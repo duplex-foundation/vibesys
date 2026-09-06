@@ -87,6 +87,20 @@ def _is_missing_codex_rollout(exc: RuntimeError) -> bool:
     return "thread/resume failed" in message and "no rollout found" in message
 
 
+def _is_missing_opencode_session(exc: RuntimeError) -> bool:
+    # ``opencode run --session <id>`` prints ``Error: Session not found`` when
+    # its session store no longer has the session (rebuilt or cleaned up).
+    return "session not found" in str(exc).lower()
+
+
+def _is_stale_provider_session(provider: str, exc: RuntimeError) -> bool:
+    if provider == "codex":
+        return _is_missing_codex_rollout(exc)
+    if provider == "opencode":
+        return _is_missing_opencode_session(exc)
+    return False
+
+
 def _heavy_codex_turn_reason(agent: CodingAgent) -> str | None:
     session = getattr(agent, "_last_session", None)
     usage = getattr(session, "final_usage", None) or {}
@@ -365,12 +379,13 @@ class AgentShimSession:
             return self._agent.generate(prompt, cwd=cwd, timeout=timeout, silent=True)
         except RuntimeError as exc:
             if not (
-                self._provider == "codex"
-                and getattr(self._agent, "session_id", None)
-                and _is_missing_codex_rollout(exc)
+                getattr(self._agent, "session_id", None)
+                and _is_stale_provider_session(self._provider, exc)
             ):
                 raise
-            self._log("Codex session is no longer available; retrying with a fresh thread.")
+            self._log(
+                f"{self._provider} session is no longer available; retrying with a fresh session."
+            )
             cast("CodexCodingAgent", self._agent).session_id = None
             self._turn_count = 0
             return self._agent.generate(prompt, cwd=cwd, timeout=timeout, silent=True)
@@ -451,6 +466,10 @@ class AgentShimDriver:
             agent = self._provider_cls(model=spec.model, event_handler=event_handler)
         if spec.environment:
             agent.env = {**agent.env, **dict(spec.environment)}
+        # A subprocess cwd does not rewrite $PWD, and bun-based CLIs (opencode)
+        # trust $PWD over the real cwd for workspace config discovery: a stale
+        # value makes them miss <workspace>/opencode.json. Let the cwd win.
+        agent.env = {key: value for key, value in agent.env.items() if key != "PWD"}
 
         if not in_container:
             resources = declare_agent_host_resources(
