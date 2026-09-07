@@ -1030,12 +1030,45 @@ def _run_orchestrator_plan(  # noqa: PLR0913  # tracked: #288
         reuse_session=False,
     )
     plan.hypothesis_id = plan.hypothesis_id.strip() or f"hypothesis-{round_number:04d}"
+    plan.hypothesis_id = _unused_hypothesis_id(
+        ctx, plan.hypothesis_id, agent_run_state, round_number
+    )
     plan.title = normalize_hypothesis_title(plan.title)
     _validate_orchestrator_plan_state(plan, agent_run_state)
     plan.recommended_skills, _ = _validate_skill_selections(ctx, plan.recommended_skills)
     issue_board.write_plan_artifact(progress_path, round_number, plan)
     issue_board.append_orchestrator_plan(progress_path, round_number, plan)
     return plan
+
+
+def _unused_hypothesis_id(
+    ctx: LoopContext,
+    hypothesis_id: str,
+    state: AgentRunState,
+    round_number: int,
+) -> str:
+    """Return ``hypothesis_id``, made unique for this run when it names a prior hypothesis.
+
+    Every round's plan opens a new hypothesis, so its ID must be new; prior
+    ones are addressed through ``hypothesis_updates``. Orchestrators that carry
+    a hypothesis into the next round (a candidate that was never measured, a
+    retry of the same mechanism) tend to reuse the ID, and a run that raised on
+    it crashed, resumed at the same plan step and crashed again. Suffixing the
+    round number keeps the orchestrator's intent readable in the progress file
+    and lets the round proceed; the rename is reported in the run log.
+    """
+    if state.by_id(hypothesis_id) is None:
+        return hypothesis_id
+    candidate = f"{hypothesis_id}-r{round_number}"
+    suffix = 2
+    while state.by_id(candidate) is not None:
+        candidate = f"{hypothesis_id}-r{round_number}-{suffix}"
+        suffix += 1
+    ctx.lprint(
+        f"[orchestrator] hypothesis ID {hypothesis_id!r} was already used in this run; "
+        f"this round's hypothesis is recorded as {candidate!r}"
+    )
+    return candidate
 
 
 def _validate_orchestrator_plan_state(

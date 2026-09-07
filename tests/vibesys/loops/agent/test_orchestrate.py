@@ -1179,7 +1179,7 @@ def test_invalid_hypothesis_update_is_not_written_to_progress(tmp_path, ref_file
     )
 
 
-def test_reused_hypothesis_id_is_not_written_to_progress(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+def test_reused_hypothesis_id_is_renamed_and_the_round_proceeds(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
     runner = _make_orchestrate_runner(
         plans=[
             OrchestratorPlan(
@@ -1197,13 +1197,14 @@ def test_reused_hypothesis_id_is_not_written_to_progress(tmp_path, ref_file):  #
         ]
     )
 
-    with pytest.raises(ValueError, match="already used"):
-        _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=2)
+    _invoke_orchestrate(tmp_path, ref_file, runner, max_rounds=2)
 
     project = _created_project(tmp_path)
-    assert not list(project.rglob("plans/round-0002.json"))
-    assert all(
-        "incorrectly reuse the identifier" not in path.read_text() for path in project.rglob("*.md")
+    plans = list(project.rglob("plans/round-0002.json"))
+    assert len(plans) == 1
+    assert json.loads(plans[0].read_text())["hypothesis_id"] == "already-used-r2"
+    assert any(
+        "incorrectly reuse the identifier" in path.read_text() for path in project.rglob("*.md")
     )
 
 
