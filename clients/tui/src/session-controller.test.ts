@@ -21,7 +21,8 @@ describe('session controller', () => {
 
     expect(controller.state.overlay?.kind).toBe('help');
     expect(controller.state.overlay?.content).toContain('/open-round');
-    expect(controller.state.overlay?.content).toContain('Planned');
+    expect(controller.state.overlay?.content).not.toContain('Planned');
+    expect(controller.state.overlay?.content).not.toContain('/invocation');
     expect(transport.requests).toEqual([]);
   });
 
@@ -33,9 +34,14 @@ describe('session controller', () => {
 
     expect(transport.requests).toEqual([]);
     expect(controller.state.chatConversation).toEqual([]);
-    expect(controller.state.errorBanner?.message).toContain('Commands start with /');
+    // Ordinary text is a routing mistake, not a malformed command: it lands on
+    // the command input's own hint row rather than raising the shared banner
+    // (#564/#635's reasoning, applied to a wrong command instead of an empty
+    // one).
+    expect(controller.state.inputError).toContain('Not a command:');
+    expect(controller.state.errorBanner).toBeNull();
 
-    controller.dismissErrorBanner();
+    controller.clearInputError();
     await controller.submitChat('what is happening?');
 
     expect(transport.requests).toEqual([{type: 'query.chat', text: 'what is happening?'}]);
@@ -97,7 +103,13 @@ describe('session controller', () => {
     // The event replay is the long pole; nothing waits behind it, and nothing
     // waits behind the two independent queries either.
     expect([...started].sort()).toEqual(['query.experiments', 'query.snapshot', 'subscribe']);
-    for (const resolve of pending) resolve();
+    for (const resolve of pending.splice(0)) resolve();
+
+    // The design log deliberately rides behind the experiments answer rather
+    // than the boot barrier, so it is the one follow-up request here.
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    expect(started).toContain('query.design');
+    for (const resolve of pending.splice(0)) resolve();
     await boot;
   });
 
@@ -661,20 +673,20 @@ describe('session controller', () => {
     const controller = new SocketSessionController(transport);
 
     await controller.submitCommand('/history');
-    expect(controller.state.errorBanner?.scope).toBe('input');
-    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.inputError).toContain('Unknown command /history');
 
     await controller.submitCommand('/history rounds');
-    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history rounds');
+    expect(controller.state.inputError).toContain('Unknown command /history rounds');
 
     await controller.submitCommand('/experiments');
-    expect(controller.state.errorBanner?.message).toContain('Unknown command: /experiments');
+    expect(controller.state.inputError).toContain('Unknown command /experiments');
 
-    controller.dismissErrorBanner();
-    expect(controller.state.errorBanner).toBeNull();
+    controller.clearInputError();
+    expect(controller.state.inputError).toBeNull();
 
     await controller.submitCommand('/history');
-    expect(controller.state.errorBanner?.message).toContain('Unknown command: /history');
+    expect(controller.state.inputError).toContain('Unknown command /history');
 
     expect(transport.requests).toEqual([]);
   });
@@ -720,7 +732,8 @@ describe('session controller', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(transport.requests.length - before).toBe(1);
+    const refetches = transport.requests.slice(before).filter(r => r.type === 'query.experiments');
+    expect(refetches).toHaveLength(1);
     expect(controller.state.experimentLog?.entries).toHaveLength(3);
     expect(controller.state.experimentLog?.selectedId).toBe('H-02');
     expect(controller.state.experimentLog?.entries[1]?.resolved_outcome).toBe('rejected');
@@ -809,9 +822,82 @@ describe('session controller', () => {
     expect(controller.state.experimentLog?.pending).toBe(true);
     await controller.start();
 
-    expect(transport.requests).toEqual([{type: 'query.snapshot'}, {type: 'query.experiments'}]);
+    expect(transport.requests).toEqual([
+      {type: 'query.snapshot'},
+      {type: 'query.experiments'},
+      {type: 'query.design'},
+    ]);
     expect(controller.state.experimentLog?.pending).toBe(false);
     expect(controller.state.experimentLog?.selectedId).toBe('H-01');
+  });
+
+  it('loads the design log with the experiments so the drill-down can annotate rounds', async () => {
+    const transport = new FakeTransport();
+    transport.design = [{round: 1, files: [{path: 'src/ring.rs', change: 'added'}]}];
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(controller.state.designLog).toEqual(transport.design);
+  });
+
+  it('leaves the design log unloaded until the backend reports it ready', async () => {
+    const transport = new FakeTransport();
+    transport.designReady = false;
+    const controller = new SocketSessionController(transport);
+
+    await controller.start();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(controller.state.designLog).toBeNull();
+  });
+
+  it('renders /design in the right pane, joining stage facts by round', async () => {
+    const transport = new FakeTransport();
+    transport.experiments = [
+      entry('H-01', 1, 1, {
+        title: 'Pad the ring indices',
+        rounds: [{round: 1, passed: true, reviewed: true, judge_verdict: 'pass'}],
+      }),
+    ];
+    transport.design = [
+      {
+        round: 1,
+        files: [
+          {path: 'src/ring.rs', change: 'added'},
+          {path: 'src/lib.rs', change: 'modified'},
+        ],
+      },
+    ];
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    await controller.submitCommand('/design');
+
+    expect(controller.state.overlay).toBeNull();
+    expect(controller.state.layout.right?.view).toBe('design');
+    expect(controller.state.layout.right?.title).toBe('Design changes');
+    expect(controller.state.layout.right?.content).toContain('Design changes by round');
+    expect(controller.state.layout.right?.content).toContain(
+      'Round 1 · H-01 · Pad the ring indices',
+    );
+    expect(controller.state.layout.right?.content).toContain('src/ring.rs, src/lib.rs');
+    expect(controller.state.designLog).toEqual(transport.design);
+  });
+
+  it('says the design log is not ready instead of showing an empty pane', async () => {
+    const transport = new FakeTransport();
+    transport.designReady = false;
+    const controller = new SocketSessionController(transport);
+
+    await controller.submitCommand('/design');
+
+    expect(controller.state.layout.right?.content).toContain(
+      'not available until a run is attached',
+    );
+    expect(controller.state.designLog).toBeNull();
   });
 
   it('keeps bootstrap pending until attached experiments become ready', async () => {
@@ -936,7 +1022,8 @@ describe('session controller', () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(transport.requests.length - before).toBe(1);
+    const refetches = transport.requests.slice(before).filter(r => r.type === 'query.experiments');
+    expect(refetches).toHaveLength(1);
   });
 
   it('refetches again when experiments change during an in-flight fetch', async () => {
@@ -950,13 +1037,13 @@ describe('session controller', () => {
     transport.emit(event(2, 'experiments_changed'));
     transport.emit(event(3, 'experiments_changed'));
     transport.resolveExperiment([entry('H-stale', 1, 1, {active: true})]);
-    await Promise.resolve();
-    await Promise.resolve();
+    // A macrotask, because the design refresh sits between the answer and the
+    // queued refetch and its length is not this test's concern.
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
 
     expect(transport.experimentRequests).toBe(3);
     transport.resolveExperiment([entry('H-current', 1, 2, {resolved_outcome: 'proven'})]);
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
 
     expect(controller.state.experimentLog?.selectedId).toBe('H-current');
     expect(transport.experimentRequests).toBe(3);
@@ -1097,6 +1184,75 @@ describe('session controller', () => {
 
     expect(perfRequests(transport)).toBe(before);
     expect(controller.state.layout.right).toBeNull();
+  });
+
+  it('fetches the view opened while another view’s query is in flight', async () => {
+    const transport = new DeferredDesignTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.deferDesign = true;
+
+    const designOpen = controller.openPane('design');
+    const perfOpen = controller.openPane('perf');
+    // The perf pane is on screen and waiting; its query must not have been
+    // swallowed by the design query still in flight.
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(controller.state.layout.right?.pending).toBe(true);
+    expect(transport.requests.filter(request => request.type === 'query.performance')).toHaveLength(
+      0,
+    );
+
+    transport.releaseDesign();
+    await Promise.all([designOpen, perfOpen]);
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(transport.requests.filter(request => request.type === 'query.performance')).toHaveLength(
+      1,
+    );
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(controller.state.layout.right?.pending).toBe(false);
+    expect(controller.state.layout.right?.content).toContain('Performance · total_ops_per_sec');
+  });
+
+  it('drops the superseded design answer rather than painting it over the perf pane', async () => {
+    const transport = new DeferredDesignTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.deferDesign = true;
+
+    const designOpen = controller.openPane('design');
+    const perfOpen = controller.openPane('perf');
+    transport.releaseDesign();
+    await Promise.all([designOpen, perfOpen]);
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    expect(controller.state.layout.right?.view).toBe('perf');
+    expect(controller.state.layout.right?.content).toContain('Performance · total_ops_per_sec');
+    expect(controller.state.layout.right?.content).not.toContain('Design changes by round');
+  });
+
+  it('coalesces same-view refreshes during a fetch into one follow-up', async () => {
+    const transport = new DeferredDesignTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.deferDesign = true;
+
+    const designOpen = controller.openPane('design');
+    // Two rounds finish while the query is still running. The in-flight
+    // answer predates both, so one refetch follows, not one per event.
+    transport.emit(event(9, 'round_finished'));
+    transport.emit(event(10, 'round_finished'));
+    const before = designQueries(transport);
+
+    transport.releaseDesign();
+    await designOpen;
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    expect(designQueries(transport) - before).toBe(1);
+
+    transport.releaseDesign();
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    expect(controller.state.layout.right?.pending).toBe(false);
+    expect(designQueries(transport) - before).toBe(1);
   });
 
   it('closes the pane without disturbing the chat', async () => {
@@ -1413,7 +1569,7 @@ describe('session controller', () => {
     ]);
   });
 
-  it('/resume lists the threads with their runtime and switches', async () => {
+  it('/switch lists the threads with their runtime and switches', async () => {
     const transport = new ThreadTransport();
     const controller = new SocketSessionController(transport);
     await controller.start();
@@ -1421,7 +1577,7 @@ describe('session controller', () => {
     await controller.confirmChatMenu();
     controller.switchChatThread('default');
 
-    await controller.submitChat('/resume');
+    await controller.submitChat('/switch');
 
     const menu = controller.state.chatMenu;
     expect(menu?.kind).toBe('resume');
@@ -1444,14 +1600,58 @@ describe('session controller', () => {
     expect(controller.state.activeChatThreadId).toBe('thread-1');
   });
 
+  it('resumes the paused run from the chat, same as the command bar', async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    await controller.submitChat('/resume');
+
+    // The chat forwards /resume to the one command executor: it resumes the run
+    // and opens no thread menu.
+    expect(transport.requests).toContainEqual({type: 'command.resume'});
+    expect(controller.state.chatMenu).toBeNull();
+  });
+
+  it("reports a chat-only command's usage error rather than an unknown-command error", async () => {
+    const transport = new ThreadTransport();
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    // /clear takes no argument. The chat resolves it, so the error must be the
+    // registry usage error; re-parsing the text on the command bar, which does
+    // not offer /clear, would report "Unknown command" instead.
+    const before = transport.requests.length;
+    await controller.submitChat('/clear definitely-not');
+
+    // A usage error is `scope: 'input'` regardless of which surface typed it,
+    // so it lands on the command input's hint rather than the banner.
+    expect(controller.state.inputError).toBe('Usage: /clear');
+    expect(controller.state.errorBanner).toBeNull();
+    // The phrase started no thread and sent no request.
+    expect(transport.requests.length).toBe(before);
+    expect(controller.state.chatMenu).toBeNull();
+  });
+
+  it('does not run a no-argument command typed with a trailing phrase', async () => {
+    const transport = new FakeTransport();
+    const controller = new SocketSessionController(transport);
+
+    await controller.submitCommand('/pause typo');
+
+    expect(controller.state.inputError).toBe('Usage: /pause');
+    expect(controller.state.errorBanner).toBeNull();
+    expect(transport.requests).toEqual([]);
+  });
+
   it('reports an unknown theme as an error without switching', async () => {
     const transport = new FakeTransport();
     const controller = new SocketSessionController(transport);
 
     await controller.submitCommand('/theme monokai');
 
-    expect(controller.state.errorBanner).toMatchObject({scope: 'input'});
-    expect(controller.state.errorBanner?.message).toContain('Unknown theme: monokai');
+    expect(controller.state.errorBanner).toBeNull();
+    expect(controller.state.inputError).toContain('Unknown theme: monokai');
     expect(controller.state.themeName).toBe('dark');
     expect(transport.requests).toEqual([]);
   });
@@ -1705,9 +1905,91 @@ describe('a stream that re-bootstraps at a raised floor', () => {
     await Promise.resolve();
 
     expect(controller.state.core.historyAfterSequence).toBe(4);
-    expect(transport.requests.slice(before).map(request => request.type)).toEqual([
-      'query.experiments',
-    ]);
+    expect(
+      transport.requests.slice(before).filter(request => request.type === 'query.experiments'),
+    ).toHaveLength(1);
+  });
+});
+
+/**
+ * The same late attach, but the run log is shorter than the subscription's
+ * tail, so the re-bootstrap replays it whole and declares floor 0 like the
+ * batch before it. Nothing about the floors distinguishes the two logs; only
+ * the store they name does.
+ */
+describe('a stream that re-bootstraps into a log shorter than the tail', () => {
+  const runLog: RunEvent[] = [
+    {
+      ...event(1, 'run_started'),
+      data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+    },
+    event(2, 'agent_output_chunk', 'two\n'),
+    roundFinished(3, 1),
+    event(4, 'agent_output_chunk', 'four\n'),
+  ];
+  // What the client folded from the server's own log before the attach: the
+  // same sequence numbers, different events.
+  const preAttach = [
+    event(1, 'agent_output_chunk', 'server started\n'),
+    event(2, 'agent_output_chunk', 'server ready\n'),
+  ];
+
+  async function rebootstrapped(transport: HistoryTransport): Promise<SocketSessionController> {
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+    transport.emitBatch(preAttach, 0, 'bootstrap-store');
+    transport.emitBatch(runLog, 0, 'run-store');
+    return controller;
+  }
+
+  it('reaches the state a full replay of the run log would have built', async () => {
+    const replayedTransport = new HistoryTransport(runLog);
+    const replayed = new SocketSessionController(replayedTransport);
+    await replayed.start();
+    replayedTransport.emitBatch(runLog, 0, 'run-store');
+
+    const controller = await rebootstrapped(new HistoryTransport(runLog));
+
+    expect(controller.state.core.transcript).toEqual(replayed.state.core.transcript);
+    expect(controller.state.core.rounds).toEqual(replayed.state.core.rounds);
+    expect(controller.state.core.sequence).toBe(replayed.state.core.sequence);
+  });
+
+  it('folds the run log prefix its stale cursor covered', async () => {
+    const controller = await rebootstrapped(new HistoryTransport(runLog));
+
+    // `run_started` is sequence 1 in the attached log and sequence 1 was
+    // already folded from the log it replaces, so the out-of-order guard drops
+    // it unless the batch is recognized as superseding what came before.
+    expect(controller.state.core.maxRounds).toBe(3);
+    expect(controller.state.core.outerLoop).toBe('agent');
+    expect(controller.state.core.rounds.map(round => round.number)).toEqual([1]);
+  });
+
+  it('declares a complete history, so nothing is left to backfill', async () => {
+    const transport = new HistoryTransport(runLog);
+
+    const controller = await rebootstrapped(transport);
+
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+    await expect(controller.loadOlderHistory()).resolves.toBe(false);
+    expect(eventsQueries(transport)).toEqual([]);
+  });
+
+  it('extends rather than re-folds while the store stays the same', async () => {
+    const transport = new HistoryTransport(runLog);
+    const controller = new SocketSessionController(transport);
+    await controller.start();
+
+    transport.emitBatch(runLog.slice(0, 2), 0, 'run-store');
+    transport.emitBatch(runLog.slice(2), 0, 'run-store');
+
+    // A fresh run attaches its (empty) log without renumbering anything, so
+    // its stream keeps one identity and the client must not discard the
+    // events it already folded under it.
+    expect(controller.state.core.maxRounds).toBe(3);
+    expect(controller.state.core.rounds.map(round => round.number)).toEqual([1]);
+    expect(controller.state.core.transcript.map(item => item.content).join('')).toContain('two\n');
   });
 });
 
@@ -1736,6 +2018,99 @@ describe('stream reconnect', () => {
     expect(controller.state.core.sequence).toBe(7);
     expect(controller.state.core.historyAfterSequence).toBe(5);
   });
+
+  it('re-bootstraps when the store was swapped while the stream was severed', async () => {
+    const transport = new ReconnectTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0]);
+    await controller.start();
+    // Boot against the bootstrap store: sequences 1 and 2 are folded from it.
+    transport.emitBatch(
+      [
+        event(1, 'agent_output_chunk', 'server started\n'),
+        event(2, 'agent_output_chunk', 'server ready\n'),
+      ],
+      0,
+      'bootstrap-store',
+    );
+    expect(controller.state.core.sequence).toBe(2);
+
+    transport.sever();
+    await settle();
+    // While severed, the durable log was attached: a new store whose sequence 1
+    // is `run_started`, not the output the client folded at 1 in the old store.
+    transport.emitBatch(
+      [
+        {
+          ...event(1, 'run_started'),
+          data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+        },
+        event(2, 'agent_output_chunk', 'two\n'),
+      ],
+      0,
+      'run-store',
+    );
+
+    // The resume named the store the client last saw, and the batch that named
+    // a different one superseded the fold: `run_started` at sequence 1 lands
+    // even though sequence 1 was already folded, which the extend path drops.
+    expect(transport.subscribeCalls.at(-1)?.storeId).toBe('bootstrap-store');
+    expect(controller.state.core.maxRounds).toBe(3);
+    expect(controller.state.core.outerLoop).toBe('agent');
+    expect(controller.state.core.historyAfterSequence).toBe(0);
+  });
+
+  it('keeps the fold when an old-server fallback omits store identity', async () => {
+    const transport = new ReconnectTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0]);
+    await controller.start();
+    transport.emitBatch(
+      [
+        {
+          ...event(1, 'run_started'),
+          data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+        },
+      ],
+      0,
+      'run-store',
+    );
+
+    // A server predating store-aware resumes rejects the first dial, then the
+    // stream falls back to a plain cursor resume whose suffix names no store.
+    transport.refuseSubscribes = 1;
+    transport.sever();
+    await settle();
+    expect(transport.subscribeCalls.at(-1)?.storeId).toBeUndefined();
+    transport.emitBatch([event(2, 'agent_output_chunk', 'two\n')]);
+
+    expect(controller.state.core.maxRounds).toBe(3);
+    expect(controller.state.core.sequence).toBe(2);
+    expect(controller.state.core.transcript.map(item => item.content).join('')).toContain('two\n');
+  });
+
+  it('keeps the fold and learns an identity first seen on a resumed suffix', async () => {
+    const transport = new ReconnectTransport();
+    const controller = new SocketSessionController(transport, undefined, undefined, [0, 0]);
+    await controller.start();
+    transport.emitBatch([
+      {
+        ...event(1, 'run_started'),
+        data: {kind: 'run_started', outer_loop: 'agent', input: '.', max_rounds: 3},
+      },
+    ]);
+
+    transport.sever();
+    await settle();
+    transport.emitBatch([event(2, 'agent_output_chunk', 'two\n')], 0, 'run-store');
+
+    expect(controller.state.core.maxRounds).toBe(3);
+    expect(controller.state.core.sequence).toBe(2);
+    expect(controller.state.core.transcript.map(item => item.content).join('')).toContain('two\n');
+
+    // Once learned, the identity protects the next cursor resume.
+    transport.sever();
+    await settle();
+    expect(transport.subscribeCalls.at(-1)?.storeId).toBe('run-store');
+  });
 });
 
 class FakeTransport implements ServerTransport {
@@ -1743,6 +2118,8 @@ class FakeTransport implements ServerTransport {
   /** Mutable so a test can change what a refetch returns mid-run. */
   experiments: NonNullable<ProtocolResponse['experiments']> = [];
   experimentsReady = true;
+  design: NonNullable<ProtocolResponse['design']> = [];
+  designReady = true;
   readonly requests: RequestInput[] = [];
   #message: ((message: ServerMessage) => void) | null = null;
   #disconnect: ((error: Error) => void) | null = null;
@@ -1766,6 +2143,8 @@ class FakeTransport implements ServerTransport {
       performance: this.responsePerformance,
       experiments: this.experiments,
       experiments_ready: this.experimentsReady,
+      design: this.design,
+      design_ready: this.designReady,
       ...(input.type === 'query.chat'
         ? {
             chat: this.responseChat ?? {
@@ -1809,8 +2188,12 @@ class FakeTransport implements ServerTransport {
  */
 class ReconnectTransport implements ServerTransport {
   readonly requests: RequestInput[] = [];
-  /** Every subscribe: the cursor and tail it carried, in order. */
-  readonly subscribeCalls: Array<{afterSequence: number; tail: number | undefined}> = [];
+  /** Every subscribe: the cursor, tail, and store it carried, in order. */
+  readonly subscribeCalls: Array<{
+    afterSequence: number;
+    tail: number | undefined;
+    storeId: string | undefined;
+  }> = [];
   /** How many upcoming subscribes to reject before letting one through. */
   refuseSubscribes = 0;
   #message: ((message: ServerMessage) => void) | null = null;
@@ -1833,7 +2216,7 @@ class ReconnectTransport implements ServerTransport {
     onDisconnect: (error: Error) => void,
     options?: SubscribeOptions,
   ): Promise<EventSubscription> {
-    this.subscribeCalls.push({afterSequence, tail: options?.tail});
+    this.subscribeCalls.push({afterSequence, tail: options?.tail, storeId: options?.storeId});
     if (this.refuseSubscribes > 0) {
       this.refuseSubscribes -= 1;
       return Promise.reject(new Error('connection refused'));
@@ -1843,11 +2226,12 @@ class ReconnectTransport implements ServerTransport {
     return Promise.resolve({close: async () => undefined});
   }
 
-  emitBatch(events: readonly RunEvent[], historyAfterSequence = 0): void {
+  emitBatch(events: readonly RunEvent[], historyAfterSequence = 0, storeId?: string): void {
     this.#message?.({
       type: 'event_batch',
       events: [...events],
       history_after_sequence: historyAfterSequence,
+      ...(storeId === undefined ? {} : {store_id: storeId}),
     });
   }
 
@@ -1897,6 +2281,86 @@ class DeferredExperimentsTransport implements ServerTransport {
       experiments,
       experiments_ready: true,
     });
+  }
+
+  subscribe(
+    _afterSequence: number,
+    onMessage: (message: ServerMessage) => void,
+    _onDisconnect: (error: Error) => void,
+  ): Promise<EventSubscription> {
+    this.#message = onMessage;
+    return Promise.resolve({close: async () => undefined});
+  }
+
+  emit(runEvent: RunEvent): void {
+    this.#message?.({type: 'event', event: runEvent});
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/**
+ * A backend whose design query the test holds open, so a slow /design can
+ * overlap the next pane command the way the live git-backed query does.
+ * Everything else answers immediately, including the perf query.
+ */
+class DeferredDesignTransport implements ServerTransport {
+  readonly requests: RequestInput[] = [];
+  /** Holds `query.design` answers until the test releases them. */
+  deferDesign = false;
+  readonly #pendingDesign: Array<() => void> = [];
+  #message: ((message: ServerMessage) => void) | null = null;
+
+  request(input: RequestInput): Promise<ProtocolResponse> {
+    this.requests.push(input);
+    const base = {
+      protocol_version: 1 as const,
+      request_id: 'request',
+      timestamp: '2026-01-01T00:00:00Z',
+      ok: true as const,
+    };
+    if (input.type === 'query.snapshot') {
+      return Promise.resolve({...base, snapshot: {run_id: 'run', status: 'running', sequence: 0}});
+    }
+    if (input.type === 'query.experiments') {
+      return Promise.resolve({...base, experiments: [], experiments_ready: true});
+    }
+    if (input.type === 'query.performance') {
+      return Promise.resolve({
+        ...base,
+        performance: [
+          {
+            round: 1,
+            perf_metric: 1200,
+            perf_unit: 'total_ops_per_sec',
+            passed: true,
+            profile_skipped: false,
+          },
+          {
+            round: 2,
+            perf_metric: 2400,
+            perf_unit: 'total_ops_per_sec',
+            passed: true,
+            profile_skipped: false,
+          },
+        ],
+        events: [],
+      });
+    }
+    if (input.type === 'query.design') {
+      const response = {...base, design: [], design_ready: true};
+      if (!this.deferDesign) return Promise.resolve(response);
+      return new Promise(resolve => this.#pendingDesign.push(() => resolve(response)));
+    }
+    return Promise.resolve(base);
+  }
+
+  releaseDesign(): void {
+    const pending = this.#pendingDesign.shift();
+    if (!pending) throw new Error('No pending design request');
+    pending();
   }
 
   subscribe(
@@ -2116,11 +2580,14 @@ class HistoryTransport implements ServerTransport {
   }
 
   /** One bootstrap batch: the spine below the floor, then the tail. */
-  emitBatch(events: readonly RunEvent[], historyAfterSequence: number): void {
+  emitBatch(events: readonly RunEvent[], historyAfterSequence: number, storeId?: string): void {
     this.#message?.({
       type: 'event_batch',
       events: [...events],
       history_after_sequence: historyAfterSequence,
+      // Omitted rather than empty when a test does not care, so the default
+      // path stays what a server that reports no store identity sends.
+      ...(storeId === undefined ? {} : {store_id: storeId}),
     });
   }
 
@@ -2157,6 +2624,10 @@ function roundFinished(sequence: number, round: number): RunEvent {
 
 function perfRequests(transport: FakeTransport): number {
   return transport.requests.filter(request => request.type === 'query.performance').length;
+}
+
+function designQueries(transport: DeferredDesignTransport): number {
+  return transport.requests.filter(request => request.type === 'query.design').length;
 }
 
 function entry(

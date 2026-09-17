@@ -15,13 +15,14 @@ from typing import Any, TextIO, TypeVar, overload
 from pydantic import BaseModel
 
 from vibesys import backends, boot_trace
-from vibesys.agents import AgentClient, build_agent_client
+from vibesys.agents import AgentClientProtocol, build_agent_client
 from vibesys.agents.factory import (
     agent_driver_supports_mcp_servers,
     resolve_agent_driver,
 )
 from vibesys.agents.host_resource_declarations import task_agent_host_resources
 from vibesys.agents.progress import AgentProgress
+from vibesys.agents.session_store import AgentSessionState, DurableSessionStore
 from vibesys.backends.base import ComputeBackendImpl, ContentionMonitor
 from vibesys.config import Config, as_config
 from vibesys.constants import (
@@ -48,6 +49,8 @@ from vibesys.profilers import (
     profiler_definition,
     resolve_profiler_kind,
 )
+from vibesys.render.run_log import RunLogRenderer
+from vibesys.render.sink import output_sink
 from vibesys.resource_paths import profiler_support_dir
 from vibesys.run import (
     AgentRuntimeResources,
@@ -79,6 +82,7 @@ from vibesys.run.events import (
     PhaseData,
     json_value,
 )
+from vibesys.run.git_events import CoreGitTrackerEvents
 from vibesys.run.integration import LocalRunIntegration
 from vibesys.run.project_policy import (
     build_project_path_policy,
@@ -121,10 +125,6 @@ def _execution_status(error: BaseException | None) -> EventStatus:
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         return EventStatus.INTERRUPTED
     return EventStatus.FAILED
-
-
-def _optional_string(value: object) -> str | None:
-    return value if isinstance(value, str) else None
 
 
 def _coerce_dir(raw: str | Path | None, label: str) -> Path | None:
@@ -571,6 +571,9 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             integration.attach(log_dir)
             logger = RunLogger(log_dir)
             teardown_stack.callback(logger.close)
+            # Registered after logger.close so LIFO teardown unsubscribes the
+            # renderer before the log file closes.
+            teardown_stack.callback(output_sink().subscribe(RunLogRenderer(logger.writer).handle))
             hook_log[0] = logger.lprint
             for message in buffered_logs:
                 logger.lprint(message)
@@ -591,7 +594,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             git = GitTracker(
                 project_root,
                 run_id=run_id,
-                log=logger.lprint,
+                events=CoreGitTrackerEvents(),
                 excluded_dirs=project_excluded_dirs,
                 trusted_input_paths=trusted_project_input_paths(
                     project_root,
@@ -899,15 +902,27 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             evaluator_tool_roots=evaluator_tool_roots,
         )
 
+        run_state = RunState(project, git, run_id)
+
         with boot_trace.span("agent_client_build"):
-            # Build the backend-agnostic agent client. Loops invoke this instead
-            # of calling create_deep_agent / vibesys._agent_cli directly. The cli
+            # Checkpoint coding-agent provider session IDs in the run's
+            # machine-local namespace so a resumed run can continue the
+            # implementer's conversation instead of replaying the round. The
+            # map lives under the local (never snapshotted) namespace because
+            # the provider transcripts it names are host-local.
+            agent_session_store = DurableSessionStore(
+                run_state.local(RunStateNamespace.AGENT).slot("sessions.json", AgentSessionState),
+                log=logger.lprint,
+            )
+            # Build the backend-agnostic agent client. Loops invoke this
+            # instead of calling an agent driver directly. The cli
             # backend is rejected if --docker is set; build_agent_client raises
             # SystemExit with a clear message in that case.
             agent_client = build_agent_client(
                 config,
                 agent_backend=agent_backend,
                 cli_provider=cli_provider,
+                session_store=agent_session_store,
                 backends={
                     "implementer": session.sandbox,
                     "judge": session.sandbox,
@@ -934,9 +949,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 require_host_sandbox=not session.view.cli_sandboxed,
                 host_resources=agent_host_resources,
             )
-        close_agent_client = getattr(agent_client, "close", None)
-        if callable(close_agent_client):
-            teardown_stack.callback(close_agent_client)
+        teardown_stack.callback(agent_client.close)
 
         result = _RunContext(
             backend=backend,
@@ -974,7 +987,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             device=device,
             agent_client=agent_client,
             project=project,
-            state=RunState(project, git, run_id),
+            state=run_state,
             run_id=run_id,
             round_transaction_coordinator=round_transaction_coordinator,
             agent_host_resources=agent_host_resources,
@@ -1101,7 +1114,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
     git = GitTracker(
         workspace,
         run_id=parent.run_id,
-        log=logger.lprint,
+        events=CoreGitTrackerEvents(),
         excluded_dirs=parent.EXCLUDED_WORKSPACE_DIRS,
         trusted_input_paths=trusted_project_input_paths(
             workspace,
@@ -1160,6 +1173,11 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
         profiler_benchmark_command=session.view.paths.benchmark_command,
     )
 
+    # No session store: an evolve candidate names no conversation narrower than
+    # an agent role, so every one of its turns lands on a role-scoped key, and
+    # role-scoped conversations are never checkpointed (they belong to one
+    # process). Candidates also share the parent's run ID and local namespace
+    # and run concurrently, so a single per-run map would alias them anyway.
     agent_client = build_agent_client(
         config,
         agent_backend=agent_backend,
@@ -1186,9 +1204,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
         # context carries neither the profiler domain nor the task name.
         host_resources=parent.agent_host_resources,
     )
-    close_agent_client = getattr(agent_client, "close", None)
-    if callable(close_agent_client):
-        teardown_stack.callback(close_agent_client)
+    teardown_stack.callback(agent_client.close)
 
     paths = RunPaths(
         project_root=workspace,
@@ -1292,7 +1308,7 @@ class _RunContext:
         run_environment_session: RunEnvironmentSession,
         commands: RunCommands,
         device: DeviceLease,
-        agent_client: AgentClient,
+        agent_client: AgentClientProtocol,
         project: Project,
         state: RunState,
         run_id: str,
@@ -1418,7 +1434,18 @@ class _RunContext:
         self.device.monitor = monitor
 
     def gpu_env(self) -> dict[str, str]:
-        """Env vars for the host-running CLI agent; see :meth:`DeviceLease.gpu_env`."""
+        """Env vars for the CLI agent, empty when that agent runs in a container.
+
+        The pin names a *host* device index (see :meth:`DeviceLease.gpu_env`).
+        An editor container is started with ``--gpus device=N``, so inside it
+        the selected GPU is device 0 and the container env already says so;
+        forwarding the host index there would point the agent at a device the
+        container cannot see. Keeping the pin out of the session spec also
+        keeps a mid-run device reselect from changing the session fingerprint
+        and evicting the live conversation.
+        """
+        if self.agent_client.capabilities.container_execution:
+            return {}
         return self.device.gpu_env()
 
     @contextmanager
@@ -1457,10 +1484,9 @@ class _RunContext:
         (e.g. ``iteration=`` for plain-loop runner extensions) still work.
         """
         client = self.agent_client
-        model_for_kind = getattr(client, "model_for_kind", None)
-        driver = _optional_string(getattr(client, "driver_name", None))
-        provider = _optional_string(getattr(client, "provider", None))
-        model = _optional_string(model_for_kind(kind)) if callable(model_for_kind) else None
+        driver = client.driver_name
+        provider = client.provider
+        model = client.model_for_kind(kind)
         execution = self.integration.invocations.start(
             kind,
             round_label,

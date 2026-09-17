@@ -11,7 +11,7 @@ import {
 } from '@vibesys/backend-client';
 import {DEFAULT_CHAT_THREAD_ID, hasRunEnded} from '@vibesys/core-state';
 import type {StartupTrace} from './boot-trace.js';
-import {helpText, parseChatCommand, parseCommand} from './commands.js';
+import {chatHelpText, helpText, type ParsedCommand, parseCommand} from './commands.js';
 import {renderPerformanceCurve} from './performance-chart.js';
 import {
   activeChatThreadSettings,
@@ -26,11 +26,13 @@ import {
   chatPaneVisible,
   clearAgentSelection,
   clearEntrySelection,
+  clearInputError,
   closeChatMenu,
   closeOverlays,
   closePane,
   closeThemePicker,
   cyclePaneFocus,
+  designRoundViews,
   dismissErrorBanner,
   enterExperimentDrilldown,
   enterExperimentRound,
@@ -76,6 +78,7 @@ import {
   setChatMenuCustomModel,
   setChatModelMenuOptions,
   setChatThreadPending,
+  setDesignLog,
   setExperiments,
   setPaneContent,
   setTheme,
@@ -86,6 +89,7 @@ import {
   toggleTodos,
   updateChatConversation,
 } from './session-model.js';
+import {renderDesignSummary} from './ui/design-log.js';
 import {DEFAULT_THEME_NAME, type ThemeName} from './ui/theme.js';
 
 export interface SessionController {
@@ -133,6 +137,7 @@ export interface SessionController {
   closePane(): void;
   closeOverlays(): void;
   dismissErrorBanner(): void;
+  clearInputError(): void;
   cyclePaneFocus(): void;
   focusPane(focus: PaneFocus): void;
   togglePaneZoom(): void;
@@ -202,6 +207,10 @@ export class SocketSessionController implements SessionController {
   #experimentsRequestedAt: number | null = null;
   #experimentsLoadTraced = false;
   #paneFetch: Promise<void> | null = null;
+  /** The view to fetch once the in-flight pane query settles; see `#loadPane`. */
+  #paneRefreshWanted: PaneView | null = null;
+  /** Single-flight guard for the supplemental design-log refresh. */
+  #designFetch: Promise<void> | null = null;
   /** Single-flight guard for on-demand history backfill. */
   #historyFetch: Promise<boolean> | null = null;
   /**
@@ -222,11 +231,21 @@ export class SocketSessionController implements SessionController {
   /**
    * Highest floor the stream itself has declared, which is not the same as the
    * floor in state: backfill lowers the latter and the stream never sees it.
-   * A later batch declaring more than this is a re-bootstrap; see
-   * `#raiseHistoryFloor`. Null until the first batch, whose floor is the
+   * A later batch declaring more than this is a re-bootstrap within one store,
+   * which is what the server does when a burst outruns the tail bound; see
+   * `#resetHistoryFloor`. Null until the first batch, whose floor is the
    * bootstrap's own and therefore raises nothing.
    */
   #declaredFloor: number | null = null;
+  /**
+   * The event store the folded sequences belong to, as the stream last named
+   * it. Sequences only mean anything within one store, and a run swaps in its
+   * durable log after the client subscribes, so a batch that names a different
+   * store supersedes the fold however the two logs compare in length. Null
+   * until the first batch, and empty against a server that does not report
+   * identity, which leaves `#declaredFloor` as the only signal.
+   */
+  #storeId: string | null = null;
   #streamProtocolError = false;
 
   constructor(
@@ -277,6 +296,9 @@ export class SocketSessionController implements SessionController {
       // messages and connection changes land.
       this.#stream.subscribe({
         cursor: () => this.#state.core.sequence,
+        // The store the folded cursor belongs to, so a resume across an outage
+        // can be dropped if the run swapped its durable log while we were gone.
+        storeId: () => this.#storeId ?? '',
         shouldReconnect: () => !hasRunEnded(this.#state.core) && !this.#streamProtocolError,
         onMessage: (message, {resumed}) => this.#onMessage(message, resumed),
         onConnectionState: state => this.#onConnectionState(state),
@@ -595,6 +617,10 @@ export class SocketSessionController implements SessionController {
     this.#setState(dismissErrorBanner(this.#state));
   }
 
+  clearInputError(): void {
+    this.#setState(clearInputError(this.#state));
+  }
+
   cyclePaneFocus(): void {
     this.#setState(cyclePaneFocus(this.#state));
   }
@@ -619,11 +645,27 @@ export class SocketSessionController implements SessionController {
   /**
    * Re-runs the query behind whichever visualization is on screen. The pane
    * holds rendered text, so refreshing it is the same path as opening it.
+   *
+   * Single-flight with a remembered want. A request that lands mid-flight
+   * cannot ride the in-flight query: a different view's answer is discarded
+   * by the model's view guard, and a same-view answer may predate the change
+   * that prompted the refresh. The want is one view, latest wins, so a burst
+   * of requests during one flight collapses into a single follow-up fetch,
+   * like `#experimentRefreshPending`.
    */
   async #loadPane(view: PaneView): Promise<void> {
-    if (this.#paneFetch !== null) return this.#paneFetch;
+    if (this.#paneFetch !== null) {
+      this.#paneRefreshWanted = view;
+      return this.#paneFetch;
+    }
     const fetch = this.#requestPane(view).finally(() => {
       this.#paneFetch = null;
+      const wanted = this.#paneRefreshWanted;
+      this.#paneRefreshWanted = null;
+      // A pane closed while the query ran wants nothing anymore.
+      if (wanted !== null && this.#state.layout.right?.view === wanted) {
+        void this.#loadPane(wanted);
+      }
     });
     this.#paneFetch = fetch;
     return fetch;
@@ -631,17 +673,50 @@ export class SocketSessionController implements SessionController {
 
   async #requestPane(view: PaneView): Promise<void> {
     try {
-      const response = await this.client.request({type: 'query.performance'});
-      const content = renderPerformanceCurve(
-        response.performance ?? [],
-        response.events ?? [],
-        response.performance_context,
-      );
+      const content = await this.#renderPane(view);
       this.#setState(setPaneContent(this.#state, view, content));
     } catch (error) {
       const message = errorMessage(error);
       this.#setState(reportCaughtError(failPane(this.#state, view, message), error, 'request'));
     }
+  }
+
+  /** Exhaustive over PaneView, so a new visualization is a compile error. */
+  #renderPane(view: PaneView): Promise<string> {
+    switch (view) {
+      case 'perf':
+        return this.#renderPerfPane();
+      case 'design':
+        return this.#renderDesignPane();
+      default: {
+        const unreachable: never = view;
+        throw new Error(`Unknown pane view: ${String(unreachable)}`);
+      }
+    }
+  }
+
+  async #renderPerfPane(): Promise<string> {
+    const response = await this.client.request({type: 'query.performance'});
+    return renderPerformanceCurve(
+      response.performance ?? [],
+      response.events ?? [],
+      response.performance_context,
+    );
+  }
+
+  /**
+   * The design query carries only each round's file list. Every stage fact on
+   * the same row comes from the experiment log already in state, joined by
+   * round, so the pane and the drill-down cannot disagree about a round.
+   */
+  async #renderDesignPane(): Promise<string> {
+    const response = await this.client.request({type: 'query.design'});
+    if (response.design_ready === false) {
+      return 'The design log is not available until a run is attached.';
+    }
+    const rounds = response.design ?? [];
+    this.#setState(setDesignLog(this.#state, rounds));
+    return renderDesignSummary(designRoundViews(rounds, this.#state.experimentLog?.entries ?? []));
   }
 
   /**
@@ -713,6 +788,34 @@ export class SocketSessionController implements SessionController {
       const message = errorMessage(error);
       this.#setState(reportCaughtError(failExperiments(this.#state, message), error, 'request'));
     }
+    void this.#refreshDesignLog();
+  }
+
+  /**
+   * The design log annotates the hypothesis drill-down, so it rides the same
+   * triggers as the experiment fetch but never its promise: the query runs git
+   * over the run's history, and the landing view must not wait on that to
+   * report boot. Single-flighted on its own so overlapping refreshes collapse.
+   * Best effort: on failure the drill-down keeps whatever it last showed and
+   * stays quiet, because `/design` reports errors through the pane.
+   */
+  #refreshDesignLog(): Promise<void> {
+    if (this.#designFetch !== null) return this.#designFetch;
+    const fetch = this.#requestDesignLog().finally(() => {
+      this.#designFetch = null;
+    });
+    this.#designFetch = fetch;
+    return fetch;
+  }
+
+  async #requestDesignLog(): Promise<void> {
+    try {
+      const response = await this.client.request({type: 'query.design'});
+      if (response.design_ready === false) return;
+      this.#setState(setDesignLog(this.#state, response.design ?? []));
+    } catch {
+      // Supplemental data: no banner, no experiment-log error state.
+    }
   }
 
   /** Reports the first delivery only: later refreshes are not a boot cost. */
@@ -732,16 +835,32 @@ export class SocketSessionController implements SessionController {
   submitChat(value: string): Promise<void> {
     const text = value.trim();
     if (!text.startsWith('/')) return this.sendChat(value);
-    const parsed = parseChatCommand(text);
-    if (parsed.command === 'clear') return this.clearChatThread();
-    if (parsed.command === 'model') return this.openChatModelMenu();
-    if (parsed.command === 'resume') {
-      this.openChatResumeMenu();
-      return Promise.resolve();
+    const action = parseCommand(text, {surface: 'chat'});
+    switch (action.kind) {
+      case 'chatClear':
+        return this.clearChatThread();
+      case 'chatModel':
+        return this.openChatModelMenu();
+      case 'chatSwitch':
+        this.openChatResumeMenu();
+        return Promise.resolve();
+      case 'help':
+      case 'unknown':
+        // /help and any unrecognized slash input answer with the chat's own
+        // help rather than the global one or a global "unknown command" error.
+        this.#showChatHelp();
+        return Promise.resolve();
+      default:
+        // Everything else, including a usage error, goes to the one command
+        // executor as the action the chat's own registry lookup produced. The
+        // text is not re-parsed on the command surface, so a chat-only
+        // command's usage error stays a usage error instead of becoming
+        // "unknown command" for a name that surface does not offer.
+        return this.#dispatchCommand(action);
     }
-    if (parsed.global === true) return this.submitCommand(text);
-    // Unknown slash input answers with the chat's own help rather than
-    // falling through to a global "unknown command" error.
+  }
+
+  #showChatHelp(): void {
     this.#setState(
       updateChatConversation(this.#state, this.#state.activeChatThreadId, entries => [
         ...entries,
@@ -749,11 +868,10 @@ export class SocketSessionController implements SessionController {
           id: `chat-help-${++this.#chatMessageId}`,
           kind: 'status',
           label: 'Chat commands',
-          content: parsed.help ?? '',
+          content: chatHelpText(),
         },
       ]),
     );
-    return Promise.resolve();
   }
 
   sendChat(value: string): Promise<void> {
@@ -866,50 +984,73 @@ export class SocketSessionController implements SessionController {
     }
   }
 
-  async submitCommand(value: string): Promise<void> {
-    const parsed = parseCommand(value.trim());
-    if (parsed.error)
-      return this.#setState(reportError(this.#state, parsed.error, {scope: 'input'}));
-    if (parsed.localView === 'help') {
-      return this.#setState(
-        showDetail(this.#state, helpText({chatDocked: chatPaneVisible(this.#state)}), 'help'),
-      );
-    }
-    if (parsed.localView === 'chat') {
-      this.#setState(openChat(this.#state));
-      if (parsed.chatMessage) await this.sendChat(parsed.chatMessage);
-      return;
-    }
-    if (parsed.toggle === 'todos') {
-      this.toggleTodos();
-      return;
-    }
-    if (parsed.toggle === 'prompt') {
-      this.togglePrompt();
-      return;
-    }
-    if (parsed.openRound) {
-      this.openRound(parsed.openRound.round);
-      return;
-    }
-    if (parsed.localView === 'theme') {
-      if (parsed.themeName === undefined) return this.openThemePicker();
-      return this.setTheme(parsed.themeName);
-    }
-    if (!parsed.request) return;
-    if (parsed.paneView !== undefined) {
-      await this.openPane(parsed.paneView);
-      return;
-    }
-    try {
-      const response = await this.client.request(parsed.request);
-      const rendered = renderResponse(parsed.request, response, parsed.responseView);
-      if (rendered !== null) this.#setState(showDetail(this.#state, rendered));
-    } catch (error) {
-      this.#setState(reportCaughtError(this.#state, error, 'request'));
+  submitCommand(value: string): Promise<void> {
+    return this.#dispatchCommand(
+      parseCommand(value.trim(), {
+        surface: 'command',
+        chatDocked: chatPaneVisible(this.#state),
+      }),
+    );
+  }
+
+  /**
+   * Applies one resolved command action. Both input surfaces end here, so the
+   * behavior of a shared command cannot depend on where it was typed. The
+   * switch is exhaustive, so registering a new action kind without handling it
+   * is a compile error.
+   */
+  async #dispatchCommand(action: ParsedCommand): Promise<void> {
+    switch (action.kind) {
+      case 'unknown':
+        return this.#setState(
+          reportError(this.#state, `Unknown command ${action.text}: try /help for the list.`, {
+            scope: 'input',
+          }),
+        );
+      case 'error':
+        return this.#setState(reportError(this.#state, action.error, {scope: 'input'}));
+      case 'help':
+        return this.#setState(
+          showDetail(this.#state, helpText({chatDocked: chatPaneVisible(this.#state)}), 'help'),
+        );
+      case 'openChat':
+        this.#setState(openChat(this.#state));
+        if (action.chatMessage) await this.sendChat(action.chatMessage);
+        return;
+      case 'toggle':
+        if (action.toggle === 'todos') this.toggleTodos();
+        else this.togglePrompt();
+        return;
+      case 'openRound':
+        this.openRound(action.round);
+        return;
+      case 'theme':
+        if (action.themeName === undefined) return this.openThemePicker();
+        return this.setTheme(action.themeName);
+      case 'chatClear':
+        return this.clearChatThread();
+      case 'chatModel':
+        return this.openChatModelMenu();
+      case 'chatSwitch':
+        this.openChatResumeMenu();
+        return;
+      case 'request': {
+        if (action.paneView !== undefined) return this.openPane(action.paneView);
+        try {
+          const response = await this.client.request(action.request);
+          const rendered = renderResponse(action.request, response, action.responseView);
+          if (rendered !== null) this.#setState(showDetail(this.#state, rendered));
+        } catch (error) {
+          this.#setState(reportCaughtError(this.#state, error, 'request'));
+        }
+        return;
+      }
+      default:
+        return assertNever(action);
     }
   }
 
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
   #onMessage(message: ServerMessage, resumed: boolean): void {
     if (message.type === 'event') {
       this.#setState(applyEvent(this.#state, message.event));
@@ -918,27 +1059,55 @@ export class SocketSessionController implements SessionController {
     }
     if (message.type === 'event_batch') {
       if (resumed) {
-        // A resumed subscription replays exactly the events after the
-        // client's own cursor and declares no history floor of its own
-        // (`history_after_sequence` 0 on every batch). Taking that literally
-        // would mark history complete and quietly break scroll-back, so the
-        // floor bookkeeping keeps the boot subscription's answers and the
-        // batch folds at the floor already in state.
-        this.#setState(
-          applyEventBatch(
-            this.#state,
-            message.events,
-            message.active_executions,
-            message.through_sequence,
-            this.#state.core.historyAfterSequence,
-          ),
-        );
+        const store = message.store_id ?? '';
+        const knownStoreChanged = Boolean(this.#storeId && store && store !== this.#storeId);
+        if (knownStoreChanged) {
+          // The run swapped its durable log while the stream was severed. The
+          // resume named the store we last folded, so the server dropped our
+          // cursor and replayed the live store from its floor: this batch
+          // supersedes the fold rather than extending it, exactly as a
+          // mid-stream swap does on the boot dial.
+          const declared = message.history_after_sequence ?? 0;
+          this.#storeId = store;
+          this.#declaredFloor = declared;
+          this.#setState(
+            applyEventRebootstrap(
+              this.#state,
+              message.events,
+              message.active_executions,
+              message.through_sequence,
+              this.#resetHistoryFloor(declared),
+            ),
+          );
+          this.#recordSpine(message.events, declared);
+        } else {
+          if (store) this.#storeId = store;
+          // A resumed subscription replays exactly the events after the
+          // client's own cursor and declares no history floor of its own
+          // (`history_after_sequence` 0 on every batch). Taking that literally
+          // would mark history complete and quietly break scroll-back, so the
+          // floor bookkeeping keeps the boot subscription's answers and the
+          // batch folds at the floor already in state.
+          this.#setState(
+            applyEventBatch(
+              this.#state,
+              message.events,
+              message.active_executions,
+              message.through_sequence,
+              this.#state.core.historyAfterSequence,
+            ),
+          );
+        }
       } else {
         const declared = message.history_after_sequence ?? 0;
-        const rebootstrap = this.#declaredFloor !== null && declared > this.#declaredFloor;
+        const store = message.store_id ?? '';
+        const rebootstrap =
+          (this.#storeId !== null && store !== this.#storeId) ||
+          (this.#declaredFloor !== null && declared > this.#declaredFloor);
+        this.#storeId = store;
         this.#declaredFloor = declared;
         const floor = rebootstrap
-          ? this.#raiseHistoryFloor(declared)
+          ? this.#resetHistoryFloor(declared)
           : this.#lowerHistoryFloor(declared);
         const apply = rebootstrap ? applyEventRebootstrap : applyEventBatch;
         this.#setState(
@@ -980,15 +1149,17 @@ export class SocketSessionController implements SessionController {
   }
 
   /**
-   * Adopts a floor the stream raised, which only a re-bootstrap does.
+   * Takes a re-bootstrapped stream's floor literally, up or down.
    *
    * The run's durable event log is attached after the client subscribes, so a
    * subscription that bootstrapped against the server's own short log is
-   * re-bootstrapped at a tail of the run log. Everything below that tail is
+   * re-bootstrapped against the run log. Everything below the new floor is
    * unread history, whatever the client held before, and the spine set
-   * described a log this one replaces.
+   * described a log this one replaces. Descending is not the backfill's
+   * descent either: a run log shorter than the tail is replayed whole and
+   * declares floor 0, which is the truth about the log now being streamed.
    */
-  #raiseHistoryFloor(floor: number): number {
+  #resetHistoryFloor(floor: number): number {
     this.#historyFloor = floor;
     this.#foldedBelowFloor.clear();
     return floor;
@@ -1040,6 +1211,11 @@ function reportCaughtError(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Proves a switch over a discriminated union handles every case at compile time. */
+function assertNever(value: never): never {
+  throw new Error(`Unhandled command action: ${JSON.stringify(value)}`);
 }
 
 function renderResponse(

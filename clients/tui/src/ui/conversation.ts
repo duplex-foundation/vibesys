@@ -1,19 +1,36 @@
 import {
   BoxRenderable,
+  bold,
   type CliRenderer,
+  CodeRenderable,
+  fg,
   MarkdownRenderable,
+  StyledText,
   type SyntaxStyle,
   // The terminal mouse event, not the DOM global of the same name.
   type MouseEvent as TerminalMouseEvent,
+  type TextChunk,
   TextRenderable,
 } from '@opentui/core';
 import {hasRunEnded} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
 import type {ConversationEntry, SessionState} from '../session-model.js';
 import {visibleConversation} from '../session-model.js';
-import {promptPreview, toolCallPreview, toolResultPreview} from './previews.js';
-import {entryPalette} from './styles.js';
-import type {Theme} from './theme.js';
+import {
+  type CollapsiblePreview,
+  promptPreview,
+  toolCallPreview,
+  toolResultPreview,
+} from './previews.js';
+import {
+  codeSurface,
+  createMarkdownBlockOptions,
+  drawOnCodeSurface,
+  type EntryPalette,
+  entryPalette,
+  type MarkdownBlockOptions,
+} from './styles.js';
+import {ensureContrast, RUN_DIVIDER_MIN_CONTRAST, type Theme} from './theme.js';
 
 export interface ConversationViewOptions {
   selectConversation?: (state: SessionState) => ConversationEntry[];
@@ -58,7 +75,7 @@ const CONVERSATION_WINDOW = 200;
 export class ConversationView {
   readonly output: BoxRenderable;
   #theme: Theme;
-  #markdownStyle: SyntaxStyle;
+  #markdownBlockOptions: MarkdownBlockOptions;
   readonly #expandedPrompts = new Set<string>();
   readonly #expandedTools = new Set<string>();
   readonly #selectConversation: (state: SessionState) => ConversationEntry[];
@@ -69,6 +86,7 @@ export class ConversationView {
   readonly #onFocusRequest: (() => void) | undefined;
   #renderedConversation: ConversationEntry[] = [];
   #renderedCards: BoxRenderable[] = [];
+  /** The selection the cards in `#renderedCards` currently depict. */
   #renderedSelection: string | null = null;
   #selectedId: string | null = null;
   /** First visible entry the window renders; 0 once it covers everything. */
@@ -87,7 +105,7 @@ export class ConversationView {
     theme: Theme,
     options: ConversationViewOptions = {},
   ) {
-    this.#markdownStyle = markdownStyle;
+    this.#markdownBlockOptions = createMarkdownBlockOptions(theme, markdownStyle);
     this.#theme = theme;
     this.#selectConversation = options.selectConversation ?? visibleConversation;
     this.#emptyContent = options.emptyContent ?? 'Waiting for run events…';
@@ -96,8 +114,11 @@ export class ConversationView {
     this.#showsSelection = options.showsSelection ?? false;
     this.#onFocusRequest = options.onFocusRequest;
     const onRevealOlder = options.onRevealOlder;
-    // The bordered surface owns horizontal inset so transcript siblings, such
-    // as a fixed footer, share the same content origin as these turn cards.
+    // Horizontal inset belongs to the pane (or the chat surface's own frame)
+    // that contains this view, not to the cards below: see #565. A card that
+    // padded itself again on top of that sat one layer deeper than a
+    // non-card sibling in the same pane, such as the empty-transcript
+    // message added directly below.
     this.output = new BoxRenderable(renderer, {
       id: 'output',
       width: '100%',
@@ -134,14 +155,7 @@ export class ConversationView {
   }
 
   render(state: SessionState): void {
-    const selection = this.#selectionFor(state);
-    if (selection !== this.#renderedSelection) {
-      // The cursor is drawn into the cards, so a change has to redraw them even
-      // when the entries are identical.
-      this.#renderedConversation = [];
-      this.#renderedSelection = selection;
-    }
-    this.#selectedId = selection;
+    this.#selectedId = this.#selectionFor(state);
     this.#renderConversation(this.#selectConversation(state));
   }
 
@@ -170,7 +184,7 @@ export class ConversationView {
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
     this.#theme = theme;
-    this.#markdownStyle = markdownStyle;
+    this.#markdownBlockOptions = createMarkdownBlockOptions(theme, markdownStyle);
     this.#clear();
     this.#renderedConversation = [];
   }
@@ -240,16 +254,43 @@ export class ConversationView {
     return entries.slice(this.#windowStart);
   }
 
+  /**
+   * Redraws the cards a selection move touches. The cursor is drawn into the
+   * cards, but only into the two it moves between: every other card renders
+   * identically under either selection, so the move costs two card
+   * replacements instead of the full-window rebuild it used to force. This
+   * runs before the structural comparison so the rendered cards agree with
+   * `#selectedId` again, which is the invariant every incremental path below
+   * assumes; an endpoint that is not rendered yet (it sits in history the
+   * window is about to reveal, or in entries about to be appended) is built by
+   * whichever path materializes it, since they all draw with `#selectedId`.
+   */
+  #syncSelectionCards(): void {
+    if (this.#selectedId === this.#renderedSelection) return;
+    for (const id of [this.#renderedSelection, this.#selectedId]) {
+      if (id === null) continue;
+      const index = this.#renderedConversation.findIndex(entry => entry.id === id);
+      if (index !== -1) this.#replaceCard(index, this.#renderedConversation);
+    }
+    this.#renderedSelection = this.#selectedId;
+  }
+
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
   #renderConversation(conversation: ConversationEntry[]): void {
     const entries = this.#windowed(conversation);
+    this.#syncSelectionCards();
     if (
       sameEntries(entries, this.#renderedConversation) &&
       (entries.length > 0 || this.output.getChildren().length > 0)
     )
       return;
     if (isEntryPrefix(this.#renderedConversation, entries)) {
-      for (const entry of entries.slice(this.#renderedConversation.length)) {
-        const card = this.#renderEntry(entry);
+      // Appending cannot change any rendered card: chrome depends on the entry
+      // above, and every entry already on screen keeps the one it had.
+      for (let index = this.#renderedConversation.length; index < entries.length; index += 1) {
+        const entry = entries[index];
+        if (entry === undefined) continue;
+        const card = this.#renderEntry(entry, entries[index - 1]);
         this.output.add(card);
         this.#renderedCards.push(card);
       }
@@ -263,25 +304,36 @@ export class ConversationView {
       for (let index = revealed - 1; index >= 0; index -= 1) {
         const entry = entries[index];
         if (entry === undefined) continue;
-        const card = this.#renderEntry(entry);
+        const card = this.#renderEntry(entry, entries[index - 1]);
         this.output.add(card, 0);
         cards.unshift(card);
       }
       this.#renderedCards = [...cards, ...this.#renderedCards];
       this.#renderedConversation = entries;
+      // The old head drew its chrome for being first. It is not first any more,
+      // so it loses that chrome when the entry now above it is the same
+      // speaker. Exactly one card can be in that position, so this is one
+      // re-render, not a rebuild.
+      const head = entries[revealed];
+      const above = entries[revealed - 1];
+      if (head !== undefined && above !== undefined && sameSpeaker(above, head))
+        this.#replaceCard(revealed, entries);
       return;
     }
     const changedIndex = singleChangedEntryIndex(this.#renderedConversation, entries);
     if (changedIndex !== -1) {
-      const previousCard = this.#renderedCards[changedIndex];
+      const before = this.#renderedConversation[changedIndex];
       const entry = entries[changedIndex];
-      if (previousCard !== undefined && entry !== undefined) {
-        this.output.remove(previousCard);
-        previousCard.destroyRecursively();
-        const card = this.#renderEntry(entry);
-        this.output.add(card, changedIndex);
-        this.#renderedCards[changedIndex] = card;
+      if (
+        this.#renderedCards[changedIndex] !== undefined &&
+        before !== undefined &&
+        entry !== undefined
+      ) {
         this.#renderedConversation = entries;
+        this.#replaceCard(changedIndex, entries);
+        // A replacement that changes who is speaking also decides the chrome of
+        // the entry below it, which is the only other card that can be affected.
+        if (!sameSpeaker(before, entry)) this.#replaceCard(changedIndex + 1, entries);
         return;
       }
     }
@@ -291,15 +343,31 @@ export class ConversationView {
       const card = new TextRenderable(this.renderer, {
         content: this.#emptyContent,
         fg: this.#theme.textSubtle,
+        // Shares the gutter every card reserves for the selection rule, so the
+        // empty-transcript message keeps the same left edge as an entry's
+        // heading rather than sitting one column outside it.
+        marginLeft: 1,
       });
       this.output.add(card);
       return;
     }
-    for (const entry of entries) {
-      const card = this.#renderEntry(entry);
+    for (const [index, entry] of entries.entries()) {
+      const card = this.#renderEntry(entry, entries[index - 1]);
       this.output.add(card);
       this.#renderedCards.push(card);
     }
+  }
+
+  /** Re-renders one already-rendered card in place, chrome included. */
+  #replaceCard(index: number, entries: ConversationEntry[]): void {
+    const previousCard = this.#renderedCards[index];
+    const entry = entries[index];
+    if (previousCard === undefined || entry === undefined) return;
+    this.output.remove(previousCard);
+    previousCard.destroyRecursively();
+    const card = this.#renderEntry(entry, entries[index - 1]);
+    this.output.add(card, index);
+    this.#renderedCards[index] = card;
   }
 
   #togglePrompt(id: string): void {
@@ -323,22 +391,78 @@ export class ConversationView {
     return true;
   }
 
-  #renderEntry(entry: ConversationEntry): BoxRenderable {
+  /**
+   * Draws one entry. `previous` is the entry rendered directly above it, or
+   * `undefined` for the first one in the view, which is what decides whether
+   * this entry opens a speaker run and so draws the divider and heading.
+   */
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
+  // biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
+  #renderEntry(entry: ConversationEntry, previous: ConversationEntry | undefined): BoxRenderable {
     const palette = entryPalette(entry, this.#theme);
     const selected = this.#selectedId === entry.id;
+    // The first rendered entry always draws its chrome, whatever sits above it
+    // in the model: the window and the scrollback both start mid-run, and the
+    // topmost row on screen is the one that most has to say who is speaking.
+    // It also keeps chrome a function of the rendered window alone, so no
+    // incremental path has to look outside it.
+    //
+    // #620's bare entries take this rule too, and they are most of what it
+    // buys: a run of provider lifecycle lines is one agent talking, and it
+    // restated the agent and the round above every line.
+    const opensRun = previous === undefined || !sameSpeaker(previous, entry);
+    const borderSides: ('top' | 'left')[] = [];
+    // An entry that opens a run gets a rule on its top edge instead of a
+    // four-sided border (#565): it separates one run from the next at a
+    // fraction of the row cost, with no bottom border and no blank margin row
+    // to hold the gap open. It is drawn only on the opener: consecutive
+    // entries from one speaker are one block, and a divider inside that block
+    // separates nothing.
+    //
+    // #620's bare entries draw it too. The rule is the separator between runs,
+    // and a run of lifecycle lines needs separating from the run above it as
+    // much as a card does. #620's demotion is about the frame around an entry,
+    // which a bare entry still does not draw.
+    if (opensRun) borderSides.push('top');
+    // The cursor. An entry inside a run has no heading to carry a "▸ " marker,
+    // so selection moves out of the heading and onto a rule down the entry's
+    // left edge, which every entry can draw and which costs no row. The column
+    // it needs is reserved by `paddingLeft` when the entry is not selected, so
+    // the glyph swaps in and out without the content moving under the cursor
+    // (tui-conventions.md, "nothing moves that does not have to"); this is the
+    // same reserved-gutter treatment `paneTitle` gives a pane. The glyph is the
+    // non-colour channel WCAG 1.4.1 asks for, and `borderFocus` plus the
+    // heading's `textStrong` reinforce it where a heading exists.
+    if (selected) borderSides.push('left');
     const card = new BoxRenderable(this.renderer, {
       id: `event-${entry.id}`,
       width: '100%',
       flexDirection: 'column',
-      marginTop: 1,
-      paddingLeft: entry.kind === 'status' ? 0 : 1,
-      paddingRight: 1,
-      border: entry.kind !== 'status',
-      borderStyle: 'rounded',
-      // The cursor is the card's border, not a fill: a filled card reads as
-      // selected text, and the transcript already uses fills for roles.
-      borderColor: selected ? this.#theme.borderFocus : palette.border,
-      backgroundColor: palette.background,
+      // No side padding beyond that gutter: the pane this view sits in already
+      // insets its content by one column (or the chat surface's own frame
+      // does), and a card padding on top of that was a second, inconsistent
+      // inset.
+      ...(selected ? {} : {paddingLeft: 1}),
+      // OpenTUI turns a border back on if `borderStyle` or `borderColor` is
+      // passed beside `border: false`, so an entry that draws neither rule has
+      // to omit both (tui-conventions.md).
+      ...(borderSides.length === 0
+        ? {border: false}
+        : {
+            border: borderSides,
+            borderStyle: 'single' as const,
+            // Neutral, not the role accent. The rule separates one run from
+            // the next; who is speaking is already said by the heading word and
+            // its colour, and a third channel pointed at the same fact is what
+            // made the transcript read as oversaturated. `border` is the token
+            // every other resting frame in the UI draws in (`paneBorderColor`),
+            // lifted to `RUN_DIVIDER_MIN_CONTRAST`: a four-sided border can lean
+            // on its own area to stay noticeable at a marginal contrast, and a
+            // one-row rule that has just given up its accent cannot.
+            borderColor: selected
+              ? this.#theme.borderFocus
+              : ensureContrast(this.#theme.border, this.#theme.canvas, RUN_DIVIDER_MIN_CONTRAST),
+          }),
       ...(this.#showsSelection
         ? {
             onMouseUp: () => {
@@ -360,21 +484,41 @@ export class ConversationView {
             }
           : {}),
     });
-    const heading = new BoxRenderable(this.renderer, {
-      id: `event-${entry.id}-heading`,
-      width: '100%',
-      height: 1,
-      flexDirection: 'row',
-      justifyContent: 'space-between',
-    });
-    heading.add(
-      new TextRenderable(this.renderer, {
-        content: `${selected ? '▸ ' : ''}${entry.label ?? entry.kind}`,
-        fg: selected ? this.#theme.textStrong : palette.label,
+    if (opensRun) {
+      const heading = new BoxRenderable(this.renderer, {
+        id: `event-${entry.id}-heading`,
+        width: '100%',
         height: 1,
-      }),
-    );
-    card.add(heading);
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+      });
+      // The heading box is already `space-between`, and an entry that names
+      // both an agent and a round carries them as separate fields, so the role
+      // can sit at the left edge where it lines up down the column and the run
+      // id can go to the right rather than pushing the eye a variable distance
+      // across. Any other entry keeps its single label on the left, unchanged.
+      const {role, runId} = speaker(entry);
+      heading.add(
+        new TextRenderable(this.renderer, {
+          content: role,
+          fg: selected ? this.#theme.textStrong : palette.label,
+          height: 1,
+        }),
+      );
+      if (runId !== null) {
+        heading.add(
+          new TextRenderable(this.renderer, {
+            content: runId,
+            // Same expression as the role text on the left: the run id is
+            // part of the same heading, not a subordinate detail, so it
+            // keeps the card's colour instead of fading to textSubtle.
+            fg: selected ? this.#theme.textStrong : palette.label,
+            height: 1,
+          }),
+        );
+      }
+      card.add(heading);
+    }
     if (this.#markdownKinds.has(entry.kind)) {
       this.#renderMarkdownEntry(card, entry);
     } else if (
@@ -394,7 +538,36 @@ export class ConversationView {
           ? toolResultPreview(entry.content, entry.toolResult?.payload)
           : null;
       const content = prompt ? prompt.content : (output?.content ?? entry.content);
-      card.add(new TextRenderable(this.renderer, {content, fg: palette.content, width: '100%'}));
+      card.add(
+        new TextRenderable(this.renderer, {
+          content: styleTranscriptText(content, palette, this.#theme),
+          fg: palette.content,
+          width: '100%',
+          // A command line, a stderr trace, or a banner runs past the card;
+          // truncating it mid-path is worse than a second row.
+          wrapMode: 'word',
+        }),
+      );
+      if (entry.command !== undefined) {
+        // A gate's command (from the typed `gate_started` event, or, for
+        // recorded/legacy prose, core-state's `splitFrameworkValidationCommand`)
+        // gets code treatment instead of word-wrapping it like a sentence.
+        // `char` wrap is the point: a command's spaces are argument
+        // separators, not soft-wrap points, so it must break anywhere rather
+        // than at one.
+        const commandBlock = new CodeRenderable(this.renderer, {
+          content: entry.command,
+          // No bash grammar ships today (GRAMMAR_FILETYPES in styles.ts), so
+          // this still takes the flat drawUnstyledText path below; tagging it
+          // now means it lights up automatically once a bash grammar lands.
+          filetype: 'bash',
+          syntaxStyle: this.#markdownBlockOptions.syntaxStyle,
+          width: '100%',
+          wrapMode: 'char',
+        });
+        drawOnCodeSurface(commandBlock, codeSurface(this.#theme));
+        card.add(commandBlock);
+      }
       if (output?.collapsible) {
         const hidden =
           output.hiddenLines > 0
@@ -431,11 +604,9 @@ export class ConversationView {
         : {content: entry.content, hiddenLines: 0};
     card.add(
       new MarkdownRenderable(this.renderer, {
+        ...this.#markdownBlockOptions,
         content: preview.content,
-        syntaxStyle: this.#markdownStyle,
-        conceal: true,
         streaming: this.#markdownStreaming ?? !hasRunEnded(this.controller.state.core),
-        width: '100%',
       }),
     );
     if (entry.kind === 'prompt' && (preview.hiddenLines > 0 || expanded)) {
@@ -452,10 +623,7 @@ export class ConversationView {
   }
 
   #renderToolTurn(card: BoxRenderable, entry: ConversationEntry): void {
-    const toolCall =
-      entry.toolName !== undefined && entry.toolArguments !== undefined
-        ? toolCallPreview(entry.toolName, entry.toolArguments)
-        : (entry.toolCall ?? '');
+    const toolCall = toolCallText(entry);
     const toolResponse = entry.toolResult?.content ?? entry.toolResponse;
     card.add(
       new TextRenderable(this.renderer, {
@@ -463,6 +631,10 @@ export class ConversationView {
         fg: this.#theme.toolCall.foreground,
         bg: this.#theme.toolCall.background,
         width: '100%',
+        // A shell command is longer than the card is wide more often than not.
+        // Wrapping keeps the whole command readable; clipping it at the border
+        // hides exactly the flags and paths that say what ran.
+        wrapMode: 'word',
       }),
     );
     if (toolResponse) {
@@ -474,18 +646,17 @@ export class ConversationView {
           fg: this.#theme.toolResult.foreground,
           bg: this.#theme.toolResult.background,
           width: '100%',
+          // Expanded output is stdout and stderr verbatim, which is wider than
+          // the card whenever a compiler or a test runner produced it.
+          wrapMode: 'word',
         }),
       );
       if (response.collapsible) {
-        const hidden =
-          response.hiddenLines > 0
-            ? `${response.hiddenLines} more line${response.hiddenLines === 1 ? '' : 's'}`
-            : `${response.hiddenCharacters} more characters`;
         card.add(
           new TextRenderable(this.renderer, {
             content: expanded
               ? '▴ click or Enter to collapse response'
-              : `▾ Show full response · ${hidden} · click or Enter`,
+              : `▾ Show full response · ${hiddenToolResponseSize(response)} · click or Enter`,
             fg: this.#theme.info,
             width: '100%',
           }),
@@ -493,6 +664,116 @@ export class ConversationView {
       }
     }
   }
+}
+
+function toolCallText(entry: ConversationEntry): string {
+  if (entry.toolName !== undefined && entry.toolArguments !== undefined) {
+    return toolCallPreview(entry.toolName, entry.toolArguments);
+  }
+  return entry.toolCall ?? '';
+}
+
+function hiddenToolResponseSize(response: CollapsiblePreview): string {
+  if (response.hiddenLines === 0) return `${response.hiddenCharacters} more characters`;
+  const unit = response.hiddenLines === 1 ? 'line' : 'lines';
+  return `${response.hiddenLines} more ${unit}`;
+}
+
+/**
+ * A bracketed source tag at the start of a line: `[git-tracking]`,
+ * `[framework-validation]`. Legacy adapter only: since #692 the backend emits
+ * typed framework events instead of bracket-tagged log text, so this and
+ * `styleSourceTags` survive solely for journals recorded before #692.
+ */
+const SOURCE_TAG = /^\[[A-Za-z0-9][\w-]*\]/;
+
+/**
+ * The verdict a gate prints: `[framework-validation] PASS`,
+ * `[framework-benchmark] FAIL: ...`. Whole words, so `PASSED` and a path
+ * component spelled `fail` are left alone.
+ */
+const VERDICT = /\bPASS\b|\bFAIL\b/g;
+
+/**
+ * Emphasizes the two words in `text` a reader is actually scanning for, and
+ * draws everything around them in the entry's content color.
+ *
+ * `PASS` and `FAIL` are the outcome of a run, and after the transcript stopped
+ * spending colour on role they are close to the only saturated thing left on
+ * the line. The word is the non-colour channel: green and red alone say nothing
+ * to the ~8% of men with red-green CVD, and the two high-contrast themes barely
+ * have a palette to say it with.
+ */
+function pushBody(chunks: TextChunk[], text: string, palette: EntryPalette, theme: Theme): boolean {
+  let cursor = 0;
+  let emphasized = false;
+  for (const match of text.matchAll(VERDICT)) {
+    if (match.index > cursor) chunks.push(fg(palette.content)(text.slice(cursor, match.index)));
+    const role = match[0] === 'PASS' ? theme.conversation.success : theme.conversation.failure;
+    chunks.push(bold(fg(role.label)(match[0])));
+    cursor = match.index + match[0].length;
+    emphasized = true;
+  }
+  if (cursor < text.length) chunks.push(fg(palette.content)(text.slice(cursor)));
+  return emphasized;
+}
+
+/**
+ * Colors the parts of a transcript line that are not the line's own prose.
+ *
+ * A leading bracketed source tag recedes into the theme's muted text, and any
+ * `PASS` or `FAIL` is lifted into its verdict colour and bolded. Everything
+ * else stays in the entry's content color. `SOURCE_TAG` is anchored to the
+ * start of the line, so a bracket elsewhere in a line (`see [x] here`) is left
+ * alone.
+ *
+ * The tags used to take the card's label colour, which put a saturated
+ * 24-column prefix on nearly every subprocess line. A marker that appears on
+ * almost every row marks nothing, so it is drawn as what it is: a frequent,
+ * low-information prefix that should recede.
+ *
+ * Returns `content` unchanged when no line carries a tag or a verdict, so an
+ * ordinary entry keeps rendering as the single content-colored string it always
+ * has. Exported so the line-splitting and anchoring are tested directly, the
+ * way previews.ts exports `unwrapShellCommand` for the same reason.
+ */
+export function styleTranscriptText(
+  content: string,
+  palette: EntryPalette,
+  theme: Theme,
+): StyledText | string {
+  const lines = content.split('\n');
+  const chunks: TextChunk[] = [];
+  let styled = false;
+  lines.forEach((line, index) => {
+    const tag = SOURCE_TAG.exec(line);
+    if (tag !== null) {
+      chunks.push(fg(theme.textMuted)(tag[0]));
+      styled = true;
+    }
+    const rest = tag === null ? line : line.slice(tag[0].length);
+    if (pushBody(chunks, rest, palette, theme)) styled = true;
+    if (index < lines.length - 1) chunks.push(fg(palette.content)('\n'));
+  });
+  return styled ? new StyledText(chunks) : content;
+}
+
+/**
+ * Who an entry is from, as the heading splits it: an entry that names both an
+ * agent and a round is that pair, and anything else is its single label. One
+ * definition, so the heading and the run grouping cannot disagree about where
+ * a run ends.
+ */
+function speaker(entry: ConversationEntry): {role: string; runId: string | null} {
+  return entry.agentKind !== undefined && entry.roundLabel !== undefined
+    ? {role: entry.agentKind, runId: entry.roundLabel}
+    : {role: entry.label ?? entry.kind, runId: null};
+}
+
+function sameSpeaker(left: ConversationEntry, right: ConversationEntry): boolean {
+  const before = speaker(left);
+  const after = speaker(right);
+  return before.role === after.role && before.runId === after.runId;
 }
 
 function sameEntries(left: ConversationEntry[], right: ConversationEntry[]): boolean {

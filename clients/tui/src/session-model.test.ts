@@ -1,6 +1,6 @@
 import {describe, expect, it, test} from 'bun:test';
 import type {RunEvent, RunStatus} from '@vibesys/backend-client';
-import {type CoreRunStatus, hasRunEnded} from '@vibesys/core-state';
+import {hasRunEnded} from '@vibesys/core-state';
 import type {SessionState} from './session-model.js';
 import {
   applyActiveExecutionCheckpoint,
@@ -8,6 +8,7 @@ import {
   applyEventBatch,
   chatDocked,
   chatPaneVisible,
+  clearInputError,
   closePane,
   closeThemePicker,
   cyclePaneFocus,
@@ -32,6 +33,7 @@ import {
   openPane,
   openThemePicker,
   reportError,
+  runStatusLabel,
   selectExperimentActivity,
   selectNextAgent,
   selectNextRound,
@@ -41,7 +43,6 @@ import {
   setPaneContent,
   setTheme,
   showDetail,
-  statusText,
   togglePaneZoom,
   toggleTodos,
   unownedExperimentRounds,
@@ -50,10 +51,132 @@ import {
   visiblePhases,
   visibleTodos,
 } from './session-model.js';
+import {headerSegments, runStateText, usageText} from './ui/header.js';
+
+describe('input errors', () => {
+  it('routes a scope: input report to the hint row, never the banner', () => {
+    const state = reportError(initialSessionState(), 'Enter a slash command. Use /help.', {
+      scope: 'input',
+    });
+
+    expect(state.inputError).toBe('Enter a slash command. Use /help.');
+    expect(state.errorBanner).toBeNull();
+  });
+
+  it('leaves inputError alone for a real backend scope, and vice versa', () => {
+    const withBanner = reportError(initialSessionState(), 'The request failed.', {
+      scope: 'request',
+    });
+    expect(withBanner.errorBanner).toMatchObject({message: 'The request failed.'});
+    expect(withBanner.inputError).toBeNull();
+
+    const withInput = reportError(withBanner, 'Unknown command: /nope. Use /help.', {
+      scope: 'input',
+    });
+    // Routing input off the banner does not disturb a standing banner from a
+    // real scope, and the reverse: a later banner does not clear the hint.
+    expect(withInput.errorBanner).toEqual(withBanner.errorBanner);
+    expect(withInput.inputError).toBe('Unknown command: /nope. Use /help.');
+  });
+
+  it('clears on request, once, and leaves everything else untouched', () => {
+    const state = reportError({...initialSessionState(), selectedRound: 2}, 'Usage: /pause', {
+      scope: 'input',
+    });
+    const cleared = clearInputError(state);
+
+    expect(cleared.inputError).toBeNull();
+    expect(cleared.selectedRound).toBe(2);
+    expect(clearInputError(cleared)).toBe(cleared);
+  });
+});
+
+describe('error report normalization', () => {
+  it('lets a structured diagnostic define the banner payload while preserving report context', () => {
+    const state = reportError(initialSessionState(), 'legacy message', {
+      scope: 'request',
+      severity: 'recoverable',
+      diagnostic: {
+        id: 'diagnostic-1',
+        code: 'agent_failed',
+        summary: 'The worker failed.',
+        detail: 'Exit code: 2',
+        hint: 'Inspect the worker log.',
+        scope: 'invocation',
+        severity: 'fatal',
+        retryability: 'manual',
+      },
+      agentKind: 'implementer',
+      invocationId: 'invocation-1',
+    });
+
+    expect(state.errorBanner).toEqual({
+      title: 'Invocation failed',
+      message: 'The worker failed.',
+      detail: 'Exit code: 2',
+      hint: 'Inspect the worker log.',
+      diagnosticId: 'diagnostic-1',
+      severity: 'fatal',
+      scope: 'invocation',
+      agentKind: 'implementer',
+      roundLabel: null,
+      invocationId: 'invocation-1',
+      count: 1,
+    });
+  });
+
+  it('normalizes an empty unstructured report to stable defaults', () => {
+    const state = reportError(initialSessionState(), '', {
+      scope: 'transport',
+      diagnostic: null,
+    });
+
+    expect(state.errorBanner).toEqual({
+      title: 'Connection lost',
+      message: 'An unknown error occurred.',
+      detail: null,
+      hint: null,
+      diagnosticId: null,
+      severity: 'recoverable',
+      scope: 'transport',
+      agentKind: null,
+      roundLabel: null,
+      invocationId: null,
+      count: 1,
+    });
+  });
+
+  it('merges matching identities, promotes fatal context, and increments one banner', () => {
+    const first = reportError(initialSessionState(), 'The worker failed.', {
+      scope: 'invocation',
+      diagnosticId: 'diagnostic-1',
+      invocationId: 'invocation-1',
+    });
+    const merged = reportError(first, 'The worker failed.\nExit code: 2', {
+      scope: 'run',
+      severity: 'fatal',
+      diagnosticId: 'diagnostic-1',
+      detail: 'Exit code: 2',
+    });
+
+    expect(merged.errorBanner).toMatchObject({
+      title: 'Run failed',
+      message: 'The worker failed.\nExit code: 2',
+      detail: 'Exit code: 2',
+      diagnosticId: 'diagnostic-1',
+      invocationId: 'invocation-1',
+      severity: 'fatal',
+      scope: 'run',
+      count: 2,
+    });
+  });
+});
 
 describe('event batch projection', () => {
   it('keeps the existing banner while resumed history ends in a running session', () => {
-    const before = reportError(initialSessionState(), 'Local input problem', {scope: 'input'});
+    const before = reportError(initialSessionState(), 'Local protocol problem', {
+      scope: 'protocol',
+    });
 
     const state = applyEventBatch(before, [
       {
@@ -103,6 +226,52 @@ describe('event batch projection', () => {
     expect(state.core.status).toBe('failed');
     expect(state.errorBanner).toMatchObject({message: 'The current run failed.', scope: 'run'});
   });
+
+  it('banners the failure even when a warning diagnostic lands after it', () => {
+    const state = applyEventBatch(initialSessionState(), [
+      event(1, 'run_started', {
+        kind: 'run_started',
+        outer_loop: 'agent',
+        input: '.',
+        max_rounds: 3,
+      }),
+      {
+        ...event(2, 'run_failed'),
+        diagnostic: {
+          id: 'failure-1',
+          code: 'run_failed',
+          summary: 'The current run failed.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+      {
+        ...event(3, 'framework_warning', {
+          kind: 'framework_warning',
+          summary: 'profiler failed',
+          detail: 'nsys exited 1',
+          source: 'loop',
+        }),
+        agent_kind: null,
+        diagnostic: {
+          id: 'warn-1',
+          code: 'framework_warning',
+          summary: 'profiler failed',
+          scope: 'run',
+          severity: 'warning',
+          source: 'loop',
+        },
+      },
+    ]);
+
+    expect(state.core.status).toBe('failed');
+    expect(state.core.diagnostics.at(-1)).toMatchObject({id: 'warn-1', severity: 'warning'});
+    expect(state.errorBanner).toMatchObject({
+      message: 'The current run failed.',
+      diagnosticId: 'failure-1',
+    });
+  });
 });
 
 describe('hypothesis planning activity', () => {
@@ -144,6 +313,22 @@ describe('hypothesis planning activity', () => {
       stage: 'plan',
       roundNumber: 3,
     });
+  });
+
+  it('still presents a reprompted plan as planning', () => {
+    // The framework reprompts the orchestrator once when a plan reuses a
+    // hypothesis_id, and labels that attempt `round-N-retry-K-plan`. It is the
+    // same stage of the same round, so the operator must not see planning
+    // silently stop just because the first attempt was rejected.
+    expect(
+      hypothesisPlanningActivity(stateFor('orchestrator', 'round-3-retry-1-plan')),
+    ).toMatchObject({stage: 'plan', roundNumber: 3});
+  });
+
+  it('does not treat an unrelated retry label as planning', () => {
+    expect(
+      hypothesisPlanningActivity(stateFor('orchestrator', 'round-3-retry-1-judge')),
+    ).toBeNull();
   });
 
   it('does not present a phase as planning after its round has a hypothesis', () => {
@@ -337,6 +522,47 @@ describe('hypothesis planning activity', () => {
       selectedActivity: false,
       selectedActivityRound: null,
     });
+  });
+});
+
+describe('experiment refresh reconciliation', () => {
+  const entry = (
+    id: string,
+    round: number,
+    active = false,
+  ): Parameters<typeof setExperiments>[1][number] => ({
+    hypothesis_id: id,
+    identified: true,
+    first_round: round,
+    last_round: round,
+    rounds: [{round, passed: true, reviewed: true}],
+    kept: false,
+    active,
+  });
+
+  it('keeps the current hypothesis selected across response reordering', () => {
+    const current = setExperiments(initialSessionState(), [entry('H-01', 1), entry('H-02', 2)]);
+    const refreshed = setExperiments(current, [entry('H-02', 2, true), entry('H-01', 1)]);
+
+    expect(refreshed.experimentLog?.entries.map(item => item.hypothesis_id)).toEqual([
+      'H-01',
+      'H-02',
+    ]);
+    expect(refreshed.experimentLog?.selectedId).toBe('H-01');
+  });
+
+  it('falls back to the active hypothesis when the selected row vanishes', () => {
+    const current = setExperiments(initialSessionState(), [entry('H-01', 1)]);
+    const refreshed = setExperiments(current, [entry('H-02', 2), entry('H-03', 3, true)]);
+
+    expect(refreshed.experimentLog?.selectedId).toBe('H-03');
+  });
+
+  it('falls back to the first ordered row when no refreshed hypothesis is active', () => {
+    const current = setExperiments(initialSessionState(), [entry('H-01', 1)]);
+    const refreshed = setExperiments(current, [entry('H-03', 3), entry('H-02', 2)]);
+
+    expect(refreshed.experimentLog?.selectedId).toBe('H-02');
   });
 });
 
@@ -934,6 +1160,49 @@ describe('session event model', () => {
     });
   });
 
+  it('keeps warning diagnostics off the banner without blocking later errors', () => {
+    const warned = applyEvent(initialSessionState(), {
+      ...event(1, 'framework_warning', {
+        kind: 'framework_warning',
+        summary: 'profiler failed',
+        detail: 'nsys exited 1',
+        source: 'loop',
+      }),
+      agent_kind: null,
+      diagnostic: {
+        id: 'warn-1',
+        code: 'framework_warning',
+        summary: 'profiler failed',
+        detail: 'nsys exited 1',
+        scope: 'run',
+        severity: 'warning',
+        source: 'loop',
+      },
+    });
+
+    expect(warned.core.diagnostics).toMatchObject([
+      {id: 'warn-1', severity: 'warning', source: 'loop'},
+    ]);
+    expect(warned.errorBanner).toBeNull();
+
+    const failed = applyEvent(warned, {
+      ...event(2, 'run_failed'),
+      diagnostic: {
+        id: 'failure-1',
+        code: 'run_failed',
+        summary: 'The current run failed.',
+        scope: 'run',
+        severity: 'fatal',
+        retryability: 'never',
+      },
+    });
+
+    expect(failed.errorBanner).toMatchObject({
+      message: 'The current run failed.',
+      diagnosticId: 'failure-1',
+    });
+  });
+
   it('routes chat agent trajectory events away from the experiment transcript', () => {
     let state = initialSessionState();
     state = applyEvent(
@@ -1333,16 +1602,10 @@ describe('session event model', () => {
   // state. `/pause` is visible as `pausing…` until the backend says the pause
   // landed, and the run's ended status replaces it rather than joining it.
   it('renders one header status token per backend run status', () => {
-    const withStatus = (status: CoreRunStatus): string =>
-      statusText({
-        ...initialSessionState(),
-        core: {...initialSessionState().core, status},
-      });
-
-    expect(withStatus('running')).toBe('running · starting · no round yet');
-    expect(withStatus('pausing')).toBe('pausing… · starting · no round yet');
-    expect(withStatus('paused')).toBe('paused · starting · no round yet');
-    expect(withStatus('completed')).toBe('completed · starting · no round yet');
+    expect(runStatusLabel('running')).toBe('running');
+    expect(runStatusLabel('pausing')).toBe('pausing…');
+    expect(runStatusLabel('paused')).toBe('paused');
+    expect(runStatusLabel('completed')).toBe('completed');
   });
 
   it('reads a pause from the backend and drops it when the run ends', () => {
@@ -1354,18 +1617,17 @@ describe('session event model', () => {
       });
 
     let state = applyEvent(initialSessionState(), statusChange(1, 'pausing', 'running'));
-    expect(statusText(state)).toContain('pausing…');
+    expect(runStateText(state)).toBe('pausing…');
     state = applyEvent(state, statusChange(2, 'paused', 'pausing'));
-    expect(statusText(state)).toContain('paused');
+    expect(runStateText(state)).toBe('paused');
     state = applyEvent(state, statusChange(3, 'completed', 'paused'));
 
-    expect(statusText(state)).toContain('completed');
-    expect(statusText(state)).not.toContain('paused');
+    expect(runStateText(state)).toBe('completed');
   });
 
-  it('feeds usage updates into the status token meter', () => {
+  it('feeds usage updates into the header token meter', () => {
     let state = initialSessionState();
-    expect(statusText(state)).not.toContain('tokens');
+    expect(usageText(state)).toBeNull();
     state = applyEvent(
       state,
       event(1, 'usage_update', {
@@ -1381,7 +1643,7 @@ describe('session event model', () => {
       contextWindow: 1_000_000,
       model: 'claude-sonnet-4-6',
     });
-    expect(statusText(state)).toContain('20k/1.0M tokens');
+    expect(usageText(state)).toBe('20k/1.0M context');
     expect(state.core.transcript).toHaveLength(0);
   });
 
@@ -1540,6 +1802,20 @@ describe('hypothesis detail navigation', () => {
     const detail = enterExperimentDrilldown(setExperiments(initialSessionState(), [hypothesis]));
 
     expect(setExperiments(detail, []).hypothesisDetail).toBeNull();
+  });
+
+  it('moves a detail cursor to the latest round when its selected round disappears', () => {
+    let detail = enterExperimentDrilldown(setExperiments(initialSessionState(), [hypothesis]));
+    detail = moveHypothesisRoundSelection(detail, -1);
+    const refreshed = setExperiments(detail, [
+      {
+        ...hypothesis,
+        first_round: 2,
+        rounds: [{round: 2, passed: false, reviewed: true}],
+      },
+    ]);
+
+    expect(refreshed.hypothesisDetail).toEqual({entryKey: 'H-01', selectedRound: 2});
   });
 });
 
@@ -1895,5 +2171,117 @@ describe('a long run', () => {
     const early = {...state, selectedRound: 150};
     const entries = visibleConversation(early);
     expect(entries.length === 0 || entries.length >= 30).toBe(true);
+  });
+});
+
+describe('scope follows round navigation', () => {
+  const hypothesisA = {
+    hypothesis_id: 'H-A',
+    identified: true,
+    title: 'Batch decode requests',
+    first_round: 1,
+    last_round: 2,
+    rounds: [
+      {round: 1, passed: true, reviewed: true},
+      {round: 2, passed: true, reviewed: true},
+    ],
+    kept: true,
+    active: false,
+  };
+  const hypothesisB = {
+    hypothesis_id: 'H-B',
+    identified: true,
+    title: 'Cache the tokenizer',
+    first_round: 3,
+    last_round: 3,
+    rounds: [{round: 3, passed: false, reviewed: true}],
+    kept: false,
+    active: true,
+  };
+
+  function runWith(entries: Parameters<typeof setExperiments>[1]): SessionState {
+    return setExperiments(
+      {
+        ...initialSessionState(),
+        core: {
+          ...initialSessionState().core,
+          rounds: [
+            {number: 1, status: 'completed' as const},
+            {number: 2, status: 'completed' as const},
+            {number: 3, status: 'active' as const},
+          ],
+        },
+      },
+      entries,
+    );
+  }
+
+  it('re-derives the scope when ] crosses into another hypothesis', () => {
+    const scoped = enterExperimentRound(runWith([hypothesisA, hypothesisB]), 2);
+    expect(scoped?.hypothesisScope?.id).toBe('H-A');
+
+    const crossed = selectNextRound(scoped as SessionState);
+
+    expect(crossed.selectedRound).toBe(3);
+    expect(crossed.hypothesisScope).toMatchObject({
+      id: 'H-B',
+      title: 'Cache the tokenizer',
+      rounds: [3],
+    });
+    // The header names the hypothesis that owns the round on screen.
+    const segments = headerSegments(crossed, false).map(segment => segment.text);
+    expect(segments).toContain('Cache the tokenizer');
+    expect(segments).not.toContain('Batch decode requests');
+    // Esc unwinds to the owner of the visible round, not to the entry point.
+    const unwound = leaveExperimentDrilldown(crossed);
+    expect(unwound.hypothesisDetail).toEqual({entryKey: 'H-B', selectedRound: 3});
+    expect(unwound.experimentLog?.selectedId).toBe('H-B');
+  });
+
+  it('scopes a round no hypothesis owns as the round itself', () => {
+    const scoped = enterExperimentRound(runWith([hypothesisA]), 2);
+
+    const crossed = selectNextRound(scoped as SessionState);
+
+    expect(crossed.selectedRound).toBe(3);
+    expect(crossed.hypothesisScope).toMatchObject({id: 'round-3', source: 'round'});
+    expect(crossed.hypothesisDetail).toBeNull();
+  });
+
+  it('keeps the scope object while navigating within one hypothesis', () => {
+    const scoped = enterExperimentRound(runWith([hypothesisA, hypothesisB]), 1) as SessionState;
+
+    const moved = selectNextRound(scoped);
+
+    expect(moved.selectedRound).toBe(2);
+    expect(moved.hypothesisScope).toBe(scoped.hypothesisScope);
+    // The Esc cursor still follows the round within the hypothesis.
+    expect(moved.hypothesisDetail).toEqual({entryKey: 'H-A', selectedRound: 2});
+  });
+
+  it('adds a continuation round to a live scope on refresh', () => {
+    const scoped = enterExperimentRound(runWith([hypothesisA, hypothesisB]), 3) as SessionState;
+    expect(scoped.hypothesisScope?.rounds).toEqual([3]);
+
+    const grown = setExperiments(scoped, [
+      hypothesisA,
+      {
+        ...hypothesisB,
+        last_round: 4,
+        rounds: [...hypothesisB.rounds, {round: 4, passed: true, reviewed: false}],
+      },
+    ]);
+
+    expect(grown.hypothesisScope).toMatchObject({id: 'H-B', rounds: [3, 4]});
+    expect(grown.selectedRound).toBe(3);
+  });
+
+  it('degrades a scope whose hypothesis vanished to the round on screen', () => {
+    const scoped = enterExperimentRound(runWith([hypothesisA, hypothesisB]), 3) as SessionState;
+
+    const refreshed = setExperiments(scoped, [hypothesisA]);
+
+    expect(refreshed.hypothesisScope).toMatchObject({id: 'round-3', source: 'round'});
+    expect(refreshed.hypothesisDetail).toBeNull();
   });
 });

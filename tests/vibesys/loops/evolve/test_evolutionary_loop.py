@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -36,13 +36,13 @@ from vibesys.loops.evolve.loop import (
     _latest_wip_seed,
     _plan_candidate,
     _recent_failure_lessons,
+    _run_framework_benchmark_gate,
     _run_generation_parallel,
     _teardown_candidate_deployment,
     run_evolve_loop,
 )
 from vibesys.loops.evolve.population import (
     Individual,
-    Objective,
     Population,
 )
 from vibesys.loops.evolve.search_policy import (
@@ -52,8 +52,12 @@ from vibesys.loops.evolve.search_policy import (
     VibeSysSearchPolicy,
 )
 from vibesys.loops.evolve.state import EvolutionStateStore
+from vibesys.loops.metrics import MetricSpace, Objective
 from vibesys.profilers import ProfilerKind
-from vibesys.run import GitTracker, LoopContext, RunState, RunStateNamespace
+from vibesys.render.sink import output_sink
+from vibesys.run import EventJournal, GitTracker, LoopContext, RunState, RunStateNamespace
+from vibesys.run.events import FrameworkWarningData
+from vibesys.run.git_events import NullGitTrackerEvents
 from vibesys.sandbox.run_environment import CandidateRuntime, RunEnvironmentSpec
 from vibesys.schemas import JudgeResponse, MutatorResponse, ProfilerSummary, Verdict
 from vs_project import EvolveRunConfiguration, Project, RunEnvironmentRecord
@@ -62,7 +66,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from vibesys.constants import ComputeBackend
-    from vibesys.input_manifest import WorkspaceSource
+    from vibesys.input_manifest import BenchmarkResult, WorkspaceSource
     from vibesys.loops.evolve.search_policy import SearchPolicyName
     from vibesys.run import RepositoryVisibility
 
@@ -90,6 +94,9 @@ class _EvolveLoopKwargs(TypedDict, total=False):
     evaluator_path: Path | None
     evaluator_package_root: Path | None
     accuracy_timeout_seconds: int | None
+    benchmark_result: BenchmarkResult | None
+    benchmark_result_protocol: Literal[2] | None
+    benchmark_timeout_seconds: int | None
     max_generations: int
     children_per_generation: int
     k_top_inspirations: int
@@ -107,7 +114,7 @@ class _EvolveLoopKwargs(TypedDict, total=False):
     backend: ComputeBackend
     modality: str | None
     domain: DomainName | None
-    objectives: list[Objective] | None
+    space: MetricSpace
     frontier_bias: float
     bootstrap_max_attempts: int
     keep_deployments: bool
@@ -130,15 +137,18 @@ class _FakeLoopContext(LoopContext):
     that reaches past what the test set up fails loudly.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  # tracked: #288
         self,
         *,
         git: GitTracker | None = None,
         state: RunState | None = None,
         run_environment: object | None = None,
         run_environment_view: object | None = None,
+        events: EventJournal | None = None,
         log: Callable[[str], None] = _discard_log,
     ) -> None:
+        if events is not None:
+            self.events = events
         if git is not None:
             self.git = git
         if state is not None:
@@ -211,6 +221,11 @@ def _make_runner(  # noqa: ANN202, C901, PLR0913  # tracked: #288
 
     runner = MagicMock(spec=AgentClient)
     runner.backend_name = "deepagents"
+    # Every invocation event carries the client's attribution, so the mock
+    # supplies real strings the event payload can validate.
+    runner.driver_name = "mock"
+    runner.provider = "mock"
+    runner.model_for_kind.return_value = "mock-model"
 
     def _invoke(*, kind, response_cls, fallback_factory, system_prompt="", **kwargs):  # noqa: ANN001, ANN003, ANN202, ARG001  # tracked: #288
         if response_cls is MutatorResponse:
@@ -290,6 +305,7 @@ def _invoke_loop(
         "children_per_generation": 1,
         "seed": 0,
         "domain": DomainName.LLM_SERVING,
+        "space": MetricSpace(),
     }
     defaults.update(kwargs)
     with (
@@ -636,7 +652,7 @@ def test_final_project_tree_is_the_deterministic_scalar_best(tmp_path, ref_file)
     )
 
     assert result is True
-    best = _load_population(tmp_path).best()
+    best = _load_population(tmp_path).best(MetricSpace())
     assert best is not None and best.perf_metric == 100.0  # noqa: PT018  # tracked: #288
     project = _project_dir(tmp_path)
     assert (project / "mutant_2.py").is_file()
@@ -710,13 +726,15 @@ def test_accuracy_rejected_child_is_not_profiled_or_selected(tmp_path, ref_file)
 
 
 def test_pareto_mode_records_metrics_dict_on_individuals(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
-    """When objectives are configured the loop should pass `objectives` through
-    to selection AND copy `ProfilerSummary.metrics` onto every passing
-    Individual so the frontier can be computed across the run."""
-    objectives = [
-        Objective("tput", "max"),
-        Objective("lat_ms", "min"),
-    ]
+    """When axes are configured the loop should pass the space through to
+    selection AND copy `ProfilerSummary.metrics` onto every passing Individual
+    so the frontier can be computed across the run."""
+    space = MetricSpace(
+        objectives=(
+            Objective(name="tput", direction="max"),
+            Objective(name="lat_ms", direction="min"),
+        )
+    )
     profiler_responses = [
         ProfilerSummary(
             analysis="ok",
@@ -742,7 +760,7 @@ def test_pareto_mode_records_metrics_dict_on_individuals(tmp_path, ref_file):  #
         runner,
         max_generations=1,  # bootstrap seed + one gen-1 child
         children_per_generation=1,
-        objectives=objectives,
+        space=space,
         frontier_bias=1.0,
     )
     assert result is True
@@ -754,7 +772,7 @@ def test_pareto_mode_records_metrics_dict_on_individuals(tmp_path, ref_file):  #
     assert child.metrics == {"tput": 80.0, "lat_ms": 50.0}
 
     # The two individuals trade off — both should be on the frontier.
-    front_ids = {i.id for i in pop.frontier(objectives)}
+    front_ids = {i.id for i in pop.frontier(space)}
     assert front_ids == {seed.id, child.id}
 
 
@@ -792,12 +810,17 @@ def test_pareto_addendum_appears_in_profiler_prompt(tmp_path, ref_file):  # noqa
         return runner
 
     runner = _make_runner_with_profiler_capture()
-    objectives = [Objective("tput", "max"), Objective("lat_ms", "min")]
+    space = MetricSpace(
+        objectives=(
+            Objective(name="tput", direction="max"),
+            Objective(name="lat_ms", direction="min"),
+        )
+    )
     _invoke_bootstrap(
         tmp_path,
         ref_file,
         runner,
-        objectives=objectives,
+        space=space,
         frontier_bias=1.0,
     )
     assert len(captured_profiler_prompts) == 1
@@ -808,15 +831,14 @@ def test_pareto_addendum_appears_in_profiler_prompt(tmp_path, ref_file):  # noqa
 
 
 def test_no_objectives_keeps_metrics_empty_and_legacy_behavior(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
-    """Single-objective mode (no objectives passed) keeps `Individual.metrics`
-    empty even if the profiler stub doesn't supply one — preserves the
-    pre-Pareto behavior."""
+    """A space with no axes keeps `Individual.metrics` empty even if the
+    profiler stub doesn't supply one — preserves the pre-Pareto behavior."""
     runner = _make_runner()
     result = _invoke_bootstrap(
         tmp_path,
         ref_file,
         runner,
-        # Note: no `objectives` kwarg → single-objective mode.
+        # Note: an empty space → single-objective mode.
     )
     assert result is True
     pop = _load_population(tmp_path)
@@ -915,7 +937,7 @@ def test_openevolve_policy_persists_multi_file_search_state(tmp_path, ref_file):
 
 
 def test_candidate_code_is_multi_file_but_excludes_framework_state(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-    tracker = GitTracker(tmp_path, run_id="test-evolve", log=lambda _message: None)
+    tracker = GitTracker(tmp_path, run_id="test-evolve", events=NullGitTrackerEvents())
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "lib.rs").write_text("baseline\n")
     (tmp_path / "src" / "ffi.rs").write_text("baseline\n")
@@ -980,6 +1002,7 @@ def test_search_policy_initialization_failure_closes_context(tmp_path):  # noqa:
             "objective",
             runs_dir=tmp_path / "exp_env",
             domain=DomainName.GENERIC,
+            space=MetricSpace(),
             search_policy="openevolve",
         )
 
@@ -998,7 +1021,7 @@ def test_programmatic_openevolve_config_infers_policy(tmp_path):  # noqa: ANN001
         requested=None,
         seed=1,
         config=config,
-        objectives=None,
+        space=MetricSpace(),
     )
 
     assert name.value == "openevolve"
@@ -1017,7 +1040,7 @@ def test_programmatic_openevolve_config_rejects_vibesys_policy(tmp_path):  # noq
             requested="vibesys",
             seed=1,
             config=OpenEvolveSearchConfig(),
-            objectives=None,
+            space=MetricSpace(),
         )
 
 
@@ -1191,7 +1214,7 @@ def test_plan_candidate_falls_back_to_latest_passer_then_none(tmp_path):  # noqa
             k_top_inspirations=1,
             k_random_inspirations=1,
             selection_temperature=0.5,
-            objectives=None,
+            space=MetricSpace(),
             frontier_bias=0.7,
         )
         is None
@@ -1207,7 +1230,7 @@ def test_plan_candidate_falls_back_to_latest_passer_then_none(tmp_path):  # noqa
         k_top_inspirations=1,
         k_random_inspirations=1,
         selection_temperature=0.5,
-        objectives=None,
+        space=MetricSpace(),
         frontier_bias=0.7,
     )
     assert plan is not None
@@ -1262,7 +1285,7 @@ def test_run_generation_parallel_bounds_concurrency_and_records_all(tmp_path, mo
         k_random_inspirations=1,
         selection_temperature=0.5,
         objective="obj",
-        objectives=None,
+        space=MetricSpace(),
         frontier_bias=0.7,
         modality="text_generation",
         domain_definition=_LLM_SERVING_DOMAIN,
@@ -1320,7 +1343,7 @@ def test_run_generation_parallel_skips_parent_without_commit(tmp_path, monkeypat
         k_random_inspirations=1,
         selection_temperature=0.5,
         objective="obj",
-        objectives=None,
+        space=MetricSpace(),
         frontier_bias=0.7,
         modality="text_generation",
         domain_definition=_LLM_SERVING_DOMAIN,
@@ -1341,34 +1364,39 @@ def test_run_generation_parallel_skips_parent_without_commit(tmp_path, monkeypat
 def test_evaluate_in_subcontext_skips_parent_without_commit():  # noqa: ANN201  # tracked: #288
     """A parent with no commit can't seed a worktree — folded into a failed
     outcome without ever building a sub-context."""
-    logs: list[str] = []
-    parent_ctx = _FakeLoopContext(log=logs.append)
+    parent_ctx = _FakeLoopContext(log=lambda _line: None)
     parentless = Individual(id=3, generation=1, parent_id=1, commit=None, passed=True, summary="x")
 
-    outcome = _evaluate_in_subcontext(
-        parent_ctx,
-        config=Config.model_validate({"model": {"name": "m"}}),
-        agent_backend=None,
-        cli_provider=None,
-        generation=2,
-        child_idx=1,
-        parent=parentless,
-        inspirations=[],
-        objective="obj",
-        objectives=None,
-        modality="text_generation",
-        domain_definition=_LLM_SERVING_DOMAIN,
-        pass_criteria="crit",  # noqa: S106  # tracked: #288
-        keep_deployments=False,
-        policy_parent_id=None,
-        target_island=None,
-        worktree_lock=threading.Lock(),
-    )
+    seen = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        outcome = _evaluate_in_subcontext(
+            parent_ctx,
+            config=Config.model_validate({"model": {"name": "m"}}),
+            agent_backend=None,
+            cli_provider=None,
+            generation=2,
+            child_idx=1,
+            parent=parentless,
+            inspirations=[],
+            objective="obj",
+            space=MetricSpace(),
+            modality="text_generation",
+            domain_definition=_LLM_SERVING_DOMAIN,
+            pass_criteria="crit",  # noqa: S106  # tracked: #288
+            keep_deployments=False,
+            policy_parent_id=None,
+            target_island=None,
+            worktree_lock=threading.Lock(),
+        )
+    finally:
+        unsubscribe()
 
     assert outcome.passed is False
     assert outcome.parent_id == 3
     assert "no parent commit" in outcome.summary
-    assert any("no parent commit" in line for line in logs)
+    warnings = [e.data.summary for e in seen if isinstance(e.data, FrameworkWarningData)]
+    assert any("no parent commit" in summary for summary in warnings)
 
 
 def test_evaluate_in_subcontext_builds_worktree_and_evaluates(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
@@ -1432,7 +1460,7 @@ def test_evaluate_in_subcontext_builds_worktree_and_evaluates(tmp_path, ref_file
             parent=parent_ind,
             inspirations=[],
             objective="Maximize tok/s throughput.",
-            objectives=None,
+            space=MetricSpace(),
             modality="text_generation",
             domain_definition=_LLM_SERVING_DOMAIN,
             pass_criteria="be faster",  # noqa: S106  # tracked: #288
@@ -1497,3 +1525,265 @@ def test_loop_tears_down_candidate_on_pass_and_fail_paths(tmp_path, ref_file):  
 
     # 1 bootstrap attempt + 2 generation candidates = 3 teardown calls.
     assert teardown.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Declared benchmark result contract (framework-owned fitness)
+# ---------------------------------------------------------------------------
+
+
+def _passing_gate_result(  # noqa: ANN202
+    metric_value: float,
+    *,
+    unit: str | None = None,
+    row: dict[str, float] | None = None,
+):
+    from vibesys.loops.gates import (  # noqa: PLC0415  # tracked: #288
+        BenchmarkGateResult,
+        FrameworkBenchmarkOutcome,
+    )
+
+    return BenchmarkGateResult(
+        command="trusted-benchmark --json /tmp/result.json",
+        output="ok",
+        executed=True,
+        outcome=FrameworkBenchmarkOutcome(
+            metric_name="total_ops_per_sec",
+            metric_value=metric_value,
+            metric_direction="max",
+            metric_unit=unit,
+            row=row,
+        ),
+    )
+
+
+def test_benchmark_gate_extends_timeout_by_environment_setup_allowance():  # noqa: ANN201  # tracked: #288
+    """Environment-owned deployment/readiness time must not eat the benchmark
+    command's declared budget: the evolve gate forwards setup + contract, the
+    same setup-aware policy the agent path uses."""
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+    from vibesys.loops.gates import BenchmarkContract  # noqa: PLC0415  # tracked: #288
+
+    ctx = _FakeLoopContext(
+        run_environment_view=SimpleNamespace(framework_setup_timeout_seconds=90),
+        events=MagicMock(),
+    )
+    contract = BenchmarkContract(
+        result_spec=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+        timeout_seconds=120,
+    )
+    gate = MagicMock(return_value=_passing_gate_result(1.0))
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        _run_framework_benchmark_gate(
+            ctx,
+            generation=0,
+            child_idx=0,
+            contract=contract,
+            space=MetricSpace(),
+        )
+
+    # 120 (contract budget) + 90 (environment setup allowance), not the bare 120.
+    assert gate.call_args.kwargs["timeout_seconds"] == 210
+
+
+def test_benchmark_gate_timeout_unchanged_without_setup_allowance():  # noqa: ANN201  # tracked: #288
+    """With no setup allowance the forwarded budget is exactly the contract's."""
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+    from vibesys.loops.gates import BenchmarkContract  # noqa: PLC0415  # tracked: #288
+
+    ctx = _FakeLoopContext(
+        run_environment_view=SimpleNamespace(framework_setup_timeout_seconds=0),
+        events=MagicMock(),
+    )
+    contract = BenchmarkContract(
+        result_spec=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+        timeout_seconds=120,
+    )
+    gate = MagicMock(return_value=_passing_gate_result(1.0))
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        _run_framework_benchmark_gate(
+            ctx,
+            generation=0,
+            child_idx=0,
+            contract=contract,
+            space=MetricSpace(),
+        )
+
+    assert gate.call_args.kwargs["timeout_seconds"] == 120
+
+
+def test_benchmark_contract_owns_seed_and_child_fitness(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """A declared benchmark result contract, not the profiler agent's
+    self-report, records every candidate's fitness."""
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+
+    runner = _make_runner()
+    gate = MagicMock(side_effect=[_passing_gate_result(42.5), _passing_gate_result(43.75)])
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        result = _invoke_loop(
+            tmp_path,
+            ref_file,
+            runner,
+            max_generations=1,
+            children_per_generation=1,
+            benchmark_result=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+        )
+
+    assert result is True
+    assert gate.call_count == 2
+    assert gate.call_args.kwargs["result_spec"].metric == "total_ops_per_sec"
+    pop = _load_population(tmp_path)
+    assert [item.perf_metric for item in pop.all] == [42.5, 43.75]
+    # The scalar contract declares a metric name, not a unit, so the recorded
+    # unit stays the profiler's. A metric name is not a unit.
+    assert {item.perf_unit for item in pop.all} == {"tok/s"}
+    assert pop.all[0].metrics == {"total_ops_per_sec": 42.5}
+    # The profiler still ran for diagnostics; its self-report was not recorded.
+    assert runner.counters["profiler"] == 2
+
+
+def test_benchmark_contract_failure_fails_the_candidate_before_profiling(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+    from vibesys.loops.gates import (  # noqa: PLC0415  # tracked: #288
+        BenchmarkGateResult,
+        FrameworkBenchmarkOutcome,
+    )
+
+    runner = _make_runner()
+    failing = BenchmarkGateResult(
+        command="trusted-benchmark --json /tmp/result.json",
+        output="benchmark exploded",
+        executed=True,
+        outcome=FrameworkBenchmarkOutcome(
+            feedback="Framework benchmark failed.\nbenchmark exploded"
+        ),
+    )
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", MagicMock(return_value=failing)):
+        result = _invoke_bootstrap(
+            tmp_path,
+            ref_file,
+            runner,
+            benchmark_result=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+            bootstrap_max_attempts=1,
+        )
+
+    assert result is False
+    assert runner.counters["profiler"] == 0
+    pop = _load_population(tmp_path)
+    assert len(pop) == 1
+    failed = pop.all[0]
+    assert failed.passed is False
+    assert "Framework benchmark failed." in (failed.feedback or "")
+
+
+def test_no_benchmark_contract_keeps_profiler_fitness(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    runner = _make_runner()
+    gate = MagicMock()
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        result = _invoke_bootstrap(tmp_path, ref_file, runner)
+
+    assert result is True
+    gate.assert_not_called()
+    seed = _load_population(tmp_path).all[0]
+    assert seed.perf_metric == 10.0
+    assert seed.perf_unit == "tok/s"
+
+
+def test_scalar_contract_keeps_the_profilers_other_axes_on_the_frontier(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """Regression: a one-metric contract must not empty a two-axis frontier.
+
+    ``Population.frontier`` keeps only individuals carrying a value for every
+    configured axis. The scalar result contract reports one number, so writing
+    the trusted row *over* the profiler's row left every individual missing the
+    second axis and the frontier came back empty, which in turn starves Pareto
+    parent selection. The trusted row now overrides the axes it measures and
+    leaves the rest of the profiler's row in place.
+    """
+    from vibesys.input_manifest import BenchmarkResult  # noqa: PLC0415  # tracked: #288
+
+    space = MetricSpace(
+        objectives=(
+            Objective(name="total_ops_per_sec", direction="max"),
+            Objective(name="p99_latency_ns", direction="min"),
+        )
+    )
+    profiler_responses = [
+        ProfilerSummary(
+            analysis="ok",
+            bottlenecks="none",
+            suggestions="none",
+            perf_metric=100.0,
+            perf_unit="ops/s",
+            metrics={"total_ops_per_sec": 100.0, "p99_latency_ns": 500.0},
+        ),
+        ProfilerSummary(
+            analysis="ok",
+            bottlenecks="none",
+            suggestions="none",
+            perf_metric=80.0,
+            perf_unit="ops/s",
+            metrics={"total_ops_per_sec": 80.0, "p99_latency_ns": 800.0},
+        ),
+    ]
+    runner = _make_runner(profiler_responses=profiler_responses)
+    gate = MagicMock(side_effect=[_passing_gate_result(42.5), _passing_gate_result(43.75)])
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        result = _invoke_loop(
+            tmp_path,
+            ref_file,
+            runner,
+            max_generations=1,
+            children_per_generation=1,
+            space=space,
+            frontier_bias=1.0,
+            benchmark_result=BenchmarkResult(json_argument="--json", metric="total_ops_per_sec"),
+        )
+
+    assert result is True
+    pop = _load_population(tmp_path)
+    seed, child = pop.all
+    # The contract owns the axis it measures; the profiler keeps the other.
+    assert seed.metrics == {"total_ops_per_sec": 42.5, "p99_latency_ns": 500.0}
+    assert child.metrics == {"total_ops_per_sec": 43.75, "p99_latency_ns": 800.0}
+    # The two trade off on the second axis, so neither dominates and both are
+    # on the frontier. Before the fix neither carried `p99_latency_ns` at all
+    # and the frontier was empty.
+    assert {item.id for item in pop.frontier(space)} == {seed.id, child.id}
+
+
+def test_protocol_contract_records_the_evaluator_declared_unit(tmp_path, ref_file):  # noqa: ANN001, ANN201  # tracked: #288
+    """The recorded unit is the evaluator's declaration when it supplies one."""
+    runner = _make_runner()
+    gate = MagicMock(return_value=_passing_gate_result(42.5, unit="ops/s"))
+    with patch("vibesys.loops.evolve.loop.run_benchmark_gate", gate):
+        result = _invoke_bootstrap(
+            tmp_path,
+            ref_file,
+            runner,
+            benchmark_result_protocol=2,
+        )
+
+    assert result is True
+    seed = _load_population(tmp_path).all[0]
+    assert seed.perf_metric == 42.5
+    assert seed.perf_unit == "ops/s"
+
+
+def test_evolve_accuracy_gate_extends_timeout_by_environment_setup_allowance():  # noqa: ANN201  # tracked: #288
+    """The accuracy gate charges environment setup the way the benchmark gate
+    does; otherwise a Modal/SkyPilot deployment eats the accuracy command's
+    declared budget and the candidate fails on a timeout it was never given
+    the time to avoid."""
+    ctx = _FakeLoopContext(
+        run_environment_view=SimpleNamespace(framework_setup_timeout_seconds=90),
+    )
+    gate = MagicMock(return_value=SimpleNamespace(feedback=None))
+    with patch("vibesys.loops.evolve.loop.run_accuracy_gate", gate):
+        evolve_loop._run_framework_accuracy_gate(  # noqa: SLF001  # tracked: #288
+            ctx,
+            generation=0,
+            child_idx=0,
+            timeout_seconds=120,
+        )
+
+    assert gate.call_args.kwargs["timeout_seconds"] == 210

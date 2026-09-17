@@ -23,6 +23,7 @@ from vibesys.agents.contracts import (
     AgentUsage,
     SessionDisposition,
 )
+from vibesys.agents.session_key import AgentSessionKey, SessionScope
 from vibesys.render.sink import output_sink
 from vibesys.run.events import (
     AgentOutputChunkData,
@@ -44,6 +45,9 @@ class _FakeSession:
     error: BaseException | None = None
     observers: list[AgentObserver | None] = field(default_factory=list)
     events: list[AgentEvent] = field(default_factory=list)
+    resumed: list[str] = field(default_factory=list)
+    lifecycle_calls: list[str] = field(default_factory=list)
+    cancel_error: BaseException | None = None
 
     def run_turn(
         self,
@@ -59,7 +63,18 @@ class _FakeSession:
             raise self.error
         return self.results.pop(0)
 
+    def resume_provider_session(self, session_id: str) -> bool:
+        """Adopt ``session_id``, recording it so tests can assert on it."""
+        self.resumed.append(session_id)
+        return True
+
+    def cancel(self) -> None:
+        self.lifecycle_calls.append("cancel")
+        if self.cancel_error is not None:
+            raise self.cancel_error
+
     def close(self) -> None:
+        self.lifecycle_calls.append("close")
         self.close_calls += 1
 
 
@@ -79,6 +94,10 @@ class _FakeDriver:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+def _key(identifier: str) -> AgentSessionKey:
+    return AgentSessionKey(SessionScope.HYPOTHESIS, identifier)
 
 
 def _spec(
@@ -105,11 +124,15 @@ def test_keyed_turns_reuse_a_session() -> None:
     client = AgentClient(driver)
 
     assert (
-        client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl").text
+        client.run(
+            session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl")
+        ).text
         == "first"
     )
     assert (
-        client.run(session_spec=_spec(), turn=AgentTurnRequest("two"), session_key="impl").text
+        client.run(
+            session_spec=_spec(), turn=AgentTurnRequest("two"), session_key=_key("impl")
+        ).text
         == "second"
     )
 
@@ -131,8 +154,8 @@ def test_session_setup_materializes_skills_once(
     )
     spec = _spec(workspace=tmp_path, skills=(skill,))
 
-    client.run(session_spec=spec, turn=AgentTurnRequest("one"), session_key="impl")
-    client.run(session_spec=spec, turn=AgentTurnRequest("two"), session_key="impl")
+    client.run(session_spec=spec, turn=AgentTurnRequest("one"), session_key=_key("impl"))
+    client.run(session_spec=spec, turn=AgentTurnRequest("two"), session_key=_key("impl"))
 
     assert calls == [(tmp_path, [skill])]
 
@@ -279,6 +302,154 @@ def test_invoke_closes_text_before_tool_event(tmp_path: Path) -> None:
     ]
 
 
+def _assistant_chunks(seen: list, kind: str = "implementer") -> list[tuple[str | None, str]]:
+    """Every assistant-channel chunk, with the invocation it was attributed to."""
+    return [
+        (event.execution_id, event.data.content)
+        for event in seen
+        if isinstance(event.data, AgentOutputChunkData)
+        and event.data.channel == "assistant"
+        and event.agent_kind == kind
+    ]
+
+
+def test_a_streamed_answer_is_rendered_once_and_stays_attributed(tmp_path: Path) -> None:
+    """The driver streams the answer; the client must not print it again.
+
+    A transcript groups assistant chunks by the invocation they name, so a
+    second, unattributed copy would appear as its own orphaned entry.
+    """
+    session = _FakeSession(
+        results=[AgentTurnResult("Hello world")],
+        events=[
+            AgentEvent(AgentEventKind.TEXT, text="Hello "),
+            AgentEvent(AgentEventKind.TEXT, text="world"),
+        ],
+    )
+    client = AgentClient(_FakeDriver([session]))
+    seen: list = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        answer = client.invoke_text(
+            kind="implementer",
+            workspace=tmp_path,
+            system_prompt="system",
+            user_prompt="user",
+            round_label="round-1",
+            invocation_id="inv-1",
+        )
+    finally:
+        unsubscribe()
+
+    assert answer == "Hello world"
+    chunks = _assistant_chunks(seen)
+    assert "".join(content for _invocation, content in chunks) == "Hello world\n"
+    assert {invocation for invocation, _content in chunks} == {"inv-1"}
+
+
+def test_an_unstreamed_answer_is_rendered_once_and_stays_attributed(tmp_path: Path) -> None:
+    """A driver that streams nothing still gets its answer rendered, once."""
+    session = _FakeSession(results=[AgentTurnResult("Hello world")])
+    client = AgentClient(_FakeDriver([session]))
+    seen: list = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        client.invoke_text(
+            kind="implementer",
+            workspace=tmp_path,
+            system_prompt="system",
+            user_prompt="user",
+            round_label="round-1",
+            invocation_id="inv-1",
+        )
+    finally:
+        unsubscribe()
+
+    chunks = _assistant_chunks(seen)
+    assert "".join(content for _invocation, content in chunks) == "Hello world\n"
+    assert {invocation for invocation, _content in chunks} == {"inv-1"}
+
+
+def test_a_structured_turn_streams_nothing_on_the_assistant_channel(tmp_path: Path) -> None:
+    """The schema payload is rendered from the parsed model, not as prose.
+
+    An AgentShim structured turn marks its assistant text as diagnostic, so
+    nothing here should reach the assistant channel: the raw JSON must not
+    stream and the pretty version must not follow it.
+    """
+    session = _FakeSession(
+        results=[AgentTurnResult('{"answer":"done"}')],
+        events=[
+            AgentEvent(
+                AgentEventKind.THINKING,
+                text='{"answer":"done"}',
+                payload={"channel": "diagnostic"},
+            ),
+        ],
+    )
+    client = AgentClient(_FakeDriver([session]))
+    seen: list = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        response = client.invoke(
+            kind="judge",
+            workspace=tmp_path,
+            system_prompt="system",
+            user_prompt="user",
+            response_cls=_Response,
+            fallback_factory=lambda: _Response(answer="fallback"),
+            round_label="round-1",
+            invocation_id="inv-1",
+        )
+    finally:
+        unsubscribe()
+
+    assert response == _Response(answer="done")
+    assert _assistant_chunks(seen, kind="judge") == []
+
+
+def test_thinking_payload_channel_routes_to_the_diagnostic_channel(tmp_path: Path) -> None:
+    session = _FakeSession(
+        results=[AgentTurnResult("Done")],
+        events=[
+            AgentEvent(AgentEventKind.THINKING, text="the hot path is the ring buffer"),
+            AgentEvent(
+                AgentEventKind.THINKING,
+                text="restarting the provider process",
+                payload={"channel": "diagnostic"},
+            ),
+        ],
+    )
+    client = AgentClient(_FakeDriver([session]))
+    seen = []
+    unsubscribe = output_sink().subscribe(seen.append)
+    try:
+        client.invoke_text(
+            kind="implementer",
+            workspace=tmp_path,
+            system_prompt="system",
+            user_prompt="user",
+            round_label="round-1",
+        )
+    finally:
+        unsubscribe()
+
+    # The marked event is plumbing regardless of its wording; the unmarked one
+    # is the agent's own reasoning.
+    assert [
+        (event.data.channel, event.data.content)
+        for event in seen
+        if isinstance(event.data, AgentOutputChunkData) and event.agent_kind == "implementer"
+    ] == [
+        ("analysis", "the hot path is the ring buffer"),
+        ("diagnostic", "restarting the provider process"),
+        # No driver event carried the answer, so the client renders it once at
+        # the end, attributed to the same turn.
+        ("assistant", "Done"),
+        ("assistant", "\n"),
+    ]
+
+
 def test_invoke_closes_streamed_text_before_reporting_error(tmp_path: Path) -> None:
     session = _FakeSession(
         results=[],
@@ -338,11 +509,11 @@ def test_changed_session_spec_closes_and_replaces_cached_session() -> None:
     driver = _FakeDriver([old, new])
     client = AgentClient(driver)
 
-    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl")
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
     result = client.run(
         session_spec=_spec(model="changed"),
         turn=AgentTurnRequest("two"),
-        session_key="impl",
+        session_key=_key("impl"),
     )
 
     assert result.text == "new"
@@ -370,8 +541,8 @@ def test_reset_disposition_evicts_session(result: AgentTurnResult) -> None:
     driver = _FakeDriver([first, second])
     client = AgentClient(driver)
 
-    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl")
-    client.run(session_spec=_spec(), turn=AgentTurnRequest("two"), session_key="impl")
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("two"), session_key=_key("impl"))
 
     assert first.close_calls == 1
     assert len(driver.specs) == 2
@@ -384,8 +555,10 @@ def test_turn_exception_evicts_session() -> None:
     client = AgentClient(driver)
 
     with pytest.raises(ValueError, match="failed"):
-        client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl")
-    result = client.run(session_spec=_spec(), turn=AgentTurnRequest("two"), session_key="impl")
+        client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
+    result = client.run(
+        session_spec=_spec(), turn=AgentTurnRequest("two"), session_key=_key("impl")
+    )
 
     assert failed.close_calls == 1
     assert result.text == "ok"
@@ -395,7 +568,7 @@ def test_close_is_idempotent_and_rejects_future_turns() -> None:
     session = _FakeSession(results=[AgentTurnResult("ok")])
     driver = _FakeDriver([session])
     client = AgentClient(driver)
-    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key="impl")
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
 
     client.close()
     client.close()
@@ -404,6 +577,29 @@ def test_close_is_idempotent_and_rejects_future_turns() -> None:
     assert driver.close_calls == 1
     with pytest.raises(RuntimeError, match="closed"):
         client.run(session_spec=_spec(), turn=AgentTurnRequest("two"))
+
+
+def test_evicting_a_session_cancels_its_turn_before_closing_it() -> None:
+    session = _FakeSession(results=[AgentTurnResult("ok")])
+    client = AgentClient(_FakeDriver([session]))
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
+
+    client.close()
+
+    # Order matters: a client closed from another thread must stop the turn
+    # before releasing the resources that turn is still using.
+    assert session.lifecycle_calls == ["cancel", "close"]
+
+
+def test_a_failing_cancel_still_closes_the_session() -> None:
+    session = _FakeSession(results=[AgentTurnResult("ok")], cancel_error=ValueError("no hook"))
+    client = AgentClient(_FakeDriver([session]))
+    client.run(session_spec=_spec(), turn=AgentTurnRequest("one"), session_key=_key("impl"))
+
+    with pytest.raises(ValueError, match="no hook"):
+        client.close()
+
+    assert session.close_calls == 1
 
 
 def test_invoke_builds_session_and_turn_contracts_and_records_usage(tmp_path: Path) -> None:
@@ -431,7 +627,7 @@ def test_invoke_builds_session_and_turn_contracts_and_records_usage(tmp_path: Pa
         fallback_factory=lambda: _Response(answer="fallback"),
         round_label="judge #1",
         env={"VISIBLE": "1"},
-        session_key="review",
+        session_key=_key("review"),
     )
 
     assert response == _Response(answer="done")

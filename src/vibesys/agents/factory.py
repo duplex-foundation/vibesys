@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from vibesys.agents.client import AgentClient, AgentDiagnosticLog
+from vibesys.agents.provider_policy import DEFAULT_CLI_PROVIDER
 from vibesys.constants import DEFAULT_AGENT_BACKEND
 
 if TYPE_CHECKING:
@@ -12,6 +13,8 @@ if TYPE_CHECKING:
     from pathlib import Path
     from typing import TextIO
 
+    from vibesys.agents.contracts import AgentClientProtocol
+    from vibesys.agents.session_store import SessionStore
     from vibesys.config import Config
     from vibesys.constants import ComputeBackend
     from vs_sandbox import HostResource, ProjectPathPolicy
@@ -103,7 +106,8 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
     host_resources: Iterable[HostResource] = (),
     project_path_policy: ProjectPathPolicy | None = None,
     require_host_sandbox: bool = False,
-) -> AgentClient:
+    session_store: SessionStore | None = None,
+) -> AgentClientProtocol:
     """Build the configured application-level agent service."""
     host_resources = tuple(host_resources)
     agent_cfg = config.agent
@@ -139,13 +143,13 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
     if backend == "stub":
         from vibesys.agents.stub_runner import StubAgentClient  # noqa: PLC0415
 
-        return cast("AgentClient", StubAgentClient())
+        return StubAgentClient()
 
     if backend != "cli":
         raise SystemExit(f"unknown agent backend: {backend!r}")  # noqa: TRY003  # tracked: #288
 
     driver_name = resolve_agent_driver(config)
-    provider = cli_provider or agent_cfg.cli_provider or "codex"
+    provider = cli_provider or agent_cfg.cli_provider or DEFAULT_CLI_PROVIDER
     timeout = agent_cfg.cli_timeout
     driver_log = AgentDiagnosticLog(run_log_file)
 
@@ -235,4 +239,5 @@ def build_agent_client(  # noqa: C901, PLR0912, PLR0913
         require_host_sandbox=require_host_sandbox,
         containerized=use_docker,
         driver_log=driver_log,
+        session_store=session_store,
     )

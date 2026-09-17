@@ -1,5 +1,6 @@
 """Tests for the unified hypothesis aggregate and its pure transitions."""
 
+from dataclasses import replace
 from typing import Literal
 
 import pytest
@@ -10,6 +11,7 @@ from vibesys.loops.agent.hypotheses import (
     adopt_metric_space,
     append_round,
     apply_strategy_updates,
+    measurement_delta_reason,
     metric_baseline,
     project_round_evidence,
     reproject_run_evidence,
@@ -29,8 +31,9 @@ from vibesys.schemas import (
     HypothesisOutcome,
     HypothesisStrategyUpdate,
     OrchestratorPlan,
+    PerfDeltaReason,
 )
-from vs_loop_state import RoundRecord
+from vs_loop_state import PerfProvenance, RoundRecord
 
 
 def _plan(identifier: str, *, updates: list[HypothesisStrategyUpdate] | None = None):  # noqa: ANN202
@@ -56,6 +59,7 @@ def _round(  # noqa: PLR0913
     direction: Literal["max", "min"] = "max",
     retained: bool | None = True,
     comparison: MetricComparison | None = None,
+    provenance: PerfProvenance | None = "framework",
 ) -> RoundRecord:
     return RoundRecord(
         round_number=number,
@@ -76,6 +80,7 @@ def _round(  # noqa: PLR0913
         perf_direction=direction if metric is not None else None,
         candidate_retained=retained,
         perf_comparison=comparison,
+        perf_provenance=provenance if metric is not None else None,
     )
 
 
@@ -331,7 +336,7 @@ def test_reprojection_uses_the_stored_space_for_resolution_and_retention(
     assert hypothesis.measurement.direction == direction
 
 
-def test_metric_baseline_prefers_exact_parent_commit_and_fails_closed() -> None:
+def test_metric_baseline_prefers_exact_parent_and_falls_back_to_latest_official() -> None:
     parent = _round(1, 100.0, hypothesis_id="parent")
     later = _round(2, 120.0, hypothesis_id="later")
 
@@ -344,6 +349,8 @@ def test_metric_baseline_prefers_exact_parent_commit_and_fails_closed() -> None:
         )
         is parent
     )
+    # A provisional parent has no exact official match; fall back to the
+    # newest official measurement that does not postdate the parent round.
     assert (
         metric_baseline(
             parent_round=2,
@@ -351,7 +358,56 @@ def test_metric_baseline_prefers_exact_parent_commit_and_fails_closed() -> None:
             metric="total_ops_per_sec",
             rounds=[parent, later],
         )
+        is later
+    )
+    # A fallback baseline must never postdate the parent round.
+    assert (
+        metric_baseline(
+            parent_round=0,
+            parent_commit="missing",
+            metric="total_ops_per_sec",
+            rounds=[parent, later],
+        )
         is None
+    )
+    # Without any parent linkage the newest official measurement wins.
+    assert (
+        metric_baseline(
+            parent_round=None,
+            parent_commit=None,
+            metric="total_ops_per_sec",
+            rounds=[parent, later],
+        )
+        is later
+    )
+
+
+def test_metric_baseline_skips_untrusted_and_matches_renamed_metrics() -> None:
+    trusted = _round(1, 100.0, hypothesis_id="trusted")
+    self_reported = replace(
+        _round(2, 130.0, hypothesis_id="selfrep"), perf_provenance="implementer"
+    )
+    renamed = replace(_round(3, 120.0, hypothesis_id="renamed"), perf_unit="renamed_headline_unit")
+
+    # An agent self-reported metric never serves as a baseline.
+    assert (
+        metric_baseline(
+            parent_round=2,
+            parent_commit="missing",
+            metric="total_ops_per_sec",
+            rounds=[trusted, self_reported],
+        )
+        is trusted
+    )
+    # A renamed headline unit still matches through the metrics row.
+    assert (
+        metric_baseline(
+            parent_round=3,
+            parent_commit="missing",
+            metric="total_ops_per_sec",
+            rounds=[trusted, renamed],
+        )
+        is renamed
     )
 
 
@@ -361,7 +417,6 @@ def _declared(comparison: MetricComparison | None) -> ResolutionEvidence:
         passed=True,
         reviewed=True,
         comparison=comparison,
-        benchmark_expected=True,
     )
 
 
@@ -379,9 +434,11 @@ def test_resolution_consumes_the_comparison_rather_than_the_readings() -> None:
     assert resolve_hypothesis_outcome(_declared(MetricComparison.INCOMPARABLE)) is (
         HypothesisResolution.INCONCLUSIVE
     )
-    # ``None`` is a different fact: no official metric was recorded at all, so
-    # a nomination stays undecided rather than being ruled against.
-    assert resolve_hypothesis_outcome(_declared(None)) is HypothesisResolution.INCONCLUSIVE
+    # ``None`` is a different fact: no comparison exists, either because no
+    # official metric was recorded or because the number is the implementer's
+    # own. A nomination is then unmeasured, not inconclusive -- INCONCLUSIVE
+    # reports a trusted measurement that failed to decide the claim.
+    assert resolve_hypothesis_outcome(_declared(None)) is HypothesisResolution.UNMEASURED
 
 
 def test_retention_consumes_the_comparison_against_the_best_prior() -> None:
@@ -545,3 +602,320 @@ def _strip_stored_comparisons(state: AgentRunState) -> AgentRunState:
         for record in hypothesis["rounds"]:
             record["perf_comparison"] = None
     return AgentRunState.model_validate(payload)
+
+
+def _implementer_reported_run() -> AgentRunState:
+    """Two official rounds whose numbers the implementer reported itself.
+
+    Shaped so a trusted reading would resolve the second hypothesis: 100 then
+    200 on a maximize axis, an unmissable improvement. The only thing standing
+    between it and ``PROVEN`` is that the framework measured neither number.
+    """
+    state = AgentRunState(
+        metrics=MetricSpace(objectives=(Objective(name="total_ops_per_sec", direction="max"),))
+    )
+    baseline = append_round(
+        start_hypothesis(state, _plan("H-base"), started_round=1),
+        _round(1, 100.0, hypothesis_id="H-base", provenance="implementer"),
+        keep_active=False,
+    )
+    started = start_hypothesis(
+        baseline,
+        _plan("H-1"),
+        started_round=2,
+        parent_round=1,
+        parent_commit=f"{1:040x}",
+    )
+    return append_round(
+        started,
+        _round(
+            2,
+            200.0,
+            hypothesis_id="H-1",
+            parent_round=1,
+            parent_commit=f"{1:040x}",
+            outcome="unmeasured",
+            provenance="implementer",
+        ),
+        keep_active=False,
+    )
+
+
+def test_delta_reason_separates_a_first_reading_from_a_failed_lookup() -> None:
+    """Round one, a fail-closed lookup, and a resolved baseline stay apart."""
+    first = _round(1, 100.0, hypothesis_id="H-1")
+    state = start_hypothesis(AgentRunState(), _plan("H-1"), started_round=1)
+    state = append_round(state, first, keep_active=False)
+    # The parent commit matches no trusted official round and no parent round
+    # bounds the fallback: the exact shape `metric_baseline` fails closed on.
+    state = start_hypothesis(state, _plan("H-2"), started_round=2, parent_commit="f" * 40)
+    state = append_round(
+        state,
+        _round(2, 200.0, hypothesis_id="H-2", parent_commit="f" * 40),
+        keep_active=False,
+    )
+    state = start_hypothesis(
+        state, _plan("H-3"), started_round=3, parent_round=1, parent_commit=first.commit
+    )
+    state = append_round(
+        state,
+        _round(3, 300.0, hypothesis_id="H-3", parent_round=1, parent_commit=first.commit),
+        keep_active=False,
+    )
+
+    round_one = state.by_id("H-1")
+    unresolved = state.by_id("H-2")
+    resolved = state.by_id("H-3")
+    assert round_one is not None
+    assert round_one.measurement is not None
+    assert round_one.measurement.delta_pct is None
+    assert round_one.measurement.delta_reason is PerfDeltaReason.NO_BASELINE_YET
+    assert measurement_delta_reason(round_one) is PerfDeltaReason.NO_BASELINE_YET
+    assert unresolved is not None
+    assert unresolved.measurement is not None
+    assert unresolved.measurement.delta_pct is None
+    assert unresolved.measurement.delta_reason is PerfDeltaReason.BASELINE_UNRESOLVED
+    assert measurement_delta_reason(unresolved) is PerfDeltaReason.BASELINE_UNRESOLVED
+    assert resolved is not None
+    assert resolved.measurement is not None
+    assert resolved.measurement.delta_pct is not None
+    assert resolved.measurement.delta_reason is None
+    assert measurement_delta_reason(resolved) is None
+
+
+def test_a_self_reported_headline_reads_as_not_framework_measured() -> None:
+    """No measurement exists to carry the reason, so the rounds answer it."""
+    hypothesis = _implementer_reported_run().by_id("H-1")
+
+    assert hypothesis is not None
+    assert hypothesis.measurement is None
+    assert measurement_delta_reason(hypothesis) is PerfDeltaReason.NOT_FRAMEWORK_MEASURED
+
+
+def test_a_legacy_absolute_reading_carries_no_delta_reason() -> None:
+    """A record predating provenance keeps reading as a deliberate absolute."""
+    state = start_hypothesis(AgentRunState(), _plan("H-1"), started_round=1)
+    state = append_round(state, _legacy_evidence_round(1, 100.0), keep_active=False)
+
+    hypothesis = state.by_id("H-1")
+    assert hypothesis is not None
+    assert hypothesis.measurement is not None
+    assert hypothesis.measurement.delta_pct is None
+    assert hypothesis.measurement.delta_reason is None
+    assert measurement_delta_reason(hypothesis) is None
+
+
+def test_a_self_reported_improvement_never_resolves_proven() -> None:
+    """Regression for #475: the agent's own number cannot prove its own claim.
+
+    An implementer-reported round stores no comparison, so resolution has
+    nothing to order and the hypothesis is unmeasured, not proven.
+    """
+    hypothesis = _implementer_reported_run().by_id("H-1")
+
+    assert hypothesis is not None
+    assert hypothesis.resolution is HypothesisResolution.UNMEASURED
+
+
+def test_reprojection_of_a_self_reported_round_stays_unmeasured() -> None:
+    """The guard `round_comparison` needs, stated as the property it protects.
+
+    An implementer round stores no comparison, which on disk is
+    indistinguishable from a round written before the framework stored one.
+    The re-derivation fallback would happily order 200 against 100 and hand
+    back ``BETTER``, so ``--resume`` and the server read path would report
+    ``INCONCLUSIVE``-or-better where the loop recorded ``UNMEASURED``.
+    Reprojection must agree with the round record.
+    """
+    completed = _implementer_reported_run()
+    live = completed.by_id("H-1")
+    resumed = reproject_run_evidence(completed).by_id("H-1")
+
+    assert live is not None
+    assert resumed is not None
+    assert resumed.resolution is live.resolution
+    assert resumed.resolution is HypothesisResolution.UNMEASURED
+    assert [record.hypothesis_outcome for record in resumed.rounds] == ["unmeasured"]
+
+
+def test_a_self_reported_round_is_not_a_baseline_for_a_later_trusted_one() -> None:
+    """A trusted round is never ordered against an untrusted baseline."""
+    state = _implementer_reported_run()
+    started = start_hypothesis(
+        state,
+        _plan("H-2"),
+        started_round=3,
+        parent_round=2,
+        parent_commit=f"{2:040x}",
+    )
+    completed = append_round(
+        started,
+        _round(
+            3,
+            300.0,
+            hypothesis_id="H-2",
+            parent_round=2,
+            parent_commit=f"{2:040x}",
+        ),
+        keep_active=False,
+    )
+    hypothesis = completed.by_id("H-2")
+
+    assert hypothesis is not None
+    # Nothing trusted precedes round three, so its reading cannot be ordered:
+    # incomparable, not "better than the implementer's 200".
+    assert hypothesis.resolution is HypothesisResolution.INCONCLUSIVE
+
+
+def test_provisional_parent_baseline_now_resolves_via_fallback() -> None:
+    # official_eval_every >= 2: the causal parent is a provisional round, so
+    # an exact parent-commit match cannot exist among official records. The
+    # fallback baseline still lets the measurement and resolution land.
+    official = _round(1, 100.0, hypothesis_id="H-1")
+    provisional = _round(2, None, hypothesis_id="H-2", declared="continue", outcome="continue")
+    child = _round(
+        3,
+        120.0,
+        hypothesis_id="H-3",
+        parent_round=2,
+        parent_commit=provisional.commit,
+    )
+
+    state = start_hypothesis(AgentRunState(), _plan("H-1"), started_round=1)
+    state = append_round(state, official, keep_active=False)
+    state = start_hypothesis(state, _plan("H-2"), started_round=2)
+    state = append_round(state, provisional, keep_active=False)
+    state = start_hypothesis(
+        state,
+        _plan("H-3"),
+        started_round=3,
+        parent_round=2,
+        parent_commit=provisional.commit,
+    )
+    state = append_round(state, child, keep_active=False)
+
+    resolved = state.by_id("H-3")
+    assert resolved is not None
+    assert resolved.measurement is not None
+    assert resolved.measurement.baseline_round == 1
+    assert resolved.measurement.baseline_value == 100.0
+    # The reported baseline commit is the round the value came from, not the
+    # hypothesis's parent commit. Those are the same only when the exact parent
+    # match wins; here the fallback chose round one, so reporting the
+    # provisional round two's commit would name a commit whose measurement was
+    # never used.
+    assert resolved.measurement.baseline_commit == official.commit
+    assert resolved.measurement.baseline_commit != provisional.commit
+    assert resolved.resolution is HypothesisResolution.PROVEN
+
+
+def test_an_unfindable_parent_commit_with_no_round_bound_fails_closed() -> None:
+    """A named parent we cannot place is not an invitation to guess.
+
+    With a parent round the fallback is bounded: it takes the newest official
+    measurement that does not postdate the parent. With no round at all there
+    is nothing to bound it, so returning the newest measurement could hand back
+    a round recorded *after* the parent and invert cause and effect. Return
+    nothing instead; the hypothesis then resolves unmeasured rather than
+    against an arbitrary comparison.
+    """
+    parent = _round(1, 100.0, hypothesis_id="parent")
+    later = _round(2, 120.0, hypothesis_id="later")
+
+    assert (
+        metric_baseline(
+            parent_round=None,
+            parent_commit="a commit no official round carries",
+            metric="total_ops_per_sec",
+            rounds=[parent, later],
+        )
+        is None
+    )
+    # Contrast: no parent linkage at all is not a failure to place a parent, so
+    # the newest official measurement is still the right baseline.
+    assert (
+        metric_baseline(
+            parent_round=None,
+            parent_commit=None,
+            metric="total_ops_per_sec",
+            rounds=[parent, later],
+        )
+        is later
+    )
+
+
+def _derived_round(  # noqa: PLR0913
+    number: int,
+    metric: float,
+    *,
+    unit: str,
+    metrics: dict[str, float],
+    parent_round: int | None = None,
+    parent_commit: str | None = None,
+) -> RoundRecord:
+    """A round whose retention the framework must derive rather than read.
+
+    ``_retained`` short-circuits on a stored ``candidate_retained`` and on a
+    recorded ``judge_verdict``, so neither is set here: this is the
+    compatibility path where the comparison history actually gets walked.
+    """
+    return RoundRecord(
+        round_number=number,
+        commit=f"{number:040x}",
+        perf_metric=metric,
+        perf_unit=unit,
+        passed=True,
+        reviewed=True,
+        hypothesis_id=f"H-{number}",
+        hypothesis_declared_outcome="nominated",
+        hypothesis_outcome="proven",
+        hypothesis_claim=f"claim H-{number}",
+        hypothesis_task=f"implement H-{number}",
+        hypothesis_parent_round=parent_round,
+        hypothesis_parent_commit=parent_commit,
+        metrics=metrics,
+        official_evaluation=True,
+        perf_direction="max",
+    )
+
+
+def test_retention_sees_the_same_history_the_baseline_does() -> None:
+    """A renamed headline unit must not shorten retention's comparison set.
+
+    ``metric_baseline`` admits a prior round that carries the axis in its
+    objective row even when its headline unit was renamed. Retention used to
+    match on the headline unit alone, so the two disagreed about how much
+    history existed: resolution compared against the renamed round while
+    retention behaved as if this were the first reading ever taken, which it
+    always retains.
+    """
+    renamed = _derived_round(
+        1, 100.0, unit="old_headline_name", metrics={"total_ops_per_sec": 100.0}
+    )
+    worse = _derived_round(
+        2,
+        90.0,
+        unit="total_ops_per_sec",
+        metrics={"total_ops_per_sec": 90.0},
+        parent_round=1,
+        parent_commit=renamed.commit,
+    )
+
+    state = start_hypothesis(AgentRunState(), _plan("H-1"), started_round=1)
+    state = append_round(state, renamed, keep_active=False)
+    state = start_hypothesis(
+        state,
+        _plan("H-2"),
+        started_round=2,
+        parent_round=1,
+        parent_commit=renamed.commit,
+    )
+    state = append_round(state, worse, keep_active=False)
+
+    resolved = state.by_id("H-2")
+    assert resolved is not None
+    # Resolution saw the renamed round through its objective row...
+    assert resolved.measurement is not None
+    assert resolved.measurement.baseline_value == 100.0
+    # ...and so must retention: 90 does not advance a best of 100.
+    assert resolved.candidate_retained is False

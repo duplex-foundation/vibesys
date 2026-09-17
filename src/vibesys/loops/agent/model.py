@@ -12,6 +12,7 @@ from vibesys.schemas import (
     CandidateDisposition,
     HypothesisOutcome,
     OrchestratorPlan,
+    PerfDeltaReason,
 )
 from vs_loop_state import RoundRecord
 
@@ -25,6 +26,10 @@ class HypothesisResolution(StrEnum):
     IMPLEMENTATION_FAILED = "implementation_failed"
     BLOCKED = "blocked"
     REJECTED = "rejected"
+    # The review passed but no trusted framework measurement exists, so the
+    # empirical claim is neither proven nor failed. Distinct from INCONCLUSIVE,
+    # which reports a trusted measurement that could not decide the claim.
+    UNMEASURED = "unmeasured"
 
 
 class HypothesisReview(StrEnum):
@@ -58,6 +63,9 @@ class HypothesisMeasurement(BaseModel):
     baseline_commit: str | None = None
     baseline_value: FiniteFloat | None = None
     delta_pct: FiniteFloat | None = None
+    # Why ``delta_pct`` is None, when the evidence can say. None whenever a
+    # baseline was found or the record predates provenance tracking.
+    delta_reason: PerfDeltaReason | None = None
 
 
 class Hypothesis(BaseModel):

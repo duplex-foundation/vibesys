@@ -5,18 +5,40 @@ import {
   TextareaRenderable,
   TextRenderable,
 } from '@opentui/core';
-import {suggestChatSlashCommands} from '../commands.js';
+import {suggestSlashCommands} from '../commands.js';
 import type {ChatMenuRow, SessionState} from '../session-model.js';
+import {SPINNER_FRAMES, SPINNER_INTERVAL_MS} from './activity-bar.js';
+import {applyPaneFocus, paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
+import {elapsedLabel} from './previews.js';
 import {SuggestionMenu} from './suggestion-menu.js';
 import type {Theme} from './theme.js';
 
 const MIN_EDITOR_ROWS = 1;
 const MAX_EDITOR_ROWS = 6;
-const COMPOSER_CHROME = 3;
+/** Border rows the message box adds around the editor it holds. */
+const BOX_CHROME = 2;
+/** The box's own rows plus the hint row above it. */
+const COMPOSER_CHROME = BOX_CHROME + 1;
 const EDITOR_HORIZONTAL_CHROME = 4;
+/**
+ * Viewport height handed to `measureForDimensions`. The measured line count
+ * is not bounded by it; this is the same effectively-unbounded rectangle the
+ * library's own table layout measures with.
+ */
+const MEASURE_HEIGHT = 10_000;
 /** Rows the menu shows at once before it scrolls its selection into view. */
 const MAX_MENU_ROWS = 10;
 const MENU_CHROME = 2;
+const COMPOSER_TITLE = 'Message';
+/**
+ * Composer label while a question is in flight: spinner plus wait time. It is
+ * unpadded because the pane frame owns the padding and the focus gutter, so
+ * the wait and the focus marker compose instead of overwriting each other.
+ */
+export function pendingComposerLabel(frame: number, elapsedMs: number): string {
+  const spinner = SPINNER_FRAMES[frame % SPINNER_FRAMES.length] ?? SPINNER_FRAMES[0];
+  return `${COMPOSER_TITLE} · ${spinner} ${elapsedLabel(elapsedMs)}`;
+}
 
 class ChatTextareaRenderable extends TextareaRenderable {
   override handleKeyPress(key: KeyEvent): boolean {
@@ -68,10 +90,15 @@ export class ChatComposerView {
   readonly #hint: TextRenderable;
   readonly #menuList: TextRenderable;
   #availableWidth = 1;
-  #focused = false;
   #theme: Theme;
   #renderedMenu: string | null = null;
   #lastState: SessionState | null = null;
+  /** Whether the agent still owes an answer, which the title says. */
+  #pending = false;
+  #onScreen = false;
+  #pendingSince = 0;
+  #frame = 0;
+  #timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     renderer: CliRenderer,
@@ -92,11 +119,11 @@ export class ChatComposerView {
     this.#box = new BoxRenderable(renderer, {
       id: `${id}-composer-box`,
       width: '100%',
-      height: MIN_EDITOR_ROWS + 2,
+      height: MIN_EDITOR_ROWS + BOX_CHROME,
       border: true,
-      borderStyle: 'rounded',
-      borderColor: theme.border,
-      title: ' Message ',
+      borderStyle: paneBorderStyle(false),
+      borderColor: paneBorderColor(theme, false),
+      title: paneTitle(COMPOSER_TITLE, false),
       paddingLeft: 1,
       paddingRight: 1,
       onMouseUp: this.onFocusRequest,
@@ -133,18 +160,25 @@ export class ChatComposerView {
     this.menu = new BoxRenderable(renderer, {
       id: `${id}-composer-menu`,
       position: 'absolute',
-      // Anchored directly above the composer, which is the bottom of whichever
-      // chat surface mounts it. Kept in step with the editor's height below.
-      bottom: COMPOSER_CHROME + MIN_EDITOR_ROWS,
+      // Anchored on the message box, not above the whole composer: the hint
+      // row sits over the box, and a menu cleared of it would float with that
+      // row showing through the gap. The command bar's list sits on its own
+      // box the same way. Kept in step with the editor's height below.
+      bottom: MIN_EDITOR_ROWS + BOX_CHROME,
       left: 0,
       width: '100%',
       height: 3,
       visible: false,
       zIndex: 5,
       border: true,
-      borderStyle: 'rounded',
+      // Square with an outer fill, the overlay exception to the fill rule
+      // (tui-conventions.md): this menu floats over the composer, so the fill
+      // has to reach the border ring or the text under it shows through there,
+      // and a fill that reaches the ring can only be honest under a square
+      // corner.
+      borderStyle: 'single',
       borderColor: theme.border,
-      backgroundColor: theme.elevatedSurface,
+      backgroundColor: theme.canvas,
       paddingLeft: 1,
       paddingRight: 1,
     });
@@ -159,8 +193,11 @@ export class ChatComposerView {
     });
     this.menu.add(this.#menuList);
     this.#box.add(this.#editor);
-    this.output.add(this.#box);
+    // Hint first, then the box. The command column on the other side of the
+    // landing view is ordered the same way, so both columns end on a bordered
+    // input and the two boxes share a row.
     this.output.add(this.#hint);
+    this.output.add(this.#box);
   }
 
   /**
@@ -217,7 +254,9 @@ export class ChatComposerView {
 
   /** Recomputes the typed-command matches for the draft's current text. */
   #syncSuggestions(): void {
-    this.draft.suggestions.setMatches(suggestChatSlashCommands(this.draft.value.trim()));
+    this.draft.suggestions.setMatches(
+      suggestSlashCommands(this.draft.value.trim(), {surface: 'chat'}),
+    );
   }
 
   /** Makes this editor authoritative when its presentation becomes visible. */
@@ -227,14 +266,66 @@ export class ChatComposerView {
       this.#editor.setText(this.draft.value);
       this.#syncSuggestions();
     }
-    this.setFocused(focused);
-    this.#box.title = pending ? ' Message · awaiting agent ' : ' Message ';
+    this.#pending = pending;
+    this.#applyChrome();
     this.#hint.content = pending
       ? 'Awaiting the agent · Enter: queue follow-up'
       : focused
         ? 'Enter: send · Shift+Enter: newline'
         : 'Ctrl+W to type here';
     this.#resize();
+  }
+
+  /**
+   * Tracks the question in flight and whether this composer is on screen.
+   *
+   * Callers drive this on every render, before their own visibility gate, the
+   * way `ActivityBarView.render` syncs its timer whether or not the bar is
+   * shown: `activate` runs only while visible, so a question that lands while
+   * this surface is hidden would otherwise leave the interval running forever
+   * and the elapsed epoch stuck at the wait it started.
+   *
+   * The epoch moves only when a question starts, not when the surface returns,
+   * so hiding and reshowing mid-question keeps the wait the operator has
+   * actually been watching.
+   */
+  syncPending(pending: boolean, onScreen: boolean): void {
+    if (pending && !this.#pending) {
+      this.#pendingSince = Date.now();
+      this.#frame = 0;
+    }
+    this.#pending = pending;
+    this.#onScreen = onScreen;
+    this.#refreshTitle();
+    this.#syncTimer();
+  }
+
+  /**
+   * Releases the animation timer. Pending state is cleared with it, so a
+   * composer that is activated again after a destroyed render tree starts its
+   * next question from a fresh epoch rather than a dead one.
+   */
+  destroy(): void {
+    this.#pending = false;
+    this.#onScreen = false;
+    this.#syncTimer();
+  }
+
+  #syncTimer(): void {
+    if (!this.#pending || !this.#onScreen) {
+      if (this.#timer !== null) clearInterval(this.#timer);
+      this.#timer = null;
+      return;
+    }
+    if (this.#timer !== null) return;
+    this.#timer = setInterval(() => {
+      this.#frame = (this.#frame + 1) % SPINNER_FRAMES.length;
+      this.#refreshTitle();
+    }, SPINNER_INTERVAL_MS);
+  }
+
+  #refreshTitle(): void {
+    this.#applyChrome();
   }
 
   isEmpty(): boolean {
@@ -245,33 +336,70 @@ export class ChatComposerView {
     this.#editor.focus();
   }
 
-  setFocused(focused: boolean): void {
-    this.#focused = focused;
-    this.#box.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
+  /**
+   * The composer's frame, always the resting one.
+   *
+   * The focus treatment names the pane the keys are on, and this box is inside
+   * that pane rather than being one. Wearing it here drew the marker and the
+   * focused border twice, one nested in the other, which is the ambiguity the
+   * treatment exists to remove. Which composer has the cursor is carried by the
+   * cursor itself and by the hint line under the box, both non-colour channels.
+   */
+  #applyChrome(): void {
+    const label = this.#pending
+      ? pendingComposerLabel(this.#frame, Date.now() - this.#pendingSince)
+      : COMPOSER_TITLE;
+    applyPaneFocus(this.#box, this.#theme, label, false);
   }
 
   applyTheme(theme: Theme): void {
     this.#theme = theme;
-    this.#box.borderColor = this.#focused ? theme.borderFocus : theme.border;
+    this.#applyChrome();
     this.#editor.textColor = theme.textStrong;
     this.#editor.focusedTextColor = theme.textStrong;
     this.#hint.fg = theme.textSubtle;
     this.menu.borderColor = theme.border;
-    this.menu.backgroundColor = theme.elevatedSurface;
+    this.menu.backgroundColor = theme.canvas;
     this.#menuList.fg = theme.textPrimary;
+  }
+
+  /**
+   * Rows the draft occupies once the textarea word-wraps it at `width` cells.
+   *
+   * The count is measured by the editor's own edit buffer rather than
+   * estimated from the string: the textarea wraps over display cells and
+   * breaks on word boundaries, so a `ceil(codePoints / width)` estimate
+   * undercounts CJK text (two cells per character) and any draft whose word
+   * breaks leave rows short, and the box sized from the undercount scrolls
+   * wrapped rows out of view (issue #427). Measuring cannot drift from what
+   * the textarea draws, under this or any future wrap mode.
+   *
+   * The prospective width is passed explicitly, so the answer never depends
+   * on a layout pass having run: the height derived here decides the box,
+   * the box decides the layout, and the measurement reads neither back.
+   */
+  #wrappedRows(width: number): number {
+    // The empty editor shows the placeholder, which the measurement would
+    // count; the resting composer stays one row no matter how the placeholder
+    // would wrap.
+    if (this.draft.value.length === 0) return MIN_EDITOR_ROWS;
+    const measured = this.#editor.editorView.measureForDimensions(width, MEASURE_HEIGHT);
+    // Null only if the native view is gone; fall back to the smallest editor
+    // rather than guessing a wrap the buffer can no longer answer for.
+    return measured?.lineCount ?? MIN_EDITOR_ROWS;
   }
 
   #resize(): void {
     const contentWidth = Math.max(1, this.#availableWidth - EDITOR_HORIZONTAL_CHROME);
     const rows = Math.min(
       MAX_EDITOR_ROWS,
-      Math.max(MIN_EDITOR_ROWS, wrappedRows(this.draft.value, contentWidth)),
+      Math.max(MIN_EDITOR_ROWS, this.#wrappedRows(contentWidth)),
     );
     this.#editor.height = rows;
-    this.#box.height = rows + 2;
+    this.#box.height = rows + BOX_CHROME;
     this.output.height = rows + COMPOSER_CHROME;
-    // The menu sits on top of the composer, so it moves with it.
-    this.menu.bottom = this.output.height;
+    // The menu sits on top of the box, so it moves with it.
+    this.menu.bottom = this.#box.height;
   }
 
   #submit(): void {
@@ -316,11 +444,4 @@ function menuRowText(
   // A cursor bar marks the free-text entry as somewhere to type, the same
   // affordance the wizard's model step used.
   return `${marker}   ${typed === '' ? row.label : typed}${selected ? '▏' : ''}`;
-}
-
-function wrappedRows(value: string, width: number): number {
-  if (value.length === 0) return 1;
-  return value
-    .split('\n')
-    .reduce((rows, line) => rows + Math.max(1, Math.ceil([...line].length / width)), 0);
 }

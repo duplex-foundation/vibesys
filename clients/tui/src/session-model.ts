@@ -1,7 +1,10 @@
 import type {
   ChatOptions,
+  DesignFileChange,
+  DesignRound,
   Diagnostic,
   HypothesisEntry,
+  HypothesisRound,
   RunEvent,
   RunSnapshot,
 } from '@vibesys/backend-client';
@@ -19,7 +22,7 @@ import {
   initialCoreState,
   latestDiagnosticChange,
   phasesForRound,
-  type RoundSummary,
+  type RoundState,
   reconcileActiveExecutions,
   reduceEvent,
   reduceEventBatch,
@@ -65,6 +68,12 @@ export interface SessionState {
   todosExpanded: boolean;
   themeName: ThemeName;
   experimentLog: ExperimentLogState | null;
+  /**
+   * Server-derived per-round design log: files each round changed and how its
+   * stages concluded. Null until the first fetch lands; kept when a refresh
+   * fails so the drill-down degrades to stale rather than empty.
+   */
+  designLog: DesignRound[] | null;
   /** Hypothesis summary between the experiment index and a round trajectory. */
   hypothesisDetail: HypothesisDetail | null;
   hypothesisScope: HypothesisScope | null;
@@ -80,6 +89,13 @@ export interface SessionState {
   themePicker: ThemePicker | null;
   /** Root-level error state, independent of the active transcript or log view. */
   errorBanner: ErrorBannerState | null;
+  /**
+   * A `scope: 'input'` message, shown on the command input's hint row rather
+   * than the banner. Unlike `errorBanner`, this never carries a backend
+   * `detail`/`hint`: it names a typo in what the operator just typed, so it is
+   * a short client-side string rather than a diagnostic.
+   */
+  inputError: string | null;
 }
 
 export type ErrorSeverity = 'recoverable' | 'fatal';
@@ -157,6 +173,12 @@ export type ExperimentIndexItem =
 export interface HypothesisScope {
   id: string;
   label: string;
+  /**
+   * The claim on its own, without the `· r1-r2` range `label` carries. The
+   * header shows this: the range duplicates the rounds strip, and spending
+   * header width on it pushed the title itself off the line.
+   */
+  title: string;
   rounds: number[];
   /** A single recorded round not yet associated with a hypothesis. */
   source?: 'hypothesis' | 'round';
@@ -167,7 +189,7 @@ export interface HypothesisScope {
  * over it. Content is pre-rendered text so the pane stays agnostic about which
  * command produced it and a new command needs no new layout code.
  */
-export type PaneView = 'perf';
+export type PaneView = 'perf' | 'design';
 
 export interface RightPane {
   view: PaneView;
@@ -192,8 +214,14 @@ export interface LayoutState {
   zoomedPane: PaneId | null;
 }
 
-/** Semantic pane identities, independent of their current screen position. */
-export type PaneId = 'agents' | 'chat' | 'experiments' | 'performance' | 'transcript';
+/**
+ * Semantic pane identities, independent of their current screen position.
+ *
+ * `todos` is the expanded todo list. It is a strip rather than a column, but it
+ * takes the arrow keys from the pane it opens over, so it is a pane for the
+ * purpose the identities exist for: naming the one surface the keys are on.
+ */
+export type PaneId = 'agents' | 'chat' | 'experiments' | 'performance' | 'todos' | 'transcript';
 
 export interface ThemePicker {
   selected: ThemeName;
@@ -264,6 +292,13 @@ export interface ConversationEntry {
   invocationId?: string;
   startsTurn?: boolean;
   toolCall?: string;
+  /**
+   * A shell command to give code treatment instead of word-wrapped prose.
+   * Set from a typed `gate_started` event's `command` field, or, for
+   * recorded/legacy prose, split out by core-state's
+   * `splitFrameworkValidationCommand`.
+   */
+  command?: string;
   toolResponse?: string;
   toolName?: string;
   toolCallId?: string;
@@ -293,6 +328,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     // The experiment log is the landing view: a run's history reads as a short
     // list of claims before it reads as a long list of rounds.
     experimentLog: {entries: [], selectedId: null, pending: true, error: null},
+    designLog: null,
     hypothesisDetail: null,
     hypothesisScope: null,
     layout: {right: null, focus: 'left', zoomedPane: null},
@@ -301,6 +337,7 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     chatDockFits: true,
     themePicker: null,
     errorBanner: null,
+    inputError: null,
   };
 }
 
@@ -329,11 +366,14 @@ export function experimentLogVisible(state: SessionState): boolean {
  * The chat is docked on the landing view: it is part of that view rather than a
  * dialog over it, so a question never hides the table it is about. Inside a
  * hypothesis, and in a terminal too narrow for two columns, it stays the modal
- * it was.
+ * it was. Zoom hands the content row to one pane, so while any other pane is
+ * zoomed the dock is off screen and the chat is the modal again; otherwise
+ * ``/chat`` would put the keys on a composer the operator cannot see.
  */
 export function chatDocked(state: SessionState): boolean {
   return (
     state.chatDockFits &&
+    (state.layout.zoomedPane === null || state.layout.zoomedPane === 'chat') &&
     state.experimentLog !== null &&
     state.hypothesisDetail === null &&
     state.hypothesisScope === null
@@ -635,72 +675,189 @@ export function openExperimentLog(state: SessionState): SessionState {
 export function setExperiments(state: SessionState, entries: HypothesisEntry[]): SessionState {
   const log = state.experimentLog;
   if (log === null) return state;
+
   const activity = hypothesisPlanningActivity(state);
-  const selectedActivityRound =
-    log.selectedActivity === true
-      ? (log.selectedActivityRound ?? activity?.roundNumber ?? null)
-      : null;
-  const orderedEntries = [...entries].sort(compareHypothesisEntries);
-  const keys = orderedEntries.map(entryKey);
-  const materializedActivity =
-    selectedActivityRound === null
-      ? undefined
-      : orderedEntries.find(entry => scopeRounds(entry).includes(selectedActivityRound));
-  // Keep the operator's row when it still exists; otherwise fall back to the
-  // active hypothesis, then to the first row.
-  const selectedId =
-    materializedActivity !== undefined
-      ? entryKeyFor(orderedEntries, materializedActivity)
-      : log.selectedId !== null && keys.includes(log.selectedId)
-        ? log.selectedId
-        : (keys[orderedEntries.findIndex(entry => entry.active === true)] ?? keys[0] ?? null);
-  const unownedRounds = unownedExperimentRounds(state, orderedEntries);
-  const currentUnownedRound = log.selectedUnownedRound;
-  const selectedUnownedRound =
-    currentUnownedRound !== undefined &&
-    currentUnownedRound !== null &&
-    unownedRounds.includes(currentUnownedRound)
-      ? currentUnownedRound
-      : orderedEntries.length === 0
-        ? (unownedRounds[0] ?? null)
-        : null;
-  const currentDetail = state.hypothesisDetail;
-  const detailEntry =
-    currentDetail === null
-      ? undefined
-      : orderedEntries.find((entry, index) => entryKey(entry, index) === currentDetail.entryKey);
-  const detailRounds = detailEntry === undefined ? [] : scopeRounds(detailEntry);
-  const hypothesisDetail =
-    currentDetail === null || detailEntry === undefined
-      ? null
-      : {
-          entryKey: currentDetail.entryKey,
-          selectedRound:
-            currentDetail.selectedRound !== null &&
-            detailRounds.includes(currentDetail.selectedRound)
-              ? currentDetail.selectedRound
-              : (detailRounds.at(-1) ?? null),
-        };
-  return {
+  const indexed = orderAndIndexExperiments(entries);
+  const selection = reconcileExperimentSelection(log, indexed, activity);
+  const unownedRounds = unownedExperimentRounds(state, indexed.entries);
+  const selectedUnownedRound = reconcileUnownedRoundSelection(
+    log.selectedUnownedRound,
+    unownedRounds,
+    indexed.entries.length === 0,
+  );
+  const hypothesisDetail = reconcileHypothesisDetail(state.hypothesisDetail, indexed.entries);
+  const refreshed: SessionState = {
     ...state,
     hypothesisDetail,
     experimentLog: {
       ...log,
-      entries: orderedEntries,
-      selectedId,
-      selectedActivity: materializedActivity === undefined && log.selectedActivity === true,
-      selectedActivityRound: materializedActivity === undefined ? selectedActivityRound : null,
+      entries: indexed.entries,
+      ...selection,
       selectedUnownedRound,
       pending: false,
       error: null,
     },
   };
+  return refreshLiveHypothesisScope(state, refreshed);
+}
+
+interface IndexedExperiments {
+  entries: HypothesisEntry[];
+  keys: string[];
+}
+
+/** Establish the canonical response order once and retain its stable row identities. */
+function orderAndIndexExperiments(entries: HypothesisEntry[]): IndexedExperiments {
+  const ordered = [...entries].sort(compareHypothesisEntries);
+  return {entries: ordered, keys: ordered.map(entryKey)};
+}
+
+type ExperimentSelection = Pick<
+  ExperimentLogState,
+  'selectedId' | 'selectedActivity' | 'selectedActivityRound'
+>;
+
+/** Reconcile the selected index row, including planning work that became persistent. */
+function reconcileExperimentSelection(
+  log: ExperimentLogState,
+  indexed: IndexedExperiments,
+  activity: HypothesisPlanningActivity | null,
+): ExperimentSelection {
+  const selectedActivityRound =
+    log.selectedActivity === true
+      ? (log.selectedActivityRound ?? activity?.roundNumber ?? null)
+      : null;
+  const materializedActivity =
+    selectedActivityRound === null
+      ? undefined
+      : indexed.entries.find(entry => scopeRounds(entry).includes(selectedActivityRound));
+  // Keep the operator's row when it still exists; otherwise fall back to the
+  // active hypothesis, then to the first row.
+  const selectedId =
+    materializedActivity !== undefined
+      ? entryKeyFor(indexed.entries, materializedActivity)
+      : log.selectedId !== null && indexed.keys.includes(log.selectedId)
+        ? log.selectedId
+        : (indexed.keys[indexed.entries.findIndex(entry => entry.active === true)] ??
+          indexed.keys[0] ??
+          null);
+  return {
+    selectedId,
+    selectedActivity: materializedActivity === undefined && log.selectedActivity === true,
+    selectedActivityRound: materializedActivity === undefined ? selectedActivityRound : null,
+  };
+}
+
+/** Keep an unowned-round cursor only while that row remains in the refreshed index. */
+function reconcileUnownedRoundSelection(
+  current: number | null | undefined,
+  unownedRounds: number[],
+  hasNoHypotheses: boolean,
+): number | null {
+  if (current !== undefined && current !== null && unownedRounds.includes(current)) return current;
+  return hasNoHypotheses ? (unownedRounds[0] ?? null) : null;
+}
+
+/** Keep an open summary on the same hypothesis and fall back to its latest available round. */
+function reconcileHypothesisDetail(
+  currentDetail: HypothesisDetail | null,
+  entries: HypothesisEntry[],
+): HypothesisDetail | null {
+  const detailEntry =
+    currentDetail === null
+      ? undefined
+      : entries.find((entry, index) => entryKey(entry, index) === currentDetail.entryKey);
+  const detailRounds = detailEntry === undefined ? [] : scopeRounds(detailEntry);
+  if (currentDetail === null || detailEntry === undefined) return null;
+  return {
+    entryKey: currentDetail.entryKey,
+    selectedRound:
+      currentDetail.selectedRound !== null && detailRounds.includes(currentDetail.selectedRound)
+        ? currentDetail.selectedRound
+        : (detailRounds.at(-1) ?? null),
+  };
+}
+
+/** Re-derive an open trajectory's scope from the refreshed ownership payload. */
+function refreshLiveHypothesisScope(previous: SessionState, refreshed: SessionState): SessionState {
+  if (previous.hypothesisScope === null) return refreshed;
+  // A live scope must describe the fresh payload: a continuation round joins
+  // its hypothesis's scope, and a scope whose hypothesis vanished degrades to
+  // the round on screen rather than keeping the stale title over it.
+  const anchor = visibleRoundNumber(previous);
+  return anchor === null ? refreshed : {...refreshed, ...scopeStateForRound(refreshed, anchor)};
 }
 
 export function failExperiments(state: SessionState, error: string): SessionState {
   const log = state.experimentLog;
   if (log === null) return state;
   return {...state, experimentLog: {...log, pending: false, error}};
+}
+
+export function setDesignLog(state: SessionState, rounds: DesignRound[]): SessionState {
+  return {...state, designLog: rounds};
+}
+
+/** The design entry for one round, or null before the log has loaded it. */
+export function designRoundFor(
+  state: SessionState,
+  roundNumber: number | null,
+): DesignRound | null {
+  if (roundNumber === null || state.designLog === null) return null;
+  return state.designLog.find(round => round.round === roundNumber) ?? null;
+}
+
+/**
+ * The experiment log's record for one round, or null before the log has it.
+ * Every stage fact about a round, including its measured delta, lives here:
+ * the design log carries only the file list, so a consumer that wants an
+ * outcome reads this rather than the design record.
+ */
+export function hypothesisRoundFor(
+  state: SessionState,
+  roundNumber: number | null,
+): HypothesisRound | null {
+  if (roundNumber === null) return null;
+  for (const entry of state.experimentLog?.entries ?? []) {
+    const record = entry.rounds?.find(candidate => candidate.round === roundNumber);
+    if (record !== undefined) return record;
+  }
+  return null;
+}
+
+/**
+ * One round as both surfaces know it: the experiment log owns every stage
+ * fact, the design log owns only the file list. The join is by round number,
+ * which is the identity both fetches agree on, so the two can never describe
+ * the same round differently.
+ */
+export interface DesignRoundView {
+  round: number;
+  files: DesignFileChange[] | null;
+  hypothesisId: string | null;
+  title: string | null;
+  /** The experiment log's row for this round, absent for a round it lost. */
+  record: HypothesisRound | null;
+}
+
+export function designRoundViews(
+  designLog: readonly DesignRound[],
+  entries: readonly HypothesisEntry[],
+): DesignRoundView[] {
+  const owners = new Map<number, {entry: HypothesisEntry; record: HypothesisRound}>();
+  for (const entry of entries) {
+    for (const record of entry.rounds ?? []) owners.set(record.round, {entry, record});
+  }
+  return designLog.map(design => {
+    const owner = owners.get(design.round) ?? null;
+    return {
+      round: design.round,
+      files: design.files ?? null,
+      hypothesisId: owner?.entry.hypothesis_id ?? null,
+      title: owner?.entry.title ?? owner?.entry.claim ?? null,
+      record: owner?.record ?? null,
+    };
+  });
 }
 
 export function moveExperimentSelection(state: SessionState, delta: number): SessionState {
@@ -798,14 +955,9 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
     const roundNumber = state.hypothesisDetail.selectedRound;
     return roundNumber === null ? state : (enterExperimentRound(state, roundNumber) ?? state);
   }
-  const activity = hypothesisPlanningActivity(state);
-  if (
-    activity !== null &&
-    (state.experimentLog?.selectedActivity === true ||
-      (state.experimentLog?.entries.length === 0 &&
-        (state.experimentLog?.selectedUnownedRound ?? null) === null))
-  ) {
-    return enterUnownedExperimentRound(state, activity.roundNumber) ?? state;
+  const activityRound = selectedPlanningActivityRound(state);
+  if (activityRound !== null) {
+    return enterUnownedExperimentRound(state, activityRound) ?? state;
   }
   const selectedRound =
     state.experimentLog?.selectedUnownedRound ??
@@ -818,10 +970,80 @@ export function enterExperimentDrilldown(state: SessionState): SessionState {
   return openHypothesisDetail(state);
 }
 
+/** The live planning round when it is the selected, or only, index item. */
+function selectedPlanningActivityRound(state: SessionState): number | null {
+  const activity = hypothesisPlanningActivity(state);
+  if (activity === null) return null;
+  const log = state.experimentLog;
+  const selected = log?.selectedActivity === true;
+  const onlyItem = log?.entries.length === 0 && (log.selectedUnownedRound ?? null) === null;
+  return selected || onlyItem ? activity.roundNumber : null;
+}
+
 /** Leaves a trajectory for its hypothesis summary, preserving the round cursor. */
 export function leaveExperimentDrilldown(state: SessionState): SessionState {
   if (state.hypothesisScope === null) return state;
   return {...state, hypothesisScope: null, selectedRound: null, selectedAgentKind: null};
+}
+
+/**
+ * The scope, its Esc target, and the log selection implied by one round.
+ *
+ * Round navigation deliberately covers the whole run, so the scope follows the
+ * selected round: whichever hypothesis owns the round on screen is the one the
+ * header, the agent map, and Esc must describe. A round no hypothesis claims
+ * is scoped as itself rather than left under another hypothesis's title.
+ * Derived in one place so drilldown entry, round navigation, and an
+ * experiments refresh cannot disagree about what is on screen.
+ */
+function scopeStateForRound(
+  state: SessionState,
+  roundNumber: number,
+): Pick<SessionState, 'hypothesisScope' | 'hypothesisDetail' | 'experimentLog'> {
+  const entries = state.experimentLog?.entries ?? [];
+  const entryIndex = entries.findIndex(candidate => scopeRounds(candidate).includes(roundNumber));
+  const entry = entries[entryIndex];
+  if (entry === undefined) {
+    return {
+      hypothesisScope: reuseScope(state.hypothesisScope, {
+        id: `round-${roundNumber}`,
+        label: `Round ${roundNumber}`,
+        title: `Round ${roundNumber}`,
+        rounds: [roundNumber],
+        source: 'round',
+      }),
+      hypothesisDetail: null,
+      experimentLog: state.experimentLog,
+    };
+  }
+  const entryKeyValue = entryKey(entry, entryIndex);
+  return {
+    hypothesisScope: reuseScope(state.hypothesisScope, {
+      id: entry.hypothesis_id,
+      label: hypothesisLabel(entry),
+      title: hypothesisTitle(entry),
+      rounds: scopeRounds(entry),
+      source: 'hypothesis',
+    }),
+    hypothesisDetail: {entryKey: entryKeyValue, selectedRound: roundNumber},
+    experimentLog:
+      state.experimentLog === null || state.experimentLog.selectedId === entryKeyValue
+        ? state.experimentLog
+        : {...state.experimentLog, selectedId: entryKeyValue},
+  };
+}
+
+/** Keeps the current scope object when the derived one says the same thing. */
+function reuseScope(current: HypothesisScope | null, derived: HypothesisScope): HypothesisScope {
+  return current !== null &&
+    current.id === derived.id &&
+    current.label === derived.label &&
+    current.title === derived.title &&
+    current.source === derived.source &&
+    current.rounds.length === derived.rounds.length &&
+    current.rounds.every((round, index) => round === derived.rounds[index])
+    ? current
+    : derived;
 }
 
 /**
@@ -834,29 +1056,17 @@ export function enterExperimentRound(
   roundNumber: number,
 ): SessionState | null {
   const entries = state.experimentLog?.entries ?? [];
-  const entryIndex = entries.findIndex(candidate => scopeRounds(candidate).includes(roundNumber));
-  const entry = entries[entryIndex];
-  if (entry === undefined) return null;
-  const entryKeyValue = entryKey(entry, entryIndex);
-  const scoped: SessionState = {
+  if (!entries.some(candidate => scopeRounds(candidate).includes(roundNumber))) return null;
+  return {
     ...state,
     overlay: null,
     chatOpen: false,
     layout: {right: null, focus: 'left', zoomedPane: null},
-    hypothesisScope: {
-      id: entry.hypothesis_id,
-      label: hypothesisLabel(entry),
-      rounds: scopeRounds(entry),
-      source: 'hypothesis',
-    },
+    ...scopeStateForRound(state, roundNumber),
     selectedRound: roundNumber,
     selectedAgentKind: null,
     selectedEntryId: null,
-    hypothesisDetail: {entryKey: entryKeyValue, selectedRound: roundNumber},
-    experimentLog:
-      state.experimentLog === null ? null : {...state.experimentLog, selectedId: entryKeyValue},
   };
-  return scoped;
 }
 
 /**
@@ -874,13 +1084,7 @@ export function enterUnownedExperimentRound(
     overlay: null,
     chatOpen: false,
     layout: {right: null, focus: 'left', zoomedPane: null},
-    hypothesisDetail: null,
-    hypothesisScope: {
-      id: `round-${roundNumber}`,
-      label: `Round ${roundNumber}`,
-      rounds: [roundNumber],
-      source: 'round',
-    },
+    ...scopeStateForRound(state, roundNumber),
     selectedRound: roundNumber,
     selectedAgentKind: null,
     selectedEntryId: null,
@@ -909,12 +1113,17 @@ export function hypothesisRoundNumbers(entry: HypothesisEntry): number[] {
   return scopeRounds(entry);
 }
 
+/** The claim itself, falling back to its id when the record carries no title. */
+function hypothesisTitle(entry: HypothesisEntry): string {
+  return entry.title ?? entry.hypothesis_id;
+}
+
 function hypothesisLabel(entry: HypothesisEntry): string {
   const range =
     entry.first_round === entry.last_round
       ? `r${entry.first_round}`
       : `r${entry.first_round}-${entry.last_round}`;
-  return `${entry.title ?? entry.hypothesis_id} · ${range}`;
+  return `${hypothesisTitle(entry)} · ${range}`;
 }
 
 export function selectedExperiment(state: SessionState): HypothesisEntry | null {
@@ -1085,12 +1294,19 @@ function planningStage(
   if (roundLabel === null) return null;
   if (agentKind === 'orchestrator' && /^round-\d+-pre$/.test(roundLabel)) return 'pre';
   if (agentKind === 'profiler' && /^round-\d+-profiler$/.test(roundLabel)) return 'profile';
-  if (agentKind === 'orchestrator' && /^round-\d+-plan$/.test(roundLabel)) return 'plan';
+  // A plan the framework reprompted carries `round-N-retry-K-plan`. It is the
+  // same planning stage, produced by the same role for the same round, so it
+  // must not fall out of the planning activity just because the first attempt
+  // was rejected.
+  if (agentKind === 'orchestrator' && /^round-\d+(?:-retry-\d+)?-plan$/.test(roundLabel)) {
+    return 'plan';
+  }
   return null;
 }
 
 export const PANE_TITLES: Record<PaneView, string> = {
   perf: 'Performance',
+  design: 'Design changes',
 };
 
 /**
@@ -1169,8 +1385,31 @@ export function normalizeFocus(state: SessionState): SessionState {
     visiblePaneIds({...state, layout: {...state.layout, focus}}).includes(state.layout.zoomedPane)
       ? state.layout.zoomedPane
       : null;
-  if (focus === state.layout.focus && zoomedPane === state.layout.zoomedPane) return state;
-  return {...state, layout: {...state.layout, focus, zoomedPane}};
+  const next =
+    focus === state.layout.focus && zoomedPane === state.layout.zoomedPane
+      ? state
+      : {...state, layout: {...state.layout, focus, zoomedPane}};
+  return normalizeRoundFocus(next);
+}
+
+/**
+ * The round view's focus obeys the same rule as the columns above: it has to
+ * name a pane that is on screen. Beside a visualization a stored 'agents'
+ * focus is a parked value that `focusedPane` and the key routing both ignore
+ * and closing the pane restores, so it stays. A zoom has no restore point, so
+ * focus stranded behind one moves to the pane the zoom kept. The agent filter
+ * stays: its `filtered to <agent>` header cue is painted above the zoom, so
+ * the transcript is never narrowed without a signal.
+ */
+function normalizeRoundFocus(state: SessionState): SessionState {
+  if (experimentLogVisible(state) || state.layout.right !== null) return state;
+  if (!roundPaneVisible(state, 'agents') && state.roundFocus === 'agents') {
+    return {...state, roundFocus: 'transcript'};
+  }
+  if (!roundPaneVisible(state, 'transcript') && state.roundFocus === 'transcript') {
+    return {...state, roundFocus: 'agents'};
+  }
+  return state;
 }
 
 /** Escape from a round view: close whatever is layered over it, all of it. */
@@ -1190,13 +1429,57 @@ export function focusPane(state: SessionState, focus: PaneFocus): SessionState {
   return {...state, layout: {...state.layout, focus}};
 }
 
-/** The semantic pane currently receiving pane navigation keys. */
+/**
+ * True while the expanded todo list is on screen and taking the arrow keys.
+ *
+ * `keybindings` routes Up and Down to the list for as long as it is open, so
+ * the list rather than the pane it opened over is the surface those keys are
+ * on. Derived from the toggle rather than stored beside it: collapsing the list
+ * hands the keys back to whichever pane held them, with nothing to restore.
+ *
+ * The strip is drawn whenever the visible agent has todos, including under a
+ * zoomed pane, so this is the whole condition: an empty list is not on screen
+ * and cannot hold the keys.
+ */
+export function todoListFocused(state: SessionState): boolean {
+  if (experimentLogVisible(state) || !state.todosExpanded) return false;
+  return visibleTodos(state).length > 0;
+}
+
+/**
+ * True while the named round pane is on screen, mirroring the render path: a
+ * zoom on the other pane hides it, and a visualization takes the agents pane's
+ * place (in a terminal too narrow to split, the visualization's fallback modal
+ * covers the pane and takes the keys, so it is unavailable either way). Round
+ * focus only moves to a pane this returns true for, so the keys and the agent
+ * filter can never land on a pane the operator cannot see.
+ */
+export function roundPaneVisible(state: SessionState, pane: RoundFocus): boolean {
+  if (experimentLogVisible(state)) return false;
+  const zoomed = state.layout.zoomedPane;
+  if (pane === 'agents') {
+    return state.layout.right === null && (zoomed === null || zoomed === 'agents');
+  }
+  return zoomed === null || zoomed === 'transcript';
+}
+
+/**
+ * The semantic pane currently receiving pane navigation keys, and the single
+ * authority for the focus treatment: every pane view compares its own `PaneId`
+ * against this, so at most one of them can be lit at a time. Surfaces that are
+ * not panes, the command box above all, never wear that treatment, and neither
+ * does a box nested inside a pane that already wears it.
+ */
 export function focusedPane(state: SessionState): PaneId {
   if (experimentLogVisible(state)) {
     if (state.layout.focus === 'chat' && chatPaneVisible(state)) return 'chat';
     if (state.layout.focus === 'right' && state.layout.right !== null) return 'performance';
     return 'experiments';
   }
+  // The expanded todo list takes the arrow keys from whichever pane held them,
+  // so it holds the focus until it closes. Ahead of the panes below because the
+  // keys reach it first.
+  if (todoListFocused(state)) return 'todos';
   // Opening a visualization replaces the agent summary in the left column
   // with the transcript. Keep roundFocus intact so closing the visualization
   // can restore it, but never report the hidden Agents pane as focused.
@@ -1212,16 +1495,21 @@ export function focusedPane(state: SessionState): PaneId {
  * presentation, so toggling cannot replace or reconstruct pane state.
  */
 export function togglePaneZoom(state: SessionState): SessionState {
-  return {
-    ...state,
-    layout: {
-      ...state.layout,
-      zoomedPane: state.layout.zoomedPane === null ? focusedPane(state) : null,
-    },
-  };
+  if (state.layout.zoomedPane !== null) {
+    return {...state, layout: {...state.layout, zoomedPane: null}};
+  }
+  const pane = focusedPane(state);
+  // Zoom hands the content row to a column. The todo list is a strip as tall as
+  // its own contents, so the row has nothing to give it: leave the layout as it
+  // is rather than clearing the screen around a five-row box.
+  if (pane === 'todos') return state;
+  return {...state, layout: {...state.layout, zoomedPane: pane}};
 }
 
-/** Every pane currently available to focus or zoom in the active view. */
+/**
+ * Every pane the content row can be given to in the active view. The expanded
+ * todo list is deliberately absent: it can hold the keys, but not the row.
+ */
 export function visiblePaneIds(state: SessionState): PaneId[] {
   if (experimentLogVisible(state)) {
     return [
@@ -1385,7 +1673,9 @@ function applyReducedCore(state: SessionState, core: CoreState): SessionState {
     chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
   });
   if (core.status === 'failed') {
-    const finalDiagnostic = core.diagnostics.at(-1);
+    // Warnings never banner, so a trailing warning must not mask the failure:
+    // surface the last diagnostic that can.
+    const finalDiagnostic = core.diagnostics.filter(d => d.severity !== 'warning').at(-1);
     if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
   }
   return next;
@@ -1475,13 +1765,7 @@ export function selectNextRound(state: SessionState): SessionState {
   const visible = visibleRoundNumber(state);
   const index = visible === null ? -1 : rounds.findIndex(round => round.number === visible);
   const next = rounds[(index + 1 + rounds.length) % rounds.length];
-  return {
-    ...state,
-    selectedRound: next?.number ?? null,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-    overlay: null,
-  };
+  return withSelectedRound(state, next?.number ?? null);
 }
 
 export function selectPreviousRound(state: SessionState): SessionState {
@@ -1490,19 +1774,26 @@ export function selectPreviousRound(state: SessionState): SessionState {
   const visible = visibleRoundNumber(state);
   const index = visible === null ? 0 : rounds.findIndex(round => round.number === visible);
   const previous = rounds[(index - 1 + rounds.length) % rounds.length];
-  return {
-    ...state,
-    selectedRound: previous?.number ?? null,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-    overlay: null,
-  };
+  return withSelectedRound(state, previous?.number ?? null);
 }
 
 export function selectRound(state: SessionState, roundNumber: number): SessionState {
   if (!stripRounds(state).some(round => round.number === roundNumber)) return state;
+  return withSelectedRound(state, roundNumber);
+}
+
+/**
+ * Lands round navigation on `roundNumber`. Round navigation covers the whole
+ * run, not just the open hypothesis's slice of it, so inside a scope the scope
+ * follows the round: crossing into a round another hypothesis owns re-derives
+ * the scope from that owner.
+ */
+function withSelectedRound(state: SessionState, roundNumber: number | null): SessionState {
   return {
     ...state,
+    ...(state.hypothesisScope !== null && roundNumber !== null
+      ? scopeStateForRound(state, roundNumber)
+      : {}),
     selectedRound: roundNumber,
     selectedAgentKind: null,
     selectedEntryId: null,
@@ -1567,6 +1858,11 @@ export function selectNextEntry(state: SessionState, delta: number, id?: string)
  */
 export function focusRound(state: SessionState, focus: RoundFocus): SessionState {
   if (state.roundFocus === focus) return state;
+  // The move happens only between panes that are on screen. Focus landing on
+  // a hidden pane would route the keys, and the auto-selected filter below,
+  // into a surface with no visible cue. The round view has no third pane to
+  // skip to, so at a hidden neighbour the keys stay where they are.
+  if (!roundPaneVisible(state, focus)) return state;
   // Arriving at the graph with nothing picked out puts the cursor on the agent
   // whose turns are on screen, so Tab starts from where the operator is looking.
   if (focus === 'agents' && state.selectedAgentKind === null) {
@@ -1612,19 +1908,49 @@ export function dismissErrorBanner(state: SessionState): SessionState {
 }
 
 /**
+ * Clears a standing input-validation message. Called on the next keystroke
+ * and on Esc (#564/#635's reasoning applied to a wrong command rather than an
+ * empty one): the message names a typo in text the operator is already
+ * retyping, so it is stale the moment they start fixing it.
+ */
+export function clearInputError(state: SessionState): SessionState {
+  if (state.inputError === null) return state;
+  return {...state, inputError: null};
+}
+
+/**
  * Records an error independently of any particular view. A terminal event
  * commonly repeats an invocation failure, so equivalent reports promote the
  * current banner instead of burying its cause beneath a duplicate.
+ *
+ * `scope: 'input'` is routed off the banner entirely: it is client-side
+ * validation of what the operator just typed, never a backend diagnostic with
+ * `detail`/`hint`, so it belongs on the command input's own hint row instead
+ * of the shared error surface (see `command-input.ts`).
  */
 export function reportError(
   state: SessionState,
   message: string,
   report: ErrorReport,
 ): SessionState {
+  if (report.scope === 'input') {
+    return {...state, inputError: message};
+  }
+
+  const banner = errorBannerFromReport(message, report);
+  const existing = state.errorBanner;
+  if (existing === null || !equivalentError(existing, banner)) {
+    return {...state, errorBanner: banner};
+  }
+  return {...state, errorBanner: mergeEquivalentError(existing, banner)};
+}
+
+/** Normalize the report boundary into the complete state consumed by the banner view. */
+function errorBannerFromReport(message: string, report: ErrorReport): ErrorBannerState {
   const diagnostic = report.diagnostic ?? null;
   const scope = diagnostic?.scope ?? report.scope;
   const severity = diagnosticSeverity(diagnostic?.severity) ?? report.severity ?? 'recoverable';
-  const banner: ErrorBannerState = {
+  return {
     title: report.title ?? errorTitle(scope),
     message: diagnostic?.summary || message || 'An unknown error occurred.',
     detail: diagnostic?.detail ?? report.detail ?? null,
@@ -1637,31 +1963,35 @@ export function reportError(
     invocationId: report.invocationId ?? null,
     count: 1,
   };
-  const existing = state.errorBanner;
-  if (existing === null || !equivalentError(existing, banner)) {
-    return {...state, errorBanner: banner};
-  }
-  const promoted = existing.severity === 'fatal' || severity === 'fatal' ? 'fatal' : 'recoverable';
+}
+
+/** Fold a repeated report into the standing banner without losing established identity. */
+function mergeEquivalentError(
+  existing: ErrorBannerState,
+  incoming: ErrorBannerState,
+): ErrorBannerState {
+  const promoted =
+    existing.severity === 'fatal' || incoming.severity === 'fatal' ? 'fatal' : 'recoverable';
   return {
-    ...state,
-    errorBanner: {
-      ...existing,
-      message: moreInformativeMessage(existing.message, banner.message),
-      detail: moreInformativeMessage(existing.detail ?? '', banner.detail ?? '') || null,
-      hint: moreInformativeMessage(existing.hint ?? '', banner.hint ?? '') || null,
-      severity: promoted,
-      title: promoted === 'fatal' ? banner.title : existing.title,
-      scope: promoted === 'fatal' ? banner.scope : existing.scope,
-      diagnosticId: existing.diagnosticId ?? banner.diagnosticId,
-      agentKind: existing.agentKind ?? banner.agentKind,
-      roundLabel: existing.roundLabel ?? banner.roundLabel,
-      invocationId: existing.invocationId ?? banner.invocationId,
-      count: existing.count + 1,
-    },
+    ...existing,
+    message: moreInformativeMessage(existing.message, incoming.message),
+    detail: moreInformativeMessage(existing.detail ?? '', incoming.detail ?? '') || null,
+    hint: moreInformativeMessage(existing.hint ?? '', incoming.hint ?? '') || null,
+    severity: promoted,
+    title: promoted === 'fatal' ? incoming.title : existing.title,
+    scope: promoted === 'fatal' ? incoming.scope : existing.scope,
+    diagnosticId: existing.diagnosticId ?? incoming.diagnosticId,
+    agentKind: existing.agentKind ?? incoming.agentKind,
+    roundLabel: existing.roundLabel ?? incoming.roundLabel,
+    invocationId: existing.invocationId ?? incoming.invocationId,
+    count: existing.count + 1,
   };
 }
 
 function reportProjectedDiagnostic(state: SessionState, diagnostic: CoreDiagnostic): SessionState {
+  // Warnings (e.g. `framework_warning`, #692) stay in the diagnostics list;
+  // the banner is for errors that need attention now.
+  if (diagnostic.severity === 'warning') return state;
   return reportError(state, diagnostic.summary, {
     scope: diagnostic.scope,
     severity: diagnostic.severity === 'fatal' ? 'fatal' : 'recoverable',
@@ -1780,23 +2110,6 @@ export function runStatusLabel(status: CoreRunStatus): string {
   }
 }
 
-export function statusText(state: SessionState): string {
-  const base = `${runStatusLabel(state.core.status)} · ${state.core.agentKind ?? 'starting'} · ${state.core.roundLabel ?? 'no round yet'}`;
-  if (state.core.usage === null) return base;
-  const used = formatTokenCount(state.core.usage.inputTokens);
-  const meter =
-    state.core.usage.contextWindow === null
-      ? used
-      : `${used}/${formatTokenCount(state.core.usage.contextWindow)}`;
-  return `${base} · ${meter} tokens`;
-}
-
-function formatTokenCount(count: number): string {
-  if (count < 1_000) return String(count);
-  if (count < 1_000_000) return `${Math.floor(count / 1_000)}k`;
-  return `${(count / 1_000_000).toFixed(1)}M`;
-}
-
 export function visibleConversation(state: SessionState): ConversationEntry[] {
   const roundNumber = visibleRoundNumber(state);
   return state.core.transcript.filter(entry => {
@@ -1868,7 +2181,7 @@ export function visibleRoundNumber(state: SessionState): number | null {
 }
 
 /** The rounds owned by the hypothesis on screen, or every round outside one. */
-export function scopedRounds(state: SessionState): RoundSummary[] {
+export function scopedRounds(state: SessionState): RoundState[] {
   const scope = state.hypothesisScope;
   if (scope === null) return state.core.rounds;
   return state.core.rounds.filter(round => scope.rounds.includes(round.number));
@@ -1882,7 +2195,7 @@ export function scopedRounds(state: SessionState): RoundSummary[] {
  * what has happened carry ``planned`` and open an empty view, which is the
  * honest thing to show for a round that has not run.
  */
-export function stripRounds(state: SessionState): RoundSummary[] {
+export function stripRounds(state: SessionState): RoundState[] {
   const highest = Math.max(
     state.core.maxRounds ?? 0,
     ...state.core.rounds.map(round => round.number),
@@ -1890,7 +2203,7 @@ export function stripRounds(state: SessionState): RoundSummary[] {
   );
   if (highest === 0) return state.core.rounds;
   const known = new Map(state.core.rounds.map(round => [round.number, round]));
-  const rounds: RoundSummary[] = [];
+  const rounds: RoundState[] = [];
   for (let number = 1; number <= highest; number += 1) {
     rounds.push(known.get(number) ?? {number, status: 'planned'});
   }

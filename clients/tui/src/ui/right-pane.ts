@@ -1,5 +1,7 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
-import type {RightPane, SessionState} from '../session-model.js';
+import {PLOT_WIDTH} from '../performance-chart.js';
+import {focusedPane, type RightPane, type SessionState} from '../session-model.js';
+import {applyPaneFocus, paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
 import type {Theme} from './theme.js';
 
 /**
@@ -11,8 +13,18 @@ import type {Theme} from './theme.js';
  */
 export const MIN_SPLIT_WIDTH = 100;
 
-/** Chart plot width plus axis gutter, border, and padding. */
-const RIGHT_PANE_MIN = 62;
+/**
+ * Columns around the plot that aren't plot columns: an 8-char axis value
+ * gutter plus 2 for the ' ┤' separator (10 columns of chart gutter), plus 1
+ * column of border and 1 column of padding on each side of the pane (4
+ * columns).
+ */
+const RIGHT_PANE_CHROME = 10 + 4;
+/**
+ * Chart plot width plus its gutter, border, and padding. Derived from the
+ * chart's own PLOT_WIDTH so the two cannot drift apart.
+ */
+const RIGHT_PANE_MIN = PLOT_WIDTH + RIGHT_PANE_CHROME;
 const RIGHT_PANE_MAX = 84;
 const RIGHT_PANE_SHARE = 0.45;
 /** Columns the transcript needs to stay worth reading beside the pane. */
@@ -54,9 +66,9 @@ export class RightPaneView {
       paddingLeft: 1,
       paddingRight: 1,
       border: true,
-      borderStyle: 'rounded',
-      borderColor: theme.border,
-      title: ' Pane ',
+      borderStyle: paneBorderStyle(false),
+      borderColor: paneBorderColor(theme, false),
+      title: paneTitle('Pane', false),
       visible: false,
       onMouseUp: onFocusRequest,
     });
@@ -94,11 +106,11 @@ export class RightPaneView {
     }
     this.output.visible = true;
     this.output.width = width;
-    // The focused pane is the one that takes keys, so it carries the focus
-    // border colour and says so in its title.
-    const focused = state.layout.focus === 'right';
-    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
-    this.output.title = focused ? ` ▸ ${right.title} ` : ` ${right.title} `;
+    // The focused pane is the one that takes keys, and says so in its title
+    // marker, its frame, and its border colour. Every pane asks `focusedPane`,
+    // so exactly one of them can answer yes.
+    const focused = focusedPane(state) === 'performance';
+    applyPaneFocus(this.output, this.#theme, right.title, focused);
     if (right === this.#renderedPane) return;
     this.#renderedPane = right;
     this.#clear();

@@ -29,9 +29,11 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -47,8 +49,6 @@ _MODAL_DEPLOYMENT = re.compile(
     r"https://modal\.com/apps/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+/deployed/"
     r"([a-zA-Z0-9_.-]+)"
 )
-_LOCK_PATH = "/tmp/vibesys-modal-evaluator.lock"  # noqa: S108  # tracked: #288
-_DEPLOYMENT_LEASE_PATH = Path("/tmp/vibesys-modal-evaluator-deployment.json")  # noqa: S108  # tracked: #288
 _CANDIDATE_REVISION_ENV = "VIBESYS_CANDIDATE_REVISION"
 _RELEASE_DEPLOYMENT_ENV = "VIBESYS_RELEASE_MODAL_DEPLOYMENT"
 _MAX_DIAGNOSTIC_CHARS = 20_000
@@ -69,6 +69,62 @@ _MAX_ENCODED_SETUP_COMMAND_CHARS = 60_000
 _MAX_STAGE_ARCHIVE_BYTES = 8 * 1024 * 1024
 _CONTAINER_DISCOVERY_TIMEOUT_SECONDS = 90.0
 _KEEPWARM_INTERVAL_SECONDS = 30.0
+
+
+def _runtime_dir() -> Path:
+    """Return this process's private per-user runtime directory.
+
+    Prefers ``XDG_RUNTIME_DIR``, which is already private per user by POSIX
+    convention; otherwise falls back to a uid-suffixed directory under the
+    system temp directory so unrelated users sharing a host cannot collide
+    on the evaluator's lock or lease files.
+    """
+    xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime_dir:
+        return Path(xdg_runtime_dir) / "vibesys"
+    return Path(tempfile.gettempdir()) / f"vibesys-{os.getuid()}"
+
+
+_LOCK_PATH = _runtime_dir() / "modal-evaluator.lock"
+_DEPLOYMENT_LEASE_PATH = _runtime_dir() / "modal-evaluator-deployment.json"
+
+
+def _ensure_runtime_dir(path: Path) -> None:
+    """Create and validate the private per-user runtime directory for ``path``.
+
+    Raises ``RuntimeError`` naming the directory and its owning uid when the
+    location cannot be used as a private per-user directory, for example a
+    plain file already occupies it, another user owns it, or it already exists
+    writable by other users, so a hostile or stale runtime-directory entry
+    fails with a clear message instead of a deep ``PermissionError`` surfacing
+    from ``flock`` or ``open``.
+    """
+    runtime_dir = path.parent
+    try:
+        runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = runtime_dir.lstat()
+    except OSError as exc:
+        raise RuntimeError(  # noqa: TRY003
+            f"cannot use {runtime_dir} as the evaluator runtime directory: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise RuntimeError(  # noqa: TRY003
+            f"refusing to use {runtime_dir} as the evaluator runtime directory: "
+            f"expected a directory owned by uid {os.getuid()}"
+        )
+    # ``mkdir(exist_ok=True)`` accepts a directory that already existed, and the
+    # ``chmod`` below only closes access from here on: it cannot remove files
+    # another user planted while the directory was writable by them. So reject a
+    # writable directory instead of coercing it. Test the write bits alone, not
+    # all of ``0o077``, because write permission is the planting vector while a
+    # readable ``0o755`` directory is both safe and common.
+    if metadata.st_mode & 0o022:
+        raise RuntimeError(  # noqa: TRY003
+            f"refusing to use {runtime_dir} as the evaluator runtime directory: "
+            "it is group- or world-writable, so another user may already have "
+            "planted files in it"
+        )
+    runtime_dir.chmod(0o700)
 
 
 @dataclass(frozen=True)
@@ -135,7 +191,11 @@ def _compact_rich_output(output: str) -> str:
 @contextmanager
 def _exclusive_evaluation() -> Generator[None]:
     """Serialize deploy-and-evaluate callers sharing the editor container."""
-    with open(_LOCK_PATH, "w") as lock_file:  # noqa: PTH123  # tracked: #288
+    _ensure_runtime_dir(_LOCK_PATH)
+    # ``O_NOFOLLOW`` so a symlink planted at the lock path fails instead of
+    # redirecting this truncating write outside the runtime directory.
+    lock_fd = os.open(_LOCK_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock_fd, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
             yield
@@ -226,7 +286,11 @@ def _healthy_now(base_url: str) -> bool:
 
 def _read_deployment_lease() -> _DeploymentLease | None:
     try:
-        payload = json.loads(_DEPLOYMENT_LEASE_PATH.read_text())
+        # ``O_NOFOLLOW`` so a symlink planted at the lease path is ignored
+        # rather than followed into a file outside the runtime directory.
+        lease_fd = os.open(_DEPLOYMENT_LEASE_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(lease_fd) as lease_file:
+            payload = json.load(lease_file)
         revision = payload["candidate_revision"]
         base_url = payload["base_url"]
     except (OSError, KeyError, TypeError, json.JSONDecodeError):
@@ -244,6 +308,7 @@ def _write_deployment_lease(
     base_url: str,
     app_identifier: str | None,
 ) -> None:
+    _ensure_runtime_dir(_DEPLOYMENT_LEASE_PATH)
     temporary = _DEPLOYMENT_LEASE_PATH.with_suffix(".tmp")
     payload = {
         "candidate_revision": candidate_revision,
@@ -251,7 +316,12 @@ def _write_deployment_lease(
     }
     if app_identifier is not None:
         payload["app_identifier"] = app_identifier
-    temporary.write_text(json.dumps(payload))
+    # The rename below replaces a symlink at the lease path rather than
+    # following it, but this staging write would follow one planted at the
+    # sibling ``.tmp`` path, so it needs ``O_NOFOLLOW`` too.
+    staging_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(staging_fd, "w") as staging_file:
+        json.dump(payload, staging_file)
     temporary.replace(_DEPLOYMENT_LEASE_PATH)
 
 

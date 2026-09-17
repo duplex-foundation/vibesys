@@ -11,7 +11,11 @@ interface PerfPoint {
 type PerformanceContext = NonNullable<ProtocolResponse['performance_context']>;
 
 const PLOT_HEIGHT = 8;
-const PLOT_WIDTH = 48;
+/**
+ * Plot columns, excluding the axis gutter. `right-pane.ts` derives the pane's
+ * minimum width from this so the two cannot drift apart.
+ */
+export const PLOT_WIDTH = 48;
 const CONTEXT_LABEL_WIDTH = 10;
 
 export function renderPerformanceCurve(
@@ -51,9 +55,22 @@ export function renderPerformanceCurve(
     lines.push(`${formatAxis(value).padStart(8)} ┤${(grid[row] ?? []).join('')}`);
   }
   lines.push(`         └${'─'.repeat(PLOT_WIDTH)}`);
-  lines.push(`${''.padStart(11)}r${minRound}${String(`r${maxRound}`).padStart(PLOT_WIDTH - 2)}`);
+  // The row must total the same 10 + PLOT_WIDTH columns as the axis and
+  // border rows above, with the left label starting under the plot's first
+  // column (right after the border row's '└'). Padding the right label to a
+  // fixed PLOT_WIDTH - 2 assumed a single-digit minRound; pad relative to the
+  // actual left-label length instead so double-digit rounds still align.
+  const minLabel = `r${minRound}`;
+  const maxLabel = `r${maxRound}`;
+  lines.push(`${''.padStart(10)}${minLabel}${maxLabel.padStart(PLOT_WIDTH - minLabel.length)}`);
 
-  const best = visible.reduce((current, point) => (point.value > current.value ? point : current));
+  // "best" follows the objective direction: for a minimizing objective the
+  // lowest value wins. Without a recorded direction the historical
+  // higher-is-better reading stands.
+  const minimize = context?.objective_direction === 'min';
+  const best = visible.reduce((current, point) =>
+    (minimize ? point.value < current.value : point.value > current.value) ? point : current,
+  );
   const latest = visible.at(-1);
   if (latest) {
     lines.push(
@@ -79,25 +96,39 @@ function performancePoints(
   for (const event of events ?? []) {
     const round = roundNumberFromLabel(event.round_label);
     if (round === null) continue;
-    const data = event.data;
-    if (data?.kind === 'benchmark_result') {
-      byRound.set(round, {
-        round,
-        metric: data.metric,
-        value: data.value,
-        unit: data.unit,
-      });
-    }
-    if (data?.kind === 'round_finished' && typeof data.perf_metric === 'number') {
-      byRound.set(round, {
-        round,
-        metric: data.perf_unit ?? 'performance',
-        value: data.perf_metric,
-        unit: data.perf_unit ?? 'performance',
-      });
-    }
+    const point = performancePointFromEvent(event, round);
+    if (point !== null) byRound.set(round, point);
   }
   return [...byRound.values()].sort((a, b) => a.round - b.round);
+}
+
+function performancePointFromEvent(event: RunEvent, round: number): PerfPoint | null {
+  const data = event.data;
+  if (data?.kind === 'benchmark_result') {
+    return {round, metric: data.metric, value: data.value, unit: data.unit};
+  }
+  // The measurement `benchmark_result` used to carry rides a completed
+  // benchmark gate on new journals (#692). The caller's map keyed by round
+  // keeps a journal carrying both kinds from double-counting.
+  if (
+    data?.kind === 'gate_finished' &&
+    data.gate === 'benchmark' &&
+    event.status !== 'failed' &&
+    data.metric != null &&
+    data.value != null
+  ) {
+    return {
+      round,
+      metric: data.metric,
+      value: data.value,
+      unit: data.unit ?? data.metric,
+    };
+  }
+  if (data?.kind === 'round_finished' && typeof data.perf_metric === 'number') {
+    const unit = data.perf_unit ?? 'performance';
+    return {round, metric: unit, value: data.perf_metric, unit};
+  }
+  return null;
 }
 
 function latestMetric(points: PerfPoint[]): string {

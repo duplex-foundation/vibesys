@@ -3,12 +3,17 @@ import re
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
+from uuid import uuid4
+
+import pytest
 
 from vibesys.agents.callbacks import AgentLogger
+from vibesys.agents.client import _LoggerObserver
+from vibesys.agents.contracts import AgentEvent, AgentEventKind
 from vibesys.agents.progress import RoundProgress
 from vibesys.constants import DIM, GREEN, RED, RESET
 from vibesys.render.sink import output_sink
-from vibesys.run.events import ToolCallData, ToolResultData
+from vibesys.run.events import AgentOutputChunkData, ToolCallData, ToolResultData
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 
@@ -105,6 +110,93 @@ class TestOnLlmEnd:
         log_text = log.getvalue()
         assert "[thinking]" in log_text
         assert "let me think..." in log_text
+
+
+class TestOnThinkingChannel:
+    """Agent reasoning is published as analysis; plumbing is marked by drivers."""
+
+    @staticmethod
+    def _chunks(*events: AgentEvent) -> list[AgentOutputChunkData]:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            observer = _LoggerObserver(AgentLogger())
+            for event in events:
+                observer.on_event(event)
+        finally:
+            unsubscribe()
+        return [event.data for event in seen if isinstance(event.data, AgentOutputChunkData)]
+
+    def test_a_driver_marked_event_publishes_as_a_diagnostic(self) -> None:
+        """A driver that knows an event is plumbing says so in the payload."""
+        chunks = self._chunks(
+            AgentEvent(
+                kind=AgentEventKind.THINKING,
+                text="[stderr] warning: slow filesystem",
+                payload={"channel": "diagnostic"},
+            )
+        )
+
+        assert [chunk.channel for chunk in chunks] == ["diagnostic"]
+        # The marker text is published verbatim; only the channel changes.
+        assert [chunk.content for chunk in chunks] == ["[stderr] warning: slow filesystem"]
+
+    def test_an_unmarked_event_publishes_as_analysis(self) -> None:
+        """Nothing inspects the text: a bracketed aside is still reasoning."""
+        chunks = self._chunks(
+            AgentEvent(kind=AgentEventKind.THINKING, text="The ring buffer is the hot path."),
+            AgentEvent(kind=AgentEventKind.THINKING, text="[note] a bracketed aside"),
+        )
+
+        assert [chunk.channel for chunk in chunks] == ["analysis"] * 2
+
+    def test_empty_text_publishes_nothing_directly(self) -> None:
+        """``on_thinking`` and ``on_diagnostic`` share a no-op-on-empty helper."""
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            AgentLogger().on_thinking("")
+        finally:
+            unsubscribe()
+
+        assert [event.data for event in seen if isinstance(event.data, AgentOutputChunkData)] == []
+
+    def test_writes_to_log_file(self) -> None:
+        log = io.StringIO()
+        AgentLogger(log_file=log).on_thinking("The ring buffer is the hot path.")
+
+        assert "The ring buffer is the hot path." in log.getvalue()
+
+
+class TestOnDiagnostic:
+    """The explicit hook a driver-marked event routes to."""
+
+    @staticmethod
+    def _chunks(text: str) -> list[AgentOutputChunkData]:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            AgentLogger().on_diagnostic(text)
+        finally:
+            unsubscribe()
+        return [event.data for event in seen if isinstance(event.data, AgentOutputChunkData)]
+
+    def test_text_publishes_verbatim_on_the_diagnostic_channel(self) -> None:
+        chunks = self._chunks("agentshim: restarting the provider process")
+
+        assert [chunk.channel for chunk in chunks] == ["diagnostic"]
+        # Nothing inspects the text: the caller already classified it, so a
+        # diagnostic that carries no lifecycle marker still lands here.
+        assert [chunk.content for chunk in chunks] == ["agentshim: restarting the provider process"]
+
+    def test_empty_text_publishes_nothing(self) -> None:
+        assert self._chunks("") == []
+
+    def test_writes_to_log_file(self) -> None:
+        log = io.StringIO()
+        AgentLogger(log_file=log).on_diagnostic("agentshim: restarting the provider process")
+
+        assert "agentshim: restarting the provider process" in log.getvalue()
 
 
 class TestOnToolStart:
@@ -278,6 +370,143 @@ class TestOnToolError:
         logger.on_tool_error(Exception("fail"), run_id=uuid4())
         out = capsys.readouterr().out
         assert DIM not in out
+
+
+class TestOnToolErrorResult:
+    """A tool failure must close the typed tool_call emitted from ``on_llm_end``."""
+
+    def test_error_emits_failure_result_and_clears_pending(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            run_id = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=run_id, tool_call_id="call-1")
+            logger.on_tool_error(RuntimeError("boom"), run_id=run_id, tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert len(results) == 1
+        result = results[0]
+        assert result.tool == "shell"
+        assert result.call_id == "call-1"
+        assert result.is_error is True
+        assert "RuntimeError" in result.content
+        assert "boom" in result.content
+        assert not logger._pending_tool_calls["shell"]  # noqa: SLF001  # tracked: #288
+        # The free-text diagnostic (with traceback detail) is still published.
+        assert "Tool error" in capsys.readouterr().out
+
+    def test_error_does_not_misattribute_next_same_tool_result(self) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "a"}}])
+            )
+            first_run = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=first_run, tool_call_id="call-1")
+            logger.on_tool_error(RuntimeError("boom"), run_id=first_run, tool_call_id="call-1")
+
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-2", "name": "shell", "args": {"cmd": "b"}}])
+            )
+            second_run = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=second_run, tool_call_id="call-2")
+            # No tool_call_id on the output: correlation falls back to the
+            # FIFO head, which must be call-2 because the failure consumed
+            # call-1.
+            logger.on_tool_end(SimpleNamespace(name="shell", content="ok"), run_id=second_run)
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert [(r.call_id, r.is_error) for r in results] == [("call-1", True), ("call-2", False)]
+
+    def test_tool_call_id_fallback_resolves_name_without_tool_start(self) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            logger.on_tool_error(RuntimeError("boom"), run_id=uuid4(), tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert len(results) == 1
+        assert results[0].tool == "shell"
+        assert results[0].call_id == "call-1"
+        assert results[0].is_error is True
+        assert not logger._pending_tool_calls["shell"]  # noqa: SLF001  # tracked: #288
+
+    def test_streamed_turn_error_emits_no_orphan_result(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            # A streamed turn: ``on_llm_end`` returns before emitting typed
+            # tool calls, so the tool run starts with nothing queued.
+            logger.on_llm_new_token("tok")
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            run_id = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=run_id, tool_call_id="call-1")
+            logger.on_tool_error(RuntimeError("boom"), run_id=run_id, tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        calls = [event.data for event in seen if isinstance(event.data, ToolCallData)]
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert calls == []
+        assert results == []
+        assert "Tool error" in capsys.readouterr().out
+
+    def test_empty_message_error_content_has_no_trailing_colon(self) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_llm_end(
+                _make_response(tool_calls=[{"id": "call-1", "name": "shell", "args": {"cmd": "x"}}])
+            )
+            run_id = uuid4()
+            logger.on_tool_start({"name": "shell"}, "", run_id=run_id, tool_call_id="call-1")
+            logger.on_tool_error(KeyboardInterrupt(), run_id=run_id, tool_call_id="call-1")
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert len(results) == 1
+        assert results[0].content == "KeyboardInterrupt"
+        assert results[0].is_error is True
+
+    def test_error_without_tool_context_emits_no_result(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        seen = []
+        unsubscribe = output_sink().subscribe(seen.append)
+        try:
+            logger = AgentLogger()
+            logger.on_tool_error(RuntimeError("boom"), run_id=uuid4())
+        finally:
+            unsubscribe()
+
+        results = [event.data for event in seen if isinstance(event.data, ToolResultData)]
+        assert results == []
+        assert "Tool error" in capsys.readouterr().out
 
 
 class TestStateManagement:
@@ -747,10 +976,10 @@ class TestUsageMetadataExtraction:
 class TestUpdateUsagePublicHook:
     """Tests for the CLI-backend ``update_usage`` hook.
 
-    ``AgentLogger.on_usage`` routes per-turn usage dicts from ``vibesys._agent_cli``
-    into this method so the agent prefix stays in sync with the underlying CLI
-    tool's token counts — mirroring how the deepagents path updates
-    ``_input_tokens`` from ``on_llm_end``.
+    ``AgentLogger.on_usage`` routes a driver's per-turn usage dict into this
+    method so the agent prefix stays in sync with the underlying CLI tool's
+    token counts — mirroring how the deepagents path updates ``_input_tokens``
+    from ``on_llm_end``.
     """
 
     def test_update_usage_sets_input_tokens(self):  # noqa: ANN201  # tracked: #288

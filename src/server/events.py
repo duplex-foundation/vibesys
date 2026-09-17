@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -52,6 +53,11 @@ class EventType(StrEnum):  # noqa: D101  # tracked: #288
     TOOL_RESULT = "tool_result"
     TODO_UPDATE = "todo_update"
     USAGE_UPDATE = "usage_update"
+    GATE_STARTED = "gate_started"
+    GATE_FINISHED = "gate_finished"
+    WORKSPACE_SNAPSHOT = "workspace_snapshot"
+    RUN_CONFIGURED = "run_configured"
+    FRAMEWORK_WARNING = "framework_warning"
 
 
 class EventStatus(StrEnum):  # noqa: D101  # tracked: #288
@@ -72,6 +78,25 @@ AgentOutputChannel = Literal["assistant", "analysis", "tool", "diagnostic", "pro
 """Presentation channel for streamed agent output."""
 
 
+class GateKind(StrEnum):
+    """Closed set of framework-owned gates a candidate passes through."""
+
+    VALIDATION = "validation"
+    ACCURACY = "accuracy"
+    BENCHMARK = "benchmark"
+
+
+class FrameworkSource(StrEnum):
+    """Closed set of framework subsystems that emit framework events."""
+
+    GATES = "gates"
+    GIT_TRACKING = "git_tracking"
+    LOOP = "loop"
+    GPU = "gpu"
+    SKYPILOT = "skypilot"
+    OTHER = "other"
+
+
 class EventPayload(BaseModel):
     """Immutable base for every structured event payload.
 
@@ -89,6 +114,11 @@ class ChatData(EventPayload):  # noqa: D101  # tracked: #288
     # The authoritative thread title, set by the server on the turn that
     # titles a previously untitled thread so clients learn it from replay.
     thread_title: str | None = None
+    # Identity of the turn this answer closes: the same id the turn's streamed
+    # chunks carried, so clients fold the terminal answer over exactly that
+    # turn and never over an abandoned one. None on records written before the
+    # field existed, for which clients keep the last-open-turn heuristic.
+    invocation_id: str | None = None
 
 
 class ChatThreadCreatedData(EventPayload):
@@ -170,6 +200,10 @@ class RunStartedData(EventPayload):  # noqa: D101  # tracked: #288
     outer_loop: str
     input: str
     max_rounds: int
+    # The agent roles the loop can run per round (vibesys.loops.roles), so
+    # frontends seed placeholders from the contract instead of a client-side
+    # table. Empty on events recorded before the field existed.
+    expected_roles: tuple[str, ...] = ()
 
 
 class RunInterruptedData(EventPayload):  # noqa: D101  # tracked: #288
@@ -327,6 +361,92 @@ class RoundFinishedData(EventPayload):  # noqa: D101  # tracked: #288
     judge_verdict: Literal["pass", "fail", "skipped"]
     perf_metric: FiniteFloat | None = None
     perf_unit: str | None = None
+    # True when no fresh profile ran this round; such a round records no perf
+    # reading (perf_metric stays None). Defaults False so legacy persisted
+    # events stay valid.
+    profile_skipped: bool = False
+
+
+class GateStartedData(EventPayload):
+    """One framework gate began evaluating the current candidate."""
+
+    kind: Literal["gate_started"] = "gate_started"
+    gate: GateKind
+    # The validation recipe being executed; None for accuracy and benchmark.
+    recipe: str | None = None
+    # The trusted command the gate runs, when one is configured.
+    command: str | None = None
+    source: FrameworkSource = FrameworkSource.GATES
+    source_label: str | None = None
+
+
+class GateFinishedData(EventPayload):
+    """Outcome of one framework gate; envelope status carries pass or fail.
+
+    ``metric``/``value``/``unit`` are set only on a passing benchmark gate.
+    ``unit`` keeps the historical fallback of the metric name when the
+    contract declares no unit. ``output_tail`` carries the trailing command
+    output on failure.
+    """
+
+    kind: Literal["gate_finished"] = "gate_finished"
+    gate: GateKind
+    recipe: str | None = None
+    # True when a prior PASS for the exact same input was reused instead of
+    # re-running the command.
+    reused: bool = False
+    metric: str | None = None
+    value: FiniteFloat | None = None
+    unit: str | None = None
+    output_tail: str | None = None
+    source: FrameworkSource = FrameworkSource.GATES
+    source_label: str | None = None
+
+
+class WorkspaceSnapshotData(EventPayload):
+    """A Git tracker outcome: a snapshot, baseline, or exclusion change.
+
+    Exactly one aspect is populated per event: a snapshot attempt carries
+    ``label`` (``commit`` is None when there was nothing to commit), a
+    trusted-input baseline carries ``baseline``, and a snapshot-exclusion
+    change carries ``excluded_paths``.
+    """
+
+    kind: Literal["workspace_snapshot"] = "workspace_snapshot"
+    label: str = ""
+    commit: str | None = None
+    baseline: str | None = None
+    excluded_paths: tuple[str, ...] = ()
+    source: FrameworkSource = FrameworkSource.GIT_TRACKING
+
+
+class RunConfiguredData(EventPayload):
+    """One per run: the resolved configuration a loop starts with."""
+
+    kind: Literal["run_configured"] = "run_configured"
+    run_log_path: str
+    project_root: str
+    model: str | None = None
+    # First line of the objective only; the full text lives in run state.
+    objective: str | None = None
+    search_policy: str | None = None
+    benchmark_contract: bool = False
+    pareto_objectives: str | None = None
+    source: FrameworkSource = FrameworkSource.LOOP
+
+
+class FrameworkWarningData(EventPayload):
+    """A non-fatal framework fault an operator should see.
+
+    The server projection also lifts this payload into the wire event's
+    ``diagnostic`` field so diagnostic-oriented clients need no new handling.
+    """
+
+    kind: Literal["framework_warning"] = "framework_warning"
+    summary: str
+    detail: str | None = None
+    source: FrameworkSource = FrameworkSource.OTHER
+    source_label: str | None = None
 
 
 EventData = Annotated[
@@ -353,7 +473,12 @@ EventData = Annotated[
     | ToolCallData
     | ToolResultData
     | TodoUpdateData
-    | UsageUpdateData,
+    | UsageUpdateData
+    | GateStartedData
+    | GateFinishedData
+    | WorkspaceSnapshotData
+    | RunConfiguredData
+    | FrameworkWarningData,
     Field(discriminator="kind"),
 ]
 
@@ -468,6 +593,13 @@ class EventStore:
     def __init__(self, path: Path, run_id: str):  # noqa: ANN204, D107  # tracked: #288
         self.path = path
         self.run_id = run_id
+        # Names this store's sequence space. Sequences are only comparable
+        # within one store, and a run replaces its store mid-flight when the
+        # durable log is attached, so a consumer holding folded state needs an
+        # identity to tell "the next events" from "a different log's events".
+        # Neither ``path`` nor ``run_id`` can serve: a retired store can be
+        # reopened at the same path, and ``run_id`` is reassigned in place.
+        self.store_id = uuid.uuid4().hex
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._parsed_records = 0
@@ -477,6 +609,11 @@ class EventStore:
             self._records = _records_from_events(_repair_legacy_sequences(events))
         else:
             self._records, self._malformed_tail_offset = scanned
+        # A valid final record whose line was never terminated must gain its
+        # newline before ``append`` writes anything after it.
+        self._missing_tail_newline = self._malformed_tail_offset is None and _ends_without_newline(
+            self.path
+        )
         self._sequences = [record.header.sequence for record in self._records]
         self._next_sequence = self._sequences[-1] + 1 if self._sequences else 1
 
@@ -486,6 +623,16 @@ class EventStore:
                 with self.path.open("r+b") as stream:
                     stream.truncate(self._malformed_tail_offset)
                 self._malformed_tail_offset = None
+            if self._missing_tail_newline:
+                # Terminate the valid final record so the new record starts
+                # its own line instead of concatenating onto it. The flag is a
+                # construction-time observation, so recheck the file itself: if
+                # it was removed or replaced since, a blind "\n" would corrupt
+                # the fresh file's first record.
+                if _ends_without_newline(self.path):
+                    with self.path.open("a", encoding="utf-8") as stream:
+                        stream.write("\n")
+                self._missing_tail_newline = False
             event = event.model_copy(
                 update={"sequence": self._next_sequence, "run_id": self.run_id}
             )
@@ -658,7 +805,11 @@ class EventStore:
             offset += len(line)
             header_fields = _scan_header_fields(line)
             if header_fields is None:
-                if index != len(lines) - 1:
+                # A final line holding complete JSON the header scan cannot
+                # classify must be judged by full validation, so it falls to
+                # the eager path; only a tail with no complete JSON prefix (a
+                # torn append) is set aside for repair.
+                if index != len(lines) - 1 or _starts_with_complete_json(line):
                     return None
                 # Preserve access to earlier audit history if a process was
                 # interrupted during its final append.
@@ -680,28 +831,26 @@ class EventStore:
                     raw_sequence=raw_sequence,
                 )
             )
-        tail_offset = self._parse_eager_tail(raw, records, malformed_tail_offset)
-        return records, tail_offset
+        self._parse_eager_tail(raw, records, malformed_tail_offset)
+        return records, malformed_tail_offset
 
     def _parse_eager_tail(
         self, raw: bytes, records: list[_StoredRecord], malformed_tail_offset: int | None
-    ) -> int | None:
-        """Validate the trailing window, reproducing today's tail semantics.
+    ) -> None:
+        """Validate the trailing window, raising on any record that fails.
 
-        A final record that scans as JSON but fails validation is still an
-        interrupted append; anything earlier is still a hard failure.
+        Every record here scanned as complete JSON, which a torn append can
+        never leave behind, so a validation failure on the final record is
+        corruption to surface, not an interrupted write to set aside.
         """
         for position in range(max(0, len(records) - _EAGER_TAIL_RECORDS), len(records)):
             record = records[position]
             try:
                 self._parse_record(record, raw[record.offset : record.offset + record.length])
-            except ValidationError:
+            except ValidationError as error:
                 if position != len(records) - 1 or malformed_tail_offset is not None:
                     raise
-                offset = record.offset
-                del records[position]
-                return offset
-        return malformed_tail_offset
+                raise _complete_invalid_tail_error(self.path, record.offset) from error
 
     def _read_unlocked(self) -> tuple[list[RunEvent], int | None]:
         if not self.path.exists():
@@ -716,12 +865,14 @@ class EventStore:
                 self._parsed_records += 1
                 event = RunEvent.model_validate_json(line)
                 events.append(event)
-            except ValidationError:
+            except ValidationError as error:
+                if index != len(lines) - 1:
+                    raise
+                if _starts_with_complete_json(line):
+                    raise _complete_invalid_tail_error(self.path, record_offset) from error
                 # Preserve access to earlier audit history if a process was
                 # interrupted during its final append.
-                if index == len(lines) - 1:
-                    return events, record_offset
-                raise
+                return events, record_offset
         return events, None
 
 
@@ -759,6 +910,48 @@ def _scan_header_fields(line: bytes) -> tuple[int, EventType, str | None, str | 
 
 def _is_optional_str(value: Any) -> bool:  # noqa: ANN401  # scanning untyped JSON
     return value is None or isinstance(value, str)
+
+
+def _starts_with_complete_json(line: bytes) -> bool:
+    """Whether the bytes begin with one complete JSON value.
+
+    A torn append leaves a strict prefix of the record plus its newline, and
+    no strict prefix of a serialized object contains a complete JSON value, so
+    this discriminates an interrupted write from fully written bytes: a lone
+    record, or complete records concatenated onto one line by a writer that
+    never terminated it. Truncating the latter would erase durable facts, so
+    it must be surfaced as corruption, not repaired as a torn tail.
+    """
+    try:
+        text = line.decode()
+    except UnicodeDecodeError:
+        return False
+    try:
+        json.JSONDecoder().raw_decode(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _ends_without_newline(path: Path) -> bool:
+    """Whether the file's final byte leaves its last record unterminated."""
+    if not path.exists():
+        return False
+    size = path.stat().st_size
+    if size == 0:
+        return False
+    with path.open("rb") as stream:
+        stream.seek(size - 1)
+        return stream.read(1) != b"\n"
+
+
+def _complete_invalid_tail_error(path: Path, offset: int) -> ValueError:
+    """Corruption error for a fully written final record that fails validation.
+
+    Unlike a torn append, the record is complete, so silently truncating it
+    would erase a durable fact; the operator must inspect the file instead.
+    """
+    return ValueError(f"complete final record at byte offset {offset} in {path} failed validation")
 
 
 def _header_from_event(event: RunEvent, sequence: int) -> EventHeader:

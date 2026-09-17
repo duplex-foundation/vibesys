@@ -19,7 +19,6 @@ from langchain_core.tools import BaseTool  # noqa: TC002  # tracked: #288
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel
 
-from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #288
 from vibesys.agent_runner import (
     log_agent_config,
     run_agent,
@@ -27,8 +26,9 @@ from vibesys.agent_runner import (
 )
 from vibesys.agents.callbacks import AgentLogger
 from vibesys.agents.client import AgentClient
-from vibesys.agents.contracts import AgentCapabilities
+from vibesys.agents.contracts import AgentCapabilities, MCPServerSpec
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
+from vibesys.agents.session_key import AgentSessionKey  # noqa: TC001  # tracked: #288
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -48,8 +48,39 @@ class DeepAgentsClient(AgentClient):
         """Deepagents exposes only its in-process LangChain tool transport."""
         return AgentCapabilities(in_process_tools=True, session_reuse=False)
 
+    @property
+    def driver_name(self) -> str | None:
+        """Deepagents runs its graph in process, so no CLI driver runs turns."""
+        return "deepagents"
+
+    @property
+    def provider(self) -> str | None:
+        """The configured LangChain model object is the provider."""
+        return "deepagents"
+
+    def model_for_kind(self, kind: str) -> str | None:
+        """Every role's graph is built from the one configured model."""
+        del kind
+        return self._model_name
+
     def close(self) -> None:
         """Deepagents owns no resources beyond each invocation."""
+
+    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Never name a conversation: deepagents threads are in-process only.
+
+        A deepagents thread is a LangGraph checkpointer entry, not a provider
+        conversation another process could resume, and this client never runs
+        ``AgentClient.__init__``, so it owns neither a session cache nor a
+        store for the base implementation to read.
+        """
+        del session_key
+        return None
+
+    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Never name a conversation, for the reason above."""
+        del session_key
+        return None
 
     def set_log_file(self, stream: TextIO | None) -> None:
         """Direct subsequent logs to ``stream``."""
@@ -87,7 +118,7 @@ class DeepAgentsClient(AgentClient):
         return checkpointer
 
     def _session(
-        self, *, kind: str, reuse_session: bool | None, session_key: str | None
+        self, *, kind: str, reuse_session: bool | None, session_key: AgentSessionKey | None
     ) -> tuple[MemorySaver, str]:
         """Return a fresh thread by default, or a durable thread for a key."""
         checkpointer = self._checkpointer(kind)
@@ -150,7 +181,7 @@ class DeepAgentsClient(AgentClient):
         mcp_servers: list[MCPServerSpec] | None = None,  # noqa: ARG002 — cli-only injection point; deepagents uses tools=
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> T:
         label = _agent_label(kind)
 
@@ -205,7 +236,7 @@ class DeepAgentsClient(AgentClient):
         mcp_servers: list[MCPServerSpec] | None = None,  # noqa: ARG002 — cli-only
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> str:
         """Run a conversational agent without imposing a response schema."""
         _, thread_id = self._session(

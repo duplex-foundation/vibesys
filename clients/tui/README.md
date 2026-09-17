@@ -21,18 +21,33 @@ the Python `vibesys` package in the Python environment you want to use, or set
 Use Experiment chat for ordinary questions about the current run. The command
 input accepts these slash commands:
 
+Every command below is defined once in a shared registry, so the command bar and
+the chat resolve the same name to the same action, match case-insensitively, and
+report the same errors.
+
 | Command | Behavior |
 | --- | --- |
-| `/help` | Show commands and planned controls. |
-| `/chat` | Put the pane keys on the docked chat, or open it as a modal where it cannot dock; `/chat <question>` asks immediately. |
-| | Slash commands work inside the chat too, and do the same thing as in the main input. |
+| `/help` | Show the commands available on the current surface. |
+| `/chat` | Put the pane keys on the docked chat, or open it as a modal where it cannot dock; `/chat <question>` asks immediately. Command bar only, since the chat has nothing to open. |
+| | Every command below works in the chat too, and does the same thing as in the command bar. |
 | `/pause` | Pause after the current agent call finishes. |
-| `/resume` | Resume a paused run. |
+| `/resume` | Resume a paused run. Works from the command bar and the chat. |
 | `/steer <message>` | Queue an instruction that is appended to the next agent invocation's prompt. |
 | `/open-round` | Open the rounds behind the selected hypothesis. |
 | `/open-round --N` | Open round N, inside whichever hypothesis owns it. |
 | `/perf` | Plot the recorded performance metric by round, in the right pane. |
+| `/design` | Summarize what each round changed in the workspace, in the right pane. |
+| `/todos` | Expand or collapse the visible agent's todo list. |
+| `/prompt` | Expand or collapse the latest prompt in view. |
 | `/theme` | Pick a theme from a keyboard-navigable list; `/theme <name>` switches immediately. |
+
+The chat composer adds its own thread commands, which exist only in the chat:
+
+| Command | Behavior |
+| --- | --- |
+| `/clear` | Start a fresh thread with the current thread's agent and model. |
+| `/model` | Pick a harness and model, and start a thread on it. |
+| `/switch` | Switch to another chat thread. |
 
 ### Experiment log
 
@@ -54,7 +69,7 @@ Arrow keys move the selection, and the wheel and trackpad scroll the table
 independently of it. Clicking a hypothesis, or pressing Enter on an empty input,
 opens its summary. The summary gives the full wrapped hypothesis text first,
 then brief decision metadata and its rounds. Arrow keys select a round; clicking
-it or pressing Enter opens the ordinary transcript, rounds strip, and agent map.
+it or pressing Enter opens the ordinary round view: round tabs, agent map, and transcript.
 Escape returns from a round to its hypothesis, then from the hypothesis to the
 index. The input keeps Enter whenever something is typed, so a command entered
 from the log runs on its first Enter. `/open-round` and `/open-round --N` remain
@@ -62,7 +77,7 @@ explicit shortcuts directly to the selected or numbered round.
 
 The agent strip is headed `Round N flow · 45s` for the round on screen. That
 elapsed time is agent-active: wall clock minus the gaps where no agent was
-running, the same measure the rounds strip reports under `r2`. It ticks once a
+running, the same measure the round's tab reports beside `r2`. It ticks once a
 second while an agent is running and holds its final value once the round
 finishes. `Run flow` heads the strip when no round is selected, and a round
 with no recorded agent time is headed `Round N flow` alone.
@@ -74,9 +89,17 @@ When every measured hypothesis shares one objective direction the column
 header carries it as an arrow (`Measured ↑` for maximize, `↓` for minimize),
 so a signed delta reads as good or bad without task knowledge. The hypothesis
 summary spells the measurement out in words: metric name, direction, absolute
-value, baseline, and delta. The framework records a verified metric only when
-its own official evaluation ran, on the sparse cadence or the final round, so
-a hypothesis resolved between evaluations legitimately shows no measurement.
+value, baseline (with the round and commit it came from, when known), and
+delta. The framework records a verified metric only when its own official
+evaluation ran, on the sparse cadence or the final round, so a hypothesis
+resolved between evaluations legitimately shows no measurement.
+
+An absolute value with a leading `?` (`? 55434.2 ops/s`) means a baseline
+should have existed but none was admissible, so the lookup failed closed
+rather than compare against something untrusted; the drill-down spells this
+out as `No trusted baseline resolved`. `self-reported` means the only number
+for that hypothesis is the implementer's own claim, never verified by the
+framework's official evaluation.
 
 The table refetches when an agent phase or a round finishes, so it stays
 current without being reopened. Rows are ordered by first round and never
@@ -93,12 +116,15 @@ list rises out of the command input rather than across the chat.
 
 The cursor starts in the command input, and `Ctrl+W` moves both it and the pane
 keys to the chat and back; the chat's instruction line says so (`Ctrl+W to type
-here`) until it holds them, and the focused input carries the focus border, so
-where a keystroke lands is never a guess. Only the chat composer accepts
-ordinary questions; the command input accepts slash commands. Page Up and Page Down scroll the focused pane, and
-Escape hands the keys back to the table. Arrows, Enter, and the rest of the
-table's keys are unaffected by the dock. A slash command typed into the chat
-input runs through the same command path as the command box.
+here`) until it holds them, and the chat pane carries the focus border while it
+does, so where a keystroke lands is never a guess. The command box is shared by
+every pane in its column rather than being one of them, so it keeps the neutral
+border in every theme and never competes with the pane that holds the keys.
+Only the chat composer accepts ordinary questions; the command input accepts
+slash commands. Page Up and Page Down scroll the focused pane, and Escape hands
+the keys back to the table. Arrows, Enter, and the rest of the table's keys are
+unaffected by the dock. A slash command typed into the chat input runs through
+the same command path as the command box.
 
 `/chat` leaves the command surface on this view, since the chat is already
 beside the table: it is absent from `/help` and from the completions, though it
@@ -122,7 +148,7 @@ transcript behind it.
 ### Split panes
 
 Visualization commands render beside the current view rather than over it.
-`/perf` puts its output in a right pane and leaves the transcript, the chat,
+`/perf` and `/design` put their output in a right pane and leave the transcript, the chat,
 or the experiment log in the left one, both live at the same time. On the
 experiment log that makes three columns, chat, table, and visualization, each
 live. A second visualization command replaces the pane's contents rather than
@@ -131,7 +157,8 @@ stacking another surface on top.
 `Ctrl+W` moves focus one column to the right and wraps, through whichever
 columns are actually on screen. Every pane reads the same authoritative focus
 state: the focused pane carries the theme's focus border and a `▸` in its title,
-while every other pane uses the neutral border. Page Up and Page Down scroll
+while every other pane uses the neutral border. The treatment belongs to a pane
+frame, so a box inside one, the chat's composer for instance, never repeats it. Page Up and Page Down scroll
 whichever pane has focus, and Escape on the right pane closes it and restores
 the full-width view. Chat and transcript state survive the pane closing.
 
@@ -140,15 +167,22 @@ content row; pressing `F4` again restores the previous split and focus. It does
 not create a second pane or move its data, so hypothesis and agent selection,
 chat drafts, and pane scroll positions remain in place. The shortcut works for
 the hypothesis list, agent graph, transcript, experiment chat, and performance
-pane. Modal dialogs keep `F4` to themselves until they close.
+pane. It does nothing over an expanded todo list, which is as tall as its own
+contents and has no use for the row. Modal dialogs keep `F4` to themselves until
+they close.
 
 Pane widths are computed from the terminal, so a wide terminal gives the
 visualization real room while the left pane keeps a readable floor. Below 100
 columns there is not enough width for both, and visualizations fall back to the
-modal they used before panes existed. The layout re-flows on resize in either
-direction.
+modal they used before panes existed. That modal is the same surface as the
+pane, so it keeps the pane's title and its focus marker rather than reading as a
+generic dialog. The layout re-flows on resize in either direction.
 
-`/help`, `/theme`, and errors stay modal.
+`/help`, `/theme`, and errors stay modal. While any of them is open, a scrim
+dims the entire screen behind it, so the modal is the only surface left at full
+contrast and the operator can tell where a keystroke will land. The scrim is a
+translucent paint on an absolutely positioned box that joins no flex row: the
+background keeps every character where it was, and closing restores it exactly.
 
 ### Experiment chat
 
@@ -171,10 +205,12 @@ over the view as before, carrying the same input at the foot of the modal. It
 is one conversation either way: the transcript survives docking, undocking, and
 the pane closing.
 
-Inside a hypothesis the footer shows keyboard navigation. `[` and `]` select
-rounds, Tab and Shift+Tab select agents, the arrow keys move a cursor through
-the transcript's entries, Page Up/Page Down scroll it, and F2 (or Ctrl+T)
-expands the todo box, which then takes the arrow keys until Escape closes it.
+Inside a hypothesis the footer shows keyboard navigation. `←` and `→` move
+focus between the agents graph and the transcript, `↑` and `↓`
+move within whichever holds it, `[` and `]` select rounds from anywhere, Tab and
+Shift+Tab select agents, Page Up/Page Down scroll the transcript, and F2 (or
+Ctrl+T) expands the todo box, which then takes the arrow keys, and the focus
+marker with them, until Escape closes it.
 F3 (or Ctrl+P) expands the latest prompt in the current selection. Function keys
 are offered alongside the Control chords because a terminal is free to keep a
 Control chord for itself, and on macOS several do.
@@ -185,14 +221,26 @@ anywhere. Drag to select rendered text, then press Ctrl+C to copy it through
 OSC52; Ctrl+C exits when there is no nonempty selection. If the terminal does
 not support OSC52, VibeSys keeps the selection and shows a status explaining
 that the terminal's native copy command is the fallback. Rounds and agents can
-also be clicked: a round chip
-selects its round, an agent node filters the transcript to that agent, and
-clicking the selected node clears the filter. Commands listed under "Planned" in
-`/help` are not accepted yet.
+also be clicked: a round's tab selects it, an agent node filters
+the transcript to that agent, and
+clicking the selected node clears the filter.
 
-The rounds strip covers the whole run, including rounds it has not reached yet,
-and windows onto the part that fits. The selected round is always in view, and
-`‹ n` and `n ›` say how many rounds sit past each edge.
+The rounds are tabs in one row across the top of the round view, covering the
+whole run including rounds it has not reached yet. `[` and `]` or a click switch
+between them; the tabs are not a pane and take no arrow keys. The row is a window
+onto the part that fits: the selected round and the live one are always in view,
+and `‹ n` and `n ›` say how many rounds sit past each edge. Each tab carries the
+round's number, an outcome glyph, and a metric: the live agent-active time while
+it runs, the measured delta once it resolves, or its duration when no delta was
+recorded; a failed or skipped round names that outcome instead. A completed round
+where no fresh profile ran shows a hollow `○` in place of the solid check and
+dims like a planned round; such a round records no perf reading, so it never
+carries a delta or a point in the perf chart. As the terminal narrows the tabs
+shed metrics and padding before they give up the selected or live round. Below
+the tabs, the agents graph takes 40% of the width, never less than it needs to
+name every agent in full (selected included) and never more than its stages can
+use, and the transcript takes the rest. Where that and the transcript's floor do
+not both fit, the agents stack in a narrow list instead, names still in full.
 
 The launcher retains terminal results until the operator exits. If the backend
 fails to start, its log tail is printed before the temporary session directory
@@ -225,11 +273,17 @@ the input still runs on its own Enter. `/theme <name>` re-themes every view in
 place without opening the list.
 
 `ui/theme.ts` is the only module holding color literals. A theme declares
-semantic roles — `canvas`, `surface`, `elevatedSurface`, `selectedSurface`;
-`textPrimary`, `textMuted`, `textSubtle`, `textStrong`; `border`,
-`borderStrong`, `borderFocus`; `accent`, `info`; `success`, `warning`, `error`;
-per-role conversation card colors; and Markdown/code colors. Views ask for a
-role and never for a color.
+semantic roles — `canvas`, `surface`, `selectedSurface`; `textPrimary`,
+`textMuted`, `textSubtle`, `textStrong`; `border`, `borderStrong`,
+`borderFocus`; `accent`, `info`; `success`, `warning`, `error`; per-role
+conversation card colors; and Markdown/code colors. Views ask for a role and
+never for a color.
+
+`canvas` is the only background the UI paints: every pane, modal, the header,
+the error banner and the composer fill with it, and a box is told from the page
+by its border rather than by a shade of its own. The other two fills name a
+state and not a depth — `selectedSurface` is what the cursor is on, and
+`surface` backs a code block, which has no border to delimit it.
 
 Adding a theme means adding one `ThemeSpec`: a semantic core plus one accent
 per conversation role. Card fills, labels, body text, the tool-call band, and
@@ -237,6 +291,11 @@ the Markdown palette are derived from that core, and each derived foreground is
 pushed toward the nearest extreme until it clears the theme's `minContrast`
 against the surface it actually sits on. The `dark` theme additionally pins its
 derived values to the original literals so the baseline is byte-identical.
+The modal scrim is derived the same way: it pulls the background toward the
+theme's own `canvas`, and its strength is solved per theme so body text lands on
+WCAG's large-text floor whatever it started from. One fixed blend cannot do
+that, because a blend deep enough to recede Solarized Dark's 5.6:1 body text
+leaves High Contrast Dark's 21:1 fully readable.
 Status meaning never depends on color: agent phases carry a marker glyph and
 the spelled-out status, todos carry a per-status marker, and only the running
 round shows elapsed time.

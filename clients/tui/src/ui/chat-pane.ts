@@ -11,9 +11,11 @@ import {
   chatThreadHeading,
   type SessionState,
 } from '../session-model.js';
+import {fillLayer} from './box-fill.js';
 import {ChatComposerView, type ChatDraft} from './chat-composer.js';
 import {ConversationView} from './conversation.js';
 import {LOG_CLAIM_PANEL_WIDTH, LOG_COMPACT_PANEL_WIDTH} from './experiment-log.js';
+import {applyPaneFocus, paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
 import type {Theme} from './theme.js';
 
 /**
@@ -22,6 +24,9 @@ import type {Theme} from './theme.js';
  */
 const CHAT_PANE_MIN = 25;
 const CHAT_PANE_MAX = 52;
+
+/** Stands in until the first render names the active thread. */
+const CHAT_PANE_TITLE = 'Experiment chat';
 
 /**
  * The chat is part of the landing view, so it docks wherever the table is still
@@ -56,11 +61,19 @@ export function chatPaneWidth(terminalWidth: number, rightPaneWidth = 0): number
  */
 export class ChatPaneView {
   readonly output: BoxRenderable;
+  readonly #fill: BoxRenderable;
   readonly #scroll: ScrollBoxRenderable;
   readonly #conversation: ConversationView;
   readonly #composer: ChatComposerView;
   #theme: Theme;
   #renderedConversation: ConversationEntry[] | null = null;
+  /**
+   * The thread on screen while the pane is visible, `null` while it is hidden.
+   * Comparing it against the state says which renders are the pane appearing
+   * or a thread switch, the moments that jump to the tail; every other render
+   * leaves the scroll position to stickyScroll.
+   */
+  #visibleThreadId: string | null = null;
 
   constructor(
     renderer: CliRenderer,
@@ -78,15 +91,20 @@ export class ChatPaneView {
       paddingLeft: 1,
       paddingRight: 1,
       border: true,
-      borderStyle: 'rounded',
-      borderColor: theme.border,
-      title: ' Experiment chat ',
+      borderStyle: paneBorderStyle(false),
+      borderColor: paneBorderColor(theme, false),
+      title: paneTitle(CHAT_PANE_TITLE, false),
       visible: false,
       // Clicking into the chat gives it the keys, the same thing Ctrl+W does.
       // Without this the pane took the click but the focus border stayed on the
       // table, so the operator could not tell where their keys were going.
       onMouseUp: () => controller.focusPane('chat'),
     });
+    // The surface every other pane sits on. Without it this box falls through
+    // to the root's canvas, a lighter shade, so the chat read as a pale band
+    // beside panes that did not match it. On its own layer, so the pane keeps
+    // the rounded frame `PANE_BORDER` argues for (tui-conventions.md).
+    this.#fill = fillLayer(this.output, 'chat-pane-fill', theme.canvas);
     this.#scroll = new ScrollBoxRenderable(renderer, {
       id: 'chat-pane-scroll',
       width: '100%',
@@ -114,7 +132,13 @@ export class ChatPaneView {
     this.#composer = new ChatComposerView(
       renderer,
       draft,
-      value => void controller.submitChat(value),
+      value => {
+        // The operator's own message belongs at the tail even when they had
+        // scrolled into history to write it; landing at the bottom also
+        // re-arms sticky-bottom, so the answer streams into view.
+        this.#scrollToTail();
+        void controller.submitChat(value);
+      },
       theme,
       'chat-dock',
       () => controller.focusPane('chat'),
@@ -129,7 +153,9 @@ export class ChatPaneView {
 
   applyTheme(theme: Theme, markdownStyle: SyntaxStyle): void {
     this.#theme = theme;
-    this.output.borderColor = theme.border;
+    // Resting colour: `render` repaints from the live focus on the next frame.
+    this.output.borderColor = paneBorderColor(theme, false);
+    this.#fill.backgroundColor = theme.canvas;
     this.#conversation.applyTheme(theme, markdownStyle);
     this.#composer.applyTheme(theme);
     this.#renderedConversation = null;
@@ -138,6 +164,11 @@ export class ChatPaneView {
   /** Scrolled by Page Up/Page Down while this pane holds focus. */
   scrollBy(delta: number): void {
     this.#scroll.scrollBy(delta, 'viewport');
+  }
+
+  /** Releases the composer's spinner timer when the app tears down. */
+  destroy(): void {
+    this.#composer.destroy();
   }
 
   isComposerEmpty(): boolean {
@@ -158,24 +189,42 @@ export class ChatPaneView {
 
   render(state: SessionState, visible: boolean, width: number): void {
     this.output.visible = visible;
+    // Ahead of the visibility gate: an answer that lands while the dock is
+    // hidden still has to stop the composer's spinner.
+    this.#composer.syncPending(state.chatPending, visible);
     if (!visible) {
+      // Forgotten while hidden, so the pane reappears on the tail.
+      this.#visibleThreadId = null;
       return;
     }
     this.output.width = width;
     const focused = chatPaneFocused(state);
-    this.output.borderColor = focused ? this.#theme.borderFocus : this.#theme.border;
-    // The column can be as narrow as its minimum, where a spelled-out "focused"
-    // costs the title itself: a box with no title reads as nothing at all. The
-    // marker is the one the table already uses for the row that has the keys.
-    // The title names the active thread so switching is visible at a glance,
-    // and its runtime so the operator can tell which agent is answering.
-    const label = chatThreadHeading(state);
-    this.output.title = focused ? ` ▸ ${label} ` : ` ${label} `;
+    // The chat is a pane, so it wears the same focus channels as the panes
+    // beside it rather than a treatment of its own. `focus.ts` reserves the
+    // marker's cell in the title, which keeps the label at a fixed column
+    // whether or not the chat holds the keys. The label names the active thread
+    // so switching is visible at a glance, and its runtime so the operator can
+    // tell which agent is answering.
+    applyPaneFocus(this.output, this.#theme, chatThreadHeading(state), focused);
     this.#composer.activate(Math.max(1, width - 4), focused, state.chatPending);
     this.#composer.renderMenu(state);
-    if (state.chatConversation === this.#renderedConversation) return;
-    this.#renderedConversation = state.chatConversation;
-    this.#conversation.render(state);
+    if (state.chatConversation !== this.#renderedConversation) {
+      this.#renderedConversation = state.chatConversation;
+      this.#conversation.render(state);
+    }
+    // Tailing is stickyScroll's job: it follows appended entries and releases
+    // when the operator scrolls up. The explicit jump is reserved for the
+    // moments the operator asked for the tail, the pane appearing and
+    // switching threads; jumping on every conversation change instead
+    // cancelled a manual scroll-up as soon as an answer streamed in.
+    if (this.#visibleThreadId !== state.activeChatThreadId) {
+      this.#visibleThreadId = state.activeChatThreadId;
+      this.#scrollToTail();
+    }
+  }
+
+  /** Lands the viewport at the bottom, which also re-arms sticky-bottom. */
+  #scrollToTail(): void {
     this.#scroll.scrollTo(this.#scroll.scrollHeight);
   }
 }

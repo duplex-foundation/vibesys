@@ -75,6 +75,7 @@ MOCK_CAPABILITIES = AgentCapabilities(
     container_execution=True,
     timeouts=True,
     session_reuse=True,
+    provider_session_resume=True,
 )
 """What the mock can honor without weakening the semantics it was handed.
 
@@ -189,6 +190,7 @@ class MockSession:
         self._playbook = playbook
         self._turns = 0
         self._closed = False
+        self._resumed_session_id: str | None = None
 
     def run_turn(
         self,
@@ -214,12 +216,29 @@ class MockSession:
         return AgentTurnResult(
             text=_scripted_turn_text(request, round_index),
             usage=_scripted_usage(round_index),
-            provider_session_id=f"mock-{self._spec.role}-{id(self):x}",
+            # An adopted session ID is echoed back so a resumed run's continuity
+            # is observable; otherwise each session mints its own stable ID.
+            provider_session_id=(
+                self._resumed_session_id or f"mock-{self._spec.role}-{id(self):x}"
+            ),
         )
+
+    def cancel(self) -> None:
+        """Do nothing: a mock turn is synchronous and always already finished.
+
+        ``run_turn`` emits its scripted events on the calling thread and
+        returns, so there is never an in-flight turn for another thread to
+        stop. Kept so the mock satisfies the whole session contract.
+        """
 
     def close(self) -> None:
         """Release this session. Idempotent; the mock owns no resources."""
         self._closed = True
+
+    def resume_provider_session(self, session_id: str) -> bool:
+        """Adopt ``session_id`` so a resumed run's continuity is observable."""
+        self._resumed_session_id = session_id
+        return True
 
 
 class MockDriver:

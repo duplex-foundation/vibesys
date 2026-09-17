@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from vibesys import boot_trace
+from vibesys.agents.provider_policy import SHIPPED_PROVIDERS
 from vibesys.config import Config, load_config
 from vibesys.constants import (
     KNOWN_COMPUTE_BACKENDS,
@@ -38,6 +39,7 @@ from vibesys.domains.base import DomainName
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
 from vibesys.input_manifest import InputBundle, load_input_bundle, load_project_task
 from vibesys.loops.metrics import MetricSpace, Objective
+from vibesys.loops.roles import expected_agent_roles
 from vibesys.profilers import CLI_PROFILER_CHOICES, ProfilerKind, coerce_profiler_kind
 from vibesys.render.headless import HeadlessRenderer
 from vibesys.repository import (
@@ -50,6 +52,7 @@ from vibesys.repository import (
 from vibesys.resource_paths import default_skill_roots
 from vibesys.run.events import CoreEventType, EventStatus, RunStartedData
 from vibesys.run.experiment_repo import ExperimentRepository
+from vibesys.run.git_events import NullGitTrackerEvents
 from vibesys.run.git_tracker import GitTracker
 from vibesys.run.integration import LocalRunIntegration, RunIntegration
 from vibesys.sandbox.run_environment import (
@@ -437,7 +440,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "Which profiler to use between rounds. "
             "'none' to disable standalone profiling, "
             "'nsys' for NVIDIA Nsight Systems (needs /proc/driver/nvidia), "
-            "'torch' for torch.profiler (works in Modal sandboxes), "
+            "'torch' for torch.profiler (works under the Modal run environment), "
             "'neuron' for AWS neuron-explorer (Trainium/NeuronCores), "
             "'otel' for OpenTelemetry service/span/datastore latency on "
             "microservice benchmarks (opt-in; needs an instrumented input bundle), "
@@ -619,7 +622,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cli-provider",
-        choices=["claude", "gemini", "codex", "opencode"],
+        choices=list(SHIPPED_PROVIDERS),
         default=None,
         help=(
             "Which CLI tool to drive when --agent-backend=cli. Overrides "
@@ -1477,7 +1480,7 @@ def _switch_project_resume_branch(project_root: Path, run_id: str) -> None:
         return
     tracker = GitTracker(
         project_root,
-        log=lambda _message: None,
+        events=NullGitTrackerEvents(),
         run_id=run_id,
     )
     try:
@@ -2190,10 +2193,19 @@ def _load_metric_space_toml(input_path: Path) -> MetricSpace:
     return MetricSpace(objectives=tuple(objectives), relative_noise=value)
 
 
-def _resolve_objectives(args: argparse.Namespace) -> list[Objective]:
+def _resolve_metric_space(args: argparse.Namespace) -> MetricSpace:
+    """Build the run's metric space, letting ``--objective`` override its axes.
+
+    The tolerance always comes from the task file: it describes the workload's
+    measurement variation, which a command-line axis list does not change.
+    """
+    space = _load_metric_space_toml(args.input_bundle.task_root)
     if args.objective:
-        return list(args.objective)
-    return list(_load_metric_space_toml(args.input_bundle.task_root).objectives)
+        return MetricSpace(
+            objectives=tuple(args.objective),
+            relative_noise=space.relative_noise,
+        )
+    return space
 
 
 def _build_evolve_parser() -> argparse.ArgumentParser:
@@ -2362,7 +2374,7 @@ def _run_evolve(args: argparse.Namespace, integration: RunIntegration) -> None:
     from vibesys.loops.evolve.loop import run_evolve_loop  # noqa: PLC0415  # tracked: #288
 
     objective = _load_objective(bundle)
-    objectives = _resolve_objectives(args)
+    space = _resolve_metric_space(args)
 
     existing = False
     exp_name = args.exp_name
@@ -2370,9 +2382,12 @@ def _run_evolve(args: argparse.Namespace, integration: RunIntegration) -> None:
         exp_name = args.resume
         existing = True
         print(f"Resuming evolve run {exp_name} in {bundle.root}/")  # noqa: T201  # tracked: #288
-    if objectives:
-        spec = ", ".join(f"{o.name}({o.direction})" for o in objectives)
-        print(f"Pareto mode active: [{spec}]; frontier_bias={args.frontier_bias}")  # noqa: T201  # tracked: #288
+    if space.objectives:
+        spec = ", ".join(f"{o.name}({o.direction})" for o in space.objectives)
+        print(  # noqa: T201  # tracked: #288
+            f"Pareto mode active: [{spec}]; frontier_bias={args.frontier_bias}; "
+            f"tolerance={space.relative_noise:.0%}"
+        )
 
     search_policy, openevolve_config = _resolve_openevolve_options(args)
 
@@ -2389,6 +2404,9 @@ def _run_evolve(args: argparse.Namespace, integration: RunIntegration) -> None:
         evaluator_path=bundle.evaluator_path,
         evaluator_package_root=bundle.evaluator_package_root,
         accuracy_timeout_seconds=bundle.manifest.accuracy.timeout_seconds,
+        benchmark_result=bundle.benchmark_result,
+        benchmark_result_protocol=bundle.benchmark_result_protocol,
+        benchmark_timeout_seconds=bundle.manifest.benchmark.timeout_seconds,
         objective=objective,
         max_generations=args.max_generations,
         children_per_generation=args.children_per_generation,
@@ -2406,7 +2424,7 @@ def _run_evolve(args: argparse.Namespace, integration: RunIntegration) -> None:
         backend=backend,
         modality=args.modality,
         domain=bundle.domain,
-        objectives=objectives,
+        space=space,
         frontier_bias=args.frontier_bias,
         bootstrap_max_attempts=args.bootstrap_max_attempts,
         keep_deployments=args.keep_deployments,
@@ -2578,6 +2596,11 @@ def dispatch(argv: list[str], integration: RunIntegration | None = None) -> None
             unsubscribe = run_integration.events.subscribe(HeadlessRenderer().handle)
         with boot_trace.span("run_started_event"):
             max_rounds = getattr(args, "max_rounds", getattr(args, "max_iterations", 1))
+            expected_roles = expected_agent_roles(loop_kind)
+            if args.profiler is ProfilerKind.NONE:
+                # A disabled profiler never runs (see loop.py's profiler-kind
+                # gate), so don't seed a placeholder for it.
+                expected_roles = tuple(role for role in expected_roles if role != "profiler")
             run_integration.events.emit(
                 CoreEventType.RUN_STARTED,
                 status=EventStatus.ACTIVE,
@@ -2585,6 +2608,7 @@ def dispatch(argv: list[str], integration: RunIntegration | None = None) -> None
                     outer_loop=loop_kind,
                     input=str(args.input_bundle.root),
                     max_rounds=max_rounds,
+                    expected_roles=expected_roles,
                 ),
             )
         runner(args, run_integration)

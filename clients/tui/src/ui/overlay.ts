@@ -1,6 +1,7 @@
-import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
-import type {SessionState} from '../session-model.js';
-import type {Theme} from './theme.js';
+import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
+import {focusedPane, type RightPane, type SessionState} from '../session-model.js';
+import {applyPaneFocus} from './focus.js';
+import {scrim, type Theme} from './theme.js';
 
 type OverlayKind = NonNullable<SessionState['overlay']>['kind'];
 
@@ -10,6 +11,33 @@ const TITLE: Record<OverlayKind, string> = {
   error: 'Error',
 };
 
+const HINT = 'Esc to close · PgUp/PgDn: scroll';
+
+/**
+ * The share of the screen the box takes. It is applied in whole rows and
+ * columns rather than as a Yoga percentage: a fractional box edge rounds the
+ * hint back onto the scroll viewport's last row, which hides the final line of
+ * content.
+ */
+const WIDTH_SHARE = 0.7;
+const LEFT_SHARE = 0.15;
+const HEIGHT_SHARE = 0.6;
+const TOP_SHARE = 0.18;
+
+/**
+ * Rows at the foot of the screen the box never reaches: the command input, the
+ * bottom border of the pane holding it, and the key-help line under that pane.
+ *
+ * Floating over pane content is what an overlay is for. The command input is
+ * the exception, because it keeps taking keystrokes while the box is open, so
+ * covering it would hide the surface the operator is still typing into. The
+ * share above only reaches these rows on a short terminal.
+ */
+const COMMAND_SURFACE_ROWS = 5;
+
+/** Two borders, the hint row, and one line of content worth opening for. */
+const MIN_ROWS = 4;
+
 function borderFor(theme: Theme, kind: OverlayKind): string {
   if (kind === 'help') return theme.success;
   if (kind === 'error') return theme.error;
@@ -18,78 +46,187 @@ function borderFor(theme: Theme, kind: OverlayKind): string {
 
 export class OverlayView {
   readonly output: BoxRenderable;
+  readonly scrim: BoxRenderable;
+  readonly #scroll: ScrollBoxRenderable;
+  readonly #hint: TextRenderable;
   #theme: Theme;
   #renderedKind: OverlayKind | null = null;
   #renderedContent = '';
+  #renderedPane: RightPane | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
     theme: Theme,
   ) {
     this.#theme = theme;
+    this.scrim = new BoxRenderable(renderer, {
+      id: 'overlay-scrim',
+      position: 'absolute',
+      width: '100%',
+      height: '100%',
+      // The dim is solved per theme rather than fixed: the themes do not start
+      // from the same contrast, so one blend deep enough to recede Solarized
+      // Dark's body text leaves High Contrast Dark's fully readable. `scrim`
+      // in theme.ts is the single place that derivation lives (#566).
+      backgroundColor: scrim(theme).color,
+      opacity: scrim(theme).strength,
+      zIndex: 19,
+      visible: false,
+    });
     this.output = new BoxRenderable(renderer, {
       id: 'overlay',
-      width: '70%',
-      height: '60%',
       position: 'absolute',
-      left: '15%',
-      top: '18%',
       flexDirection: 'column',
       paddingLeft: 1,
       paddingRight: 1,
       border: true,
-      borderStyle: 'rounded',
+      // Square with an outer fill, the overlay exception (tui-conventions.md):
+      // the fill is what makes this modal opaque over whatever it covers, ring
+      // included, and a fill that reaches the ring needs a square corner.
+      borderStyle: 'single',
       borderColor: theme.info,
-      backgroundColor: theme.elevatedSurface,
+      backgroundColor: theme.canvas,
       // Above the chat modal (20), below the theme picker (30): a command ack
       // submitted from the modal chat has to be visible over it.
       zIndex: 25,
     });
+    this.#scroll = new ScrollBoxRenderable(renderer, {
+      id: 'overlay-scroll',
+      width: '100%',
+      flexGrow: 1,
+      stickyScroll: false,
+      viewportCulling: true,
+      verticalScrollbarOptions: {showArrows: false},
+    });
+    // The box owns its scroll viewport and its hint row for the whole life of
+    // the view: only the scrolled content is rebuilt per overlay. The hint has
+    // a reserved row of its own so it cannot overpaint the last content line.
+    this.#hint = new TextRenderable(renderer, {
+      content: HINT,
+      fg: theme.textSubtle,
+      width: '100%',
+      height: 1,
+      flexShrink: 0,
+      wrapMode: 'none',
+      truncate: true,
+    });
+    this.output.add(this.#scroll);
+    this.output.add(this.#hint);
+  }
+
+  /** Scrolled by Page Up/Page Down while the overlay is open. */
+  scrollBy(delta: number): void {
+    this.#scroll.scrollBy(delta, 'viewport');
+  }
+
+  renderScrim(visible: boolean): void {
+    this.scrim.visible = visible;
   }
 
   applyTheme(theme: Theme): void {
     this.#theme = theme;
-    this.output.backgroundColor = theme.elevatedSurface;
+    this.output.backgroundColor = theme.canvas;
+    this.scrim.backgroundColor = scrim(theme).color;
+    this.scrim.opacity = scrim(theme).strength;
     this.output.borderColor = borderFor(theme, this.#renderedKind ?? 'detail');
+    this.#hint.fg = theme.textSubtle;
     this.#renderedKind = null;
     this.#renderedContent = '';
+    this.#renderedPane = null;
   }
 
-  render(state: SessionState): void {
+  /**
+   * `pane` is the visualization the terminal is too narrow to split, drawn here
+   * because there is no column to put it in. It is the same surface as
+   * `RightPaneView` and takes the same keys, so it wears that pane's title and
+   * asks `focusedPane` the same question rather than appearing as a `Command`
+   * box with none of the focus treatment on the one thing taking keystrokes.
+   */
+  render(state: SessionState, pane: RightPane | null = null): void {
+    if (pane !== null) {
+      this.#renderPane(state, pane);
+      return;
+    }
+    this.#renderedPane = null;
     const overlay = state.overlay;
     if (overlay === null) {
       this.output.visible = false;
+      // Scroll position belongs to one viewing of one overlay. Forgetting what
+      // is on screen makes the next open rebuild the content, which puts the
+      // viewport back at the top even when the same overlay is reopened.
+      this.#renderedKind = null;
+      this.#renderedContent = '';
       return;
     }
     this.output.visible = true;
+    this.#applyGeometry();
     if (this.#renderedKind === overlay.kind && this.#renderedContent === overlay.content) return;
     this.#renderedKind = overlay.kind;
     this.#renderedContent = overlay.content;
     this.output.borderColor = borderFor(this.#theme, overlay.kind);
     this.output.title = ` ${TITLE[overlay.kind]} `;
     this.#clear();
-    this.output.add(
+    this.#body(
+      overlay.content,
+      overlay.kind === 'error' ? this.#theme.conversation.failure.content : this.#theme.textPrimary,
+    );
+  }
+
+  #renderPane(state: SessionState, pane: RightPane): void {
+    this.output.visible = true;
+    this.#applyGeometry();
+    // Outside the cache below: focus moves without the content changing.
+    applyPaneFocus(this.output, this.#theme, pane.title, focusedPane(state) === 'performance');
+    // `applyPaneFocus` also stamps the pane frame, which is rounded. This box
+    // is an overlay in both of its roles, so it keeps the outer fill and with
+    // it the square corner (tui-conventions.md), and takes only the title and
+    // the border colour from the pane treatment. Frame weight was never one of
+    // the focus channels anyway; `PANE_BORDER` says why.
+    this.output.borderStyle = 'single';
+    if (pane === this.#renderedPane) return;
+    this.#renderedPane = pane;
+    // The next ordinary overlay repaints its own title and border rather than
+    // inheriting the pane's.
+    this.#renderedKind = null;
+    this.#renderedContent = '';
+    this.#clear();
+    if (pane.error !== null) this.#body(pane.error, this.#theme.conversation.failure.content);
+    else if (pane.pending && pane.content === '') {
+      this.#body('Loading...', this.#theme.textSubtle);
+    } else this.#body(pane.content, this.#theme.textPrimary);
+  }
+
+  /** One wrapped block in the scroll viewport, rebuilt per overlay or pane. */
+  #body(content: string, fg: string): void {
+    this.#scroll.add(
       new TextRenderable(this.renderer, {
-        content: overlay.content,
-        fg:
-          overlay.kind === 'error'
-            ? this.#theme.conversation.failure.content
-            : this.#theme.textPrimary,
+        content,
+        fg,
         width: '100%',
+        flexShrink: 0,
+        wrapMode: 'word',
       }),
     );
-    this.output.add(
-      new TextRenderable(this.renderer, {
-        content: 'Esc to close',
-        fg: this.#theme.textSubtle,
-        width: '100%',
-      }),
+    this.#scroll.scrollTo(0);
+  }
+
+  /** Whole-row, whole-column geometry, recomputed as the terminal resizes. */
+  #applyGeometry(): void {
+    const columns = this.renderer.terminalWidth;
+    const rows = this.renderer.terminalHeight;
+    this.output.width = Math.round(columns * WIDTH_SHARE);
+    this.output.left = Math.round(columns * LEFT_SHARE);
+    const top = Math.round(rows * TOP_SHARE);
+    this.output.top = top;
+    this.output.height = Math.max(
+      MIN_ROWS,
+      Math.min(Math.round(rows * HEIGHT_SHARE), rows - COMMAND_SURFACE_ROWS - top),
     );
   }
 
   #clear(): void {
-    for (const child of [...this.output.getChildren()]) {
-      this.output.remove(child);
+    for (const child of [...this.#scroll.getChildren()]) {
+      this.#scroll.remove(child);
       child.destroyRecursively();
     }
   }

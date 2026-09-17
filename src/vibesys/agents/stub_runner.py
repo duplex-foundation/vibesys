@@ -9,10 +9,10 @@ from typing import TYPE_CHECKING, TypeVar
 
 from pydantic import BaseModel
 
-from vibesys._agent_cli.base import MCPServerSpec  # noqa: TC001  # tracked: #288
-from vibesys.agents.contracts import AgentCapabilities
+from vibesys.agents.contracts import AgentCapabilities, MCPServerSpec
 from vibesys.agents.progress import AgentProgress  # noqa: TC001  # tracked: #288
 from vibesys.agents.scripted_rounds import round_number_from_label, scripted_round_payload
+from vibesys.agents.session_key import AgentSessionKey  # noqa: TC001  # tracked: #288
 
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool  # annotation only; avoid eager agent-stack import
@@ -33,8 +33,33 @@ class StubAgentClient:
         """The deterministic stub does not expose external tools."""
         return AgentCapabilities(session_reuse=False)
 
+    @property
+    def driver_name(self) -> str | None:
+        """No driver runs a stub turn; the stub itself is the attribution."""
+        return "stub"
+
+    @property
+    def provider(self) -> str | None:
+        """No external provider runs a stub turn."""
+        return "stub"
+
+    def model_for_kind(self, kind: str) -> str | None:
+        """A stub turn runs no model, for any role."""
+        del kind
+        return None
+
     def close(self) -> None:
         """The deterministic stub owns no external resources."""
+
+    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Never name a conversation: the stub runs no provider at all."""
+        del session_key
+        return None
+
+    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Never name a conversation: the stub runs no provider at all."""
+        del session_key
+        return None
 
     def set_log_file(self, stream: object) -> None:
         """Accept log retargeting; the deterministic stub emits no file logs."""
@@ -86,7 +111,7 @@ class StubAgentClient:
         mcp_servers: list[MCPServerSpec] | None = None,
         tools: list[BaseTool] | None = None,
         reuse_session: bool | None = None,
-        session_key: str | None = None,
+        session_key: AgentSessionKey | None = None,
     ) -> str:
         """Return a deterministic answer for auxiliary-agent smoke tests."""
         del (

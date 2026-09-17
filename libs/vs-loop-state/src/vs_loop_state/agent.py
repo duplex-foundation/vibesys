@@ -49,6 +49,12 @@ if TYPE_CHECKING:
 #: is the only value compatible with an unreviewed round.
 JudgeVerdict = Literal["pass", "fail", "deferred"]
 
+#: Who produced a round's headline ``perf_metric``. ``framework`` means a
+#: framework-owned benchmark result contract measured it; ``implementer`` means
+#: the agent reported it about its own work. Only the framework may write
+#: ``framework``, so this is the trust boundary every consumer branches on.
+PerfProvenance = Literal["framework", "implementer"]
+
 
 @dataclass(config=ConfigDict(extra="forbid", populate_by_name=True, serialize_by_alias=True))
 class RoundRecord:
@@ -92,9 +98,13 @@ class RoundRecord:
     hypothesis_parent_commit: str | None = None
     metrics: dict[str, float] = Field(default_factory=dict)
     evaluation_artifact: str | None = None
-    # Only framework-owned gates can set this. A judge-approved hypothesis may
-    # be a useful provisional working checkpoint without becoming the latest
-    # officially verified checkpoint.
+    # Whether the framework's own gates ran this round. Only framework-owned
+    # gates can set it: a judge-approved hypothesis may be a useful provisional
+    # working checkpoint without becoming the latest officially verified
+    # checkpoint. It says nothing about who produced ``perf_metric`` -- the
+    # gates can run in a round whose headline number is still the agent's own
+    # report -- so consumers deciding whether to trust a measurement read
+    # ``perf_provenance``, not this flag.
     official_evaluation: bool = False
     official_evaluation_reason: str | None = None
     # Candidate evidence is deliberately separate from official tracking. It
@@ -125,6 +135,23 @@ class RoundRecord:
     # framework stored the comparison; readers then re-derive it from the
     # run's persisted metric space.
     perf_comparison: MetricComparison | None = None
+
+    # Who produced ``perf_metric``. ``None`` identifies a legacy record written
+    # before provenance was tracked; consumers treat those as trusted so
+    # reprojection does not rewrite their historical resolutions. On every
+    # record the framework writes now, ``perf_provenance`` is non-None whenever
+    # ``perf_metric`` is non-None.
+    perf_provenance: PerfProvenance | None = None
+
+    # Implementer attribution: which driver/provider/model produced this round
+    # attempt. The provider session ID itself is machine-local and never lives
+    # on this portable record; ``vibesys.agents.session_store`` owns it, keyed
+    # by the round's hypothesis ID. These three fields describe the *latest*
+    # attempt at the round: a resumed run that re-attempts the same round
+    # overwrites the manifest entry, so they are not an append-only audit log.
+    implementer_driver: str | None = None
+    implementer_provider: str | None = None
+    implementer_model: str | None = None
 
     @model_validator(mode="after")
     def _normalize_review(self) -> RoundRecord:

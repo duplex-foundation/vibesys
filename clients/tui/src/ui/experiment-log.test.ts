@@ -1,5 +1,7 @@
-import {describe, expect, it} from 'bun:test';
+import {afterEach, describe, expect, it} from 'bun:test';
+import {createTestRenderer} from '@opentui/core/testing';
 import type {HypothesisEntry} from '@vibesys/backend-client';
+import type {SessionController} from '../session-controller.js';
 import {
   entryKey,
   initialSessionState,
@@ -9,7 +11,9 @@ import {
   setExperiments,
 } from '../session-model.js';
 import {
+  ExperimentLogView,
   entryCells,
+  entryLeadingMarker,
   entryRow,
   formatMeasured,
   formatRounds,
@@ -19,8 +23,12 @@ import {
   outcomeColor,
   outcomeLabel,
   resolveColumns,
+  selectionCaret,
   sentenceCase,
+  unownedRoundCells,
+  unownedRoundRow,
 } from './experiment-log.js';
+import {displayWidth} from './text-width.js';
 import {resolveTheme, THEME_NAMES} from './theme.js';
 
 const WIDE = 120;
@@ -114,7 +122,11 @@ describe('experiment log rows', () => {
       resolveColumns(WIDE),
     );
 
-    expect(row.startsWith('▸')).toBe(true);
+    // The leading column reserves a selection caret ahead of the active
+    // marker; unselected, that slot is a blank rather than absent, so the
+    // active marker lands in the same place whether or not the row is
+    // selected.
+    expect(row.startsWith(' ▸')).toBe(true);
     expect(row).toContain('Active');
   });
 
@@ -129,6 +141,43 @@ describe('experiment log rows', () => {
       formatMeasured(entry({perf_delta_pct: null, perf_metric: 55434.2, perf_unit: 'ops/s'})),
     ).toBe('55434.2 ops/s');
     expect(formatMeasured(entry({perf_delta_pct: -2, perf_unit: 'ops/s'}))).toBe('-2.0%');
+  });
+
+  it('renders the three no-delta reasons and a zero delta as four distinct cells', () => {
+    const noBaselineYet = formatMeasured(
+      entry({
+        perf_delta_pct: null,
+        perf_metric: 101,
+        perf_unit: 'ops/s',
+        perf_delta_reason: 'no_baseline_yet',
+      }),
+    );
+    const baselineUnresolved = formatMeasured(
+      entry({
+        perf_delta_pct: null,
+        perf_metric: 102,
+        perf_unit: 'ops/s',
+        perf_delta_reason: 'baseline_unresolved',
+      }),
+    );
+    const selfReported = formatMeasured(
+      entry({perf_delta_pct: null, perf_metric: null, perf_delta_reason: 'not_framework_measured'}),
+    );
+    const zeroDelta = formatMeasured(entry({perf_delta_pct: 0}));
+
+    expect(noBaselineYet).toBe('101 ops/s');
+    expect(baselineUnresolved).toBe('? 102 ops/s');
+    expect(selfReported).toBe('self-reported');
+    expect(zeroDelta).toBe('0.0%');
+    expect(new Set([noBaselineYet, baselineUnresolved, selfReported, zeroDelta]).size).toBe(4);
+  });
+
+  it('renders a legacy entry with no delta_reason as a bare value and leaves a delta unaffected', () => {
+    const legacy = entry({perf_delta_pct: null, perf_metric: 2412.5, perf_unit: 'ops/s'});
+    expect(legacy.perf_delta_reason).toBeUndefined();
+    expect(formatMeasured(legacy)).toBe('2412.5 ops/s');
+
+    expect(formatMeasured(entry({perf_delta_pct: 5.9}))).toBe('+5.9%');
   });
 
   it('points the header the way improvement goes when the log agrees on one', () => {
@@ -183,6 +232,48 @@ describe('experiment log rows', () => {
     expect(metadata).toContain('Measured 2412.5 ops/s');
   });
 
+  it('shows a measurement direction even when the metric name is absent', () => {
+    expect(hypothesisMetadata(entry({perf_metric_name: null, perf_direction: 'max'}))).toContain(
+      'Direction maximize',
+    );
+    expect(hypothesisMetadata(entry({perf_metric_name: null, perf_direction: 'min'}))).toContain(
+      'Direction minimize',
+    );
+  });
+
+  it('spells out the baseline identity in the drill-down metadata', () => {
+    const metadata = hypothesisMetadata(
+      entry({
+        perf_metric: 55434.2,
+        perf_baseline_value: 52340.1,
+        perf_baseline_round: 3,
+        perf_baseline_commit: 'abc1234deadbeef',
+        perf_delta_pct: 5.9,
+      }),
+    );
+
+    expect(metadata).toContain('Baseline round 3');
+    expect(metadata).toContain('Baseline commit abc1234');
+  });
+
+  it('spells out each no-delta reason in the drill-down metadata', () => {
+    expect(
+      hypothesisMetadata(entry({perf_delta_pct: null, perf_delta_reason: 'no_baseline_yet'})),
+    ).toContain('No baseline existed yet');
+    expect(
+      hypothesisMetadata(entry({perf_delta_pct: null, perf_delta_reason: 'baseline_unresolved'})),
+    ).toContain('No trusted baseline resolved');
+    expect(
+      hypothesisMetadata(
+        entry({
+          perf_delta_pct: null,
+          perf_metric: null,
+          perf_delta_reason: 'not_framework_measured',
+        }),
+      ),
+    ).toContain('Self-reported, not framework-measured');
+  });
+
   it('renders a record with no hypothesis id as an explicit placeholder', () => {
     const row = entryRow(
       entry({
@@ -196,7 +287,9 @@ describe('experiment log rows', () => {
       resolveColumns(WIDE),
     );
 
-    expect(row).toContain('(unidentified)');
+    // The two-character selection-caret slot leaves one fewer column for the
+    // id itself, so a 15-character placeholder now truncates one char sooner.
+    expect(row).toContain('(unidentifie…');
     expect(row).toContain('—');
     expect(row).not.toContain('Active');
   });
@@ -206,10 +299,36 @@ describe('experiment log rows', () => {
     const header = headerRow(columns);
     const row = entryRow(entry({hypothesis_id: 'm1-preallocated-spsc-ring'}), columns);
     const roundsStart = header.indexOf('Rounds');
+    const claimStart = header.indexOf('Implementation Details');
 
-    expect(row).toContain('m1-preallocat…  41');
+    expect(row).toContain('m1-prealloca…');
+    // Rounds right-aligns (see "right-aligns the numeric columns" below), so
+    // the gutter before it is padding, not the fixed single space a
+    // left-aligned column would have kept.
     expect(row[roundsStart - 1]).toBe(' ');
-    expect(row.slice(roundsStart).startsWith('41')).toBe(true);
+    // The two-digit round number lands flush against the next column's gutter
+    // (the fixed two-space gap) rather than at the start of its own column.
+    expect(row.slice(roundsStart, claimStart - 2).endsWith('41')).toBe(true);
+  });
+
+  it('keeps the ? marker readable when a long unit truncates at MEASURED_WIDTH', () => {
+    const columns = resolveColumns(70);
+    expect(columns.measured).toBe(true);
+    const row = entryRow(
+      entry({
+        perf_delta_pct: null,
+        perf_metric: 55434.2,
+        perf_unit: 'total_operations_per_second_sustained',
+        perf_delta_reason: 'baseline_unresolved',
+      }),
+      columns,
+    );
+
+    // The marker is at the start of the value, which truncate() preserves by
+    // cutting the unit suffix, not the prefix; the value fills the column
+    // exactly here, so this substring check no longer depends on the
+    // header's own (now right-aligned) label position to locate it.
+    expect(row).toContain('? 55434.2');
   });
 
   it('keeps gutters across the separately colored outcome segments', () => {
@@ -245,6 +364,246 @@ describe('experiment log rows', () => {
       resolveColumns(WIDE),
     );
     expect(withActionOnly.leading).toContain('Batch prefill');
+  });
+});
+
+/**
+ * Column arithmetic in cells, not code units: a CJK character is one code
+ * unit but two terminal cells, so `padEnd`/`slice` layouts drift as soon as a
+ * title or id carries one.
+ */
+describe('experiment log CJK column alignment', () => {
+  function columnOf(row: string, needle: string): number {
+    const index = row.indexOf(needle);
+    expect(index, `${needle} in ${row}`).toBeGreaterThanOrEqual(0);
+    return displayWidth(row.slice(0, index));
+  }
+
+  it('keeps the outcome column aligned when the claim is CJK', () => {
+    const columns = resolveColumns(WIDE);
+    const ascii = entryRow(entry(), columns);
+    const cjk = entryRow(entry({title: '缓存优化提升吞吐'}), columns);
+
+    expect(displayWidth(cjk)).toBe(displayWidth(ascii));
+    expect(columnOf(cjk, 'Accepted')).toBe(columnOf(ascii, 'Accepted'));
+  });
+
+  it('truncates a CJK claim by cells and never splits a wide character', () => {
+    const columns = resolveColumns(WIDE);
+    const cells = entryCells(entry({title: '性'.repeat(60)}), columns);
+
+    // The claim budget is odd here, so the last ideograph would straddle it:
+    // it is dropped whole and the ellipsis marks the cut.
+    expect(cells.leading).toContain(`${'性'.repeat(25)}…`);
+    expect(cells.leading).not.toContain('性'.repeat(26));
+    expect(displayWidth(cells.leading)).toBe(displayWidth(entryCells(entry(), columns).leading));
+  });
+
+  it('truncates a CJK hypothesis id by cells so the rounds column stays put', () => {
+    const columns = resolveColumns(WIDE);
+    const ascii = entryRow(entry(), columns);
+    const cjk = entryRow(entry({hypothesis_id: '缓存优化假设编号很长'}), columns);
+
+    expect(cjk).toContain('缓存优化假设…');
+    expect(columnOf(cjk, '41')).toBe(columnOf(ascii, '41'));
+  });
+});
+
+/**
+ * A round with agent turns but no owning hypothesis (a profiling round before
+ * hypothesis 1, or any round the orchestrator has not yet attached to a
+ * claim) is the default landing state, not an edge case: a task profiles
+ * before proposing its first hypothesis, so nearly every run shows this row
+ * first. `unownedRoundCells` has to land on the same column grid
+ * `entryCells` does, or the columns above it read as unused chrome.
+ */
+describe('unownedRoundCells', () => {
+  it('lands on the same column offsets as a hypothesis row at every width the panel degrades through', () => {
+    // Real recorded round, not an invented fixture: hypothesis
+    // M1-superlinear-elimination, round 1, 562.9504 total_ms, from
+    // ~/dev/vibesys-runs/bad-cpp/.../agent/rounds/0001.json.
+    const recorded = entry({
+      hypothesis_id: 'M1-superlinear-elimination',
+      first_round: 1,
+      last_round: 1,
+      perf_metric: 562.9504,
+      perf_unit: 'total_ms',
+      perf_delta_pct: null,
+      resolved_outcome: 'proven',
+    });
+    for (const width of [120, 104, 103, 90, 89, 72, 62, 61, 54, 40]) {
+      const columns = resolveColumns(width);
+      const hypothesisCells = entryCells(recorded, columns);
+      const roundCells = unownedRoundCells(2, columns);
+      expect(roundCells.leading.length, `leading at ${width}`).toBe(hypothesisCells.leading.length);
+      expect(roundCells.outcome.length, `outcome at ${width}`).toBe(hypothesisCells.outcome.length);
+      expect(roundCells.trailing.length, `trailing at ${width}`).toBe(
+        hypothesisCells.trailing.length,
+      );
+      // Same columns dropped, not just the same total width.
+      expect(roundCells.trailing === '').toBe(hypothesisCells.trailing === '');
+    }
+  });
+
+  it('renders absent measured, outcome, and kept values as the existing placeholder, not empty strings', () => {
+    const columns = resolveColumns(WIDE);
+    const cells = unownedRoundCells(3, columns);
+    expect(cells.outcome.trim()).toBe('—');
+    expect(cells.trailing.trim()).toBe('—');
+    expect(cells.leading.trimEnd().endsWith('—')).toBe(true);
+  });
+
+  it('carries a real round number and the honest "recorded agent turns" text, never an invented claim', () => {
+    const cells = unownedRoundCells(7, resolveColumns(WIDE));
+    expect(cells.leading).toContain('(no hypothes');
+    expect(cells.leading).toContain('7');
+    expect(cells.leading).toContain('recorded agent turns');
+  });
+
+  it('keeps the selection caret in the same reserved column a hypothesis row uses', () => {
+    const columns = resolveColumns(WIDE);
+    const selected = unownedRoundCells(1, columns, true);
+    const unselected = unownedRoundCells(1, columns, false);
+    expect(selected.leading.startsWith('›')).toBe(true);
+    expect(unselected.leading.startsWith(' ')).toBe(true);
+    expect(selected.leading.slice(1)).toBe(unselected.leading.slice(1));
+  });
+});
+
+describe('right-aligned numeric columns', () => {
+  it('right-aligns Rounds so it ends flush at the column boundary regardless of digit count', () => {
+    // At a width below CLAIM_MIN_WIDTH and MEASURED_MIN_WIDTH, Rounds is the
+    // trailing segment of `leading`, so a right-aligned cell makes `leading`
+    // end with the value itself; a left-aligned one would end with padding.
+    const columns = resolveColumns(NARROW);
+    expect(columns.claim).toBe(false);
+    expect(columns.measured).toBe(false);
+    const short = entryCells(entry({first_round: 2, last_round: 2}), columns);
+    const long = entryCells(entry({first_round: 10, last_round: 99}), columns);
+    expect(short.leading.endsWith('2')).toBe(true);
+    expect(long.leading.endsWith('10-99')).toBe(true);
+  });
+
+  it('right-aligns Measured so it ends flush at the column boundary regardless of value length', () => {
+    const columns = resolveColumns(WIDE);
+    const short = entry({perf_delta_pct: null, perf_metric: 5});
+    const long = entry({perf_delta_pct: null, perf_metric: 123456.78, perf_unit: 'tokens/s'});
+    expect(entryCells(short, columns).leading.endsWith(formatMeasured(short))).toBe(true);
+    expect(entryCells(long, columns).leading.endsWith(formatMeasured(long))).toBe(true);
+  });
+
+  it('right-aligns Kept so "Yes" and "No" both end flush at the column boundary', () => {
+    const columns = resolveColumns(WIDE);
+    expect(columns.kept).toBe(true);
+    expect(entryCells(entry({kept: true}), columns).trailing.endsWith('Yes')).toBe(true);
+    expect(entryCells(entry({kept: false}), columns).trailing.endsWith('No')).toBe(true);
+  });
+});
+
+/**
+ * Every column's header label shares its alignment with that column's cells,
+ * placeholders included: a numeric column's header ends flush with its
+ * right-aligned values, a text column's header starts flush with its
+ * left-aligned values. Before this, every header label was left-aligned
+ * regardless of its column, so a right-aligned value (or a right-aligned
+ * placeholder) sat under a header that started, not ended, at the column
+ * boundary.
+ */
+describe('header alignment follows its column', () => {
+  it('right-aligns the Rounds header so it ends where its right-aligned values end', () => {
+    const columns = resolveColumns(WIDE);
+    const header = headerRow(columns);
+    const row = entryRow(entry({first_round: 10, last_round: 99}), columns);
+
+    const headerEnd = header.indexOf('Rounds') + 'Rounds'.length;
+    const valueEnd = row.indexOf('10-99') + '10-99'.length;
+    expect(headerEnd).toBe(valueEnd);
+  });
+
+  it('right-aligns the Measured header so it ends where its right-aligned values end', () => {
+    const columns = resolveColumns(WIDE);
+    const header = headerRow(columns);
+    const value = formatMeasured(entry());
+    const row = entryRow(entry(), columns);
+
+    const headerEnd = header.indexOf('Measured') + 'Measured'.length;
+    const valueEnd = row.indexOf(value) + value.length;
+    expect(headerEnd).toBe(valueEnd);
+  });
+
+  it('right-aligns the Kept header so it ends where its right-aligned values end', () => {
+    const columns = resolveColumns(WIDE);
+    expect(columns.kept).toBe(true);
+    const header = headerRow(columns);
+    const row = entryRow(entry({kept: true}), columns);
+
+    const headerEnd = header.indexOf('Kept') + 'Kept'.length;
+    const valueEnd = row.indexOf('Yes') + 'Yes'.length;
+    expect(headerEnd).toBe(valueEnd);
+  });
+
+  it('left-aligns the Implementation Details header so it starts where its values start', () => {
+    const columns = resolveColumns(WIDE);
+    const header = headerRow(columns);
+    const row = entryRow(entry({title: 'Batch decode requests'}), columns);
+
+    const headerStart = header.indexOf('Implementation Details');
+    const valueStart = row.indexOf('Batch decode requests');
+    expect(headerStart).toBe(valueStart);
+  });
+
+  it('in the unowned-round row, right-aligns the Measured placeholder under the Measured header and left-aligns the Outcome placeholder under the Outcome header', () => {
+    const columns = resolveColumns(WIDE);
+    const header = headerRow(columns);
+    const row = unownedRoundRow(3, columns);
+
+    const measuredHeaderEnd = header.indexOf('Measured') + 'Measured'.length;
+    const measuredPlaceholder = row.indexOf('—');
+    // Right-aligned: the one-glyph placeholder ends flush with the header
+    // label's own right-aligned end.
+    expect(measuredPlaceholder + 1).toBe(measuredHeaderEnd);
+
+    const outcomeHeaderStart = header.indexOf('Outcome');
+    const outcomePlaceholder = row.indexOf('—', measuredPlaceholder + 1);
+    // Left-aligned: the placeholder starts exactly where the header's own
+    // left-aligned label starts.
+    expect(outcomePlaceholder).toBe(outcomeHeaderStart);
+  });
+});
+
+describe('selectionCaret', () => {
+  it('renders a caret for the selected row and a matching blank otherwise', () => {
+    expect(selectionCaret(true)).toBe('›');
+    expect(selectionCaret(false)).toBe(' ');
+  });
+});
+
+describe('entryLeadingMarker', () => {
+  it('carries the selection caret and the active marker as independent signals', () => {
+    expect(entryLeadingMarker(entry({active: false}), false)).toBe('  ');
+    expect(entryLeadingMarker(entry({active: false}), true)).toBe('› ');
+    expect(entryLeadingMarker(entry({active: true}), false)).toBe(' ▸');
+    expect(entryLeadingMarker(entry({active: true}), true)).toBe('›▸');
+  });
+});
+
+describe('entryCells and entryRow with selection', () => {
+  it('shows the caret only on the selected row, at the same column as an unselected row', () => {
+    const columns = resolveColumns(WIDE);
+    const selected = entryRow(entry({hypothesis_id: 'H-01'}), columns, true);
+    const unselected = entryRow(entry({hypothesis_id: 'H-01'}), columns, false);
+
+    expect(selected.startsWith('›')).toBe(true);
+    expect(unselected.startsWith(' ')).toBe(true);
+    // Everything past the reserved caret column is identical: selection never
+    // reflows the row's other columns.
+    expect(selected.slice(1)).toBe(unselected.slice(1));
+  });
+
+  it('defaults to unselected when the caller does not pass a selection flag', () => {
+    const columns = resolveColumns(WIDE);
+    expect(entryRow(entry(), columns)).toBe(entryRow(entry(), columns, false));
+    expect(entryCells(entry(), columns)).toEqual(entryCells(entry(), columns, false));
   });
 });
 
@@ -343,5 +702,228 @@ describe('experiment log selection', () => {
     ]);
 
     expect(replaced.experimentLog?.selectedId).toBe('H-99');
+  });
+});
+
+/**
+ * The pure helpers above prove the caret occupies a reserved column and that
+ * an unowned round's cells share a hypothesis row's widths; these tests
+ * reproduce both the original selection symptom and the column-alignment
+ * defect through the real OpenTUI test renderer, per
+ * coding-best-practices.md's rule that a terminal-geometry symptom needs the
+ * renderer, not just a formatter test.
+ */
+describe('experiment log rendered rows', () => {
+  const cleanup: Array<() => void> = [];
+
+  afterEach(() => {
+    for (const destroy of cleanup.splice(0).reverse()) destroy();
+  });
+
+  /** None of these fire in a render-only test; onMouseUp is never simulated. */
+  const controller = {
+    focusPane: () => {},
+    openHypothesisDetail: () => {},
+    moveExperimentSelection: () => {},
+    selectExperimentActivity: () => {},
+    openRound: () => {},
+  } as unknown as SessionController;
+
+  async function renderLog(state: SessionState): Promise<string> {
+    const testRenderer = await createTestRenderer({width: 100, height: 24});
+    const view = new ExperimentLogView(testRenderer.renderer, controller, resolveTheme(null));
+    testRenderer.renderer.root.add(view.output);
+    cleanup.push(() => {
+      view.destroy();
+      view.output.destroyRecursively();
+      testRenderer.renderer.destroy();
+    });
+    view.render(state);
+    await testRenderer.renderOnce();
+    return testRenderer.captureCharFrame();
+  }
+
+  it('puts the caret at the same column on the selected row as the blank it replaces elsewhere', async () => {
+    const initial = logState([
+      entry({hypothesis_id: 'H-01', first_round: 1, last_round: 1}),
+      entry({hypothesis_id: 'H-02', first_round: 2, last_round: 2}),
+    ]);
+    expect(initial.experimentLog?.selectedId).toBe('H-01');
+
+    const h01Selected = (await renderLog(initial)).split('\n');
+    const rowH01Selected = h01Selected.findIndex(line => line.includes('H-01'));
+    const rowH02Unselected = h01Selected.findIndex(line => line.includes('H-02'));
+    const colH01 = h01Selected[rowH01Selected]?.indexOf('H-01') ?? -1;
+    const colH02 = h01Selected[rowH02Unselected]?.indexOf('H-02') ?? -1;
+    expect(colH01).toBeGreaterThan(0);
+    expect(colH01).toBe(colH02);
+    // The active marker sits directly before the id; the caret is one column
+    // further left again, so it never displaces the marker or the id.
+    expect(h01Selected[rowH01Selected]?.[colH01 - 2]).toBe('›');
+    expect(h01Selected[rowH02Unselected]?.[colH02 - 2]).toBe(' ');
+
+    const moved = moveExperimentSelection(initial, 1);
+    expect(moved.experimentLog?.selectedId).toBe('H-02');
+    const h02Selected = (await renderLog(moved)).split('\n');
+    const rowH01AfterMove = h02Selected.findIndex(line => line.includes('H-01'));
+    const rowH02AfterMove = h02Selected.findIndex(line => line.includes('H-02'));
+
+    // Moving the selection off H-01 does not reflow its row: the id lands in
+    // exactly the column it held while selected.
+    expect(h02Selected[rowH01AfterMove]?.indexOf('H-01')).toBe(colH01);
+    expect(h02Selected[rowH02AfterMove]?.indexOf('H-02')).toBe(colH02);
+    expect(h02Selected[rowH01AfterMove]?.[colH01 - 2]).toBe(' ');
+    expect(h02Selected[rowH02AfterMove]?.[colH02 - 2]).toBe('›');
+  });
+
+  it('keeps the outcome column aligned on screen when a claim is CJK', async () => {
+    const frame = (
+      await renderLog(
+        logState([
+          entry({hypothesis_id: 'H-01', first_round: 1, last_round: 1}),
+          entry({hypothesis_id: 'H-02', first_round: 2, last_round: 2, title: '缓存优化提升吞吐'}),
+        ]),
+      )
+    ).split('\n');
+    const asciiRow = frame.find(line => line.includes('H-01'));
+    const cjkRow = frame.find(line => line.includes('H-02'));
+    expect(asciiRow).toBeDefined();
+    expect(cjkRow).toBeDefined();
+    if (asciiRow === undefined || cjkRow === undefined) throw new Error('rows did not render');
+
+    // The frame stores a wide character once per grapheme, so the on-screen
+    // column of a cell is the display width of everything before it, not its
+    // string index.
+    const columnOf = (line: string, needle: string): number => {
+      const index = line.indexOf(needle);
+      expect(index, `${needle} in ${line}`).toBeGreaterThanOrEqual(0);
+      return displayWidth(line.slice(0, index));
+    };
+    expect(columnOf(cjkRow, 'Accepted')).toBe(columnOf(asciiRow, 'Accepted'));
+  });
+
+  it('marks the selected unowned round row with the same caret, in its own reserved column', async () => {
+    const withActivity = setExperiments(
+      openExperimentLog({
+        ...initialSessionState(),
+        core: {
+          ...initialSessionState().core,
+          rounds: [
+            {number: 3, status: 'completed'},
+            {number: 4, status: 'completed'},
+          ],
+        },
+      }),
+      [],
+    );
+    const frame = (await renderLog(withActivity)).split('\n');
+    // "recorded agent turns" is the round row's Implementation Details cell;
+    // both round rows carry it, in ascending round order (3, then 4), and
+    // round 3 is selected by default since it is the first unowned round.
+    const roundLines = frame.filter(line => line.includes('recorded agent turns'));
+    expect(roundLines).toHaveLength(2);
+    const [selectedLine, unselectedLine] = roundLines as [string, string];
+    const colSelected = selectedLine.indexOf('(no hypothes');
+    const colUnselected = unselectedLine.indexOf('(no hypothes');
+    expect(colSelected).toBeGreaterThan(0);
+    expect(colSelected).toBe(colUnselected);
+    // The caret sits two columns before the identity text: one column for
+    // itself, one for the space that always follows it, exactly like a
+    // hypothesis row's marker.
+    expect(selectedLine[colSelected - 2]).toBe('›');
+    expect(unselectedLine[colUnselected - 2]).toBe(' ');
+  });
+
+  it('aligns an unowned round row to the same column offsets as a hypothesis row sharing the same frame', async () => {
+    const state = setExperiments(
+      openExperimentLog({
+        ...initialSessionState(),
+        core: {...initialSessionState().core, rounds: [{number: 5, status: 'completed'}]},
+      }),
+      [entry({hypothesis_id: 'H-01', first_round: 1, last_round: 1})],
+    );
+    const frame = (await renderLog(state)).split('\n');
+    const hypothesisLine = frame.find(line => line.includes('H-01'));
+    const roundLine = frame.find(line => line.includes('recorded agent turns'));
+    if (hypothesisLine === undefined || roundLine === undefined) {
+      throw new Error('expected both a hypothesis row and an unowned round row');
+    }
+    // Both rows reserve the same two-character marker slot before their
+    // identity text: this is the defect the issue reported, restated as a
+    // column offset rather than as a screenshot.
+    expect(roundLine.indexOf('(no hypothes')).toBe(hypothesisLine.indexOf('H-01'));
+  });
+
+  it('draws a rule under the header that reserves its row regardless of how many rows follow', async () => {
+    const oneRound = setExperiments(
+      openExperimentLog({
+        ...initialSessionState(),
+        core: {...initialSessionState().core, rounds: [{number: 1, status: 'completed'}]},
+      }),
+      [],
+    );
+    const twoRounds = setExperiments(
+      openExperimentLog({
+        ...initialSessionState(),
+        core: {
+          ...initialSessionState().core,
+          rounds: [
+            {number: 1, status: 'completed'},
+            {number: 2, status: 'completed'},
+          ],
+        },
+      }),
+      [],
+    );
+    const frameOne = (await renderLog(oneRound)).split('\n');
+    const frameTwo = (await renderLog(twoRounds)).split('\n');
+    const headerIndexOne = frameOne.findIndex(
+      line => line.includes('Hypothesis') && line.includes('Rounds'),
+    );
+    const headerIndexTwo = frameTwo.findIndex(
+      line => line.includes('Hypothesis') && line.includes('Rounds'),
+    );
+    expect(headerIndexOne).toBeGreaterThanOrEqual(0);
+    // The rule sits at a fixed offset from the header whether one row follows
+    // it or two: nothing above the rows moves when a row appears.
+    expect(headerIndexOne).toBe(headerIndexTwo);
+    const ruleOne = frameOne[headerIndexOne + 1] ?? '';
+    const ruleTwo = frameTwo[headerIndexTwo + 1] ?? '';
+    // The pane's own border/padding sit either side of the line; the rule
+    // itself is the contiguous run of the rule glyph in the middle.
+    const ruleRun = ruleOne.match(/─+/)?.[0] ?? '';
+    expect(ruleRun.length).toBeGreaterThan(40);
+    expect(ruleOne).toBe(ruleTwo);
+  });
+
+  it('gives the unowned-round state a next-step line distinct from the zero-row wording', async () => {
+    const zeroRows = logState([]);
+    const zeroFrame = (await renderLog(zeroRows)).split('\n');
+    // Unchanged: the existing zero-row empty state keeps its own wording.
+    expect(zeroFrame.some(line => line.includes('No hypotheses have been recorded yet.'))).toBe(
+      true,
+    );
+    expect(
+      zeroFrame.some(line =>
+        line.includes('The first one appears once the orchestrator has planned a round.'),
+      ),
+    ).toBe(true);
+
+    const unownedRound = setExperiments(
+      openExperimentLog({
+        ...initialSessionState(),
+        core: {...initialSessionState().core, rounds: [{number: 1, status: 'completed'}]},
+      }),
+      [],
+    );
+    const roundFrame = (await renderLog(unownedRound)).split('\n');
+    // A round has genuinely run here, unlike the zero-row case, so the
+    // wording does not repeat "No hypotheses have been recorded yet."
+    expect(roundFrame.some(line => line.includes('No hypotheses have been recorded yet.'))).toBe(
+      false,
+    );
+    expect(
+      roundFrame.some(line => line.includes('The first hypothesis appears once the orchestrator')),
+    ).toBe(true);
   });
 });

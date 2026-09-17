@@ -520,6 +520,36 @@ class OmnigentSession:
                     self._failed = True
                 raise
 
+    def resume_provider_session(self, session_id: str) -> bool:
+        """Refuse the checkpoint: Omnigent executors have no resume entry point.
+
+        Omnigent 0.10 owns its executor's conversation lifecycle internally and
+        exposes no way to attach a thread created by an earlier process, so
+        there is nothing to adopt and the turn starts a fresh conversation.
+        Reported through ``provider_session_resume=False`` as well, so callers
+        can tell before they build a session.
+        """
+        del session_id
+        return False
+
+    def cancel(self) -> None:
+        """Cancel the in-flight turn, if any, and wait for it to unwind.
+
+        Omnigent runs each turn as a task on the driver's event loop, so this
+        cancels through that loop and is safe from any other thread. It is a
+        no-op once the turn has completed or the session has begun closing,
+        which is what makes repeated calls idempotent. The cancelled turn's
+        failure still surfaces in ``run_turn``, not here.
+        """
+        if self.owns_current_loop_thread():
+            raise RuntimeError("Omnigent session cannot be cancelled from its event-loop thread")
+        with self._lifecycle:
+            if self._close_lifecycle.state is not _LifecycleState.OPEN:
+                return
+            active = self._active_turn
+        if active is not None:
+            active.cancel_and_wait()
+
     def close(self) -> None:
         """Release the executor exactly once."""
         if self.owns_current_loop_thread():

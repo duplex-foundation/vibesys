@@ -1,6 +1,12 @@
 import type {CliRenderer, KeyEvent, ScrollBoxRenderable} from '@opentui/core';
 import type {SessionController} from '../session-controller.js';
-import {chatPaneFocused, chatPaneVisible, experimentLogVisible} from '../session-model.js';
+import {
+  chatPaneFocused,
+  chatPaneVisible,
+  experimentLogVisible,
+  focusedPane,
+  todoListFocused,
+} from '../session-model.js';
 import type {ClipboardCopyResult, SelectionClipboard} from './clipboard.js';
 
 export interface KeybindingActions {
@@ -27,10 +33,12 @@ export interface KeybindingActions {
   scrollChatPane(delta: number): void;
   scrollExperimentDetail(delta: number): void;
   scrollErrorBanner(delta: number): void;
+  scrollOverlay(delta: number): void;
   clearTransientStatus(): void;
   showClipboardStatus(result: Exclude<ClipboardCopyResult, 'no-selection'>): void;
 }
 
+// biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
 export function bindKeybindings(
   renderer: CliRenderer,
   controller: SessionController,
@@ -38,6 +46,8 @@ export function bindKeybindings(
   clipboard: SelectionClipboard,
   actions: KeybindingActions,
 ): () => void {
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
+  // biome-ignore lint/complexity/noExcessiveLinesPerFunction: pre-existing; tracked: #288
   const onKey = (key: KeyEvent): void => {
     if (key.ctrl && !key.shift && key.name === 'c') {
       key.preventDefault();
@@ -69,6 +79,14 @@ export function bindKeybindings(
     }
     if (controller.state.errorBanner !== null && key.name === 'escape') {
       controller.dismissErrorBanner();
+      key.preventDefault();
+      return;
+    }
+    // The command input's own error clears the same way: Esc goes back one
+    // level (tui-conventions.md), and a stale input error is a level to leave
+    // just as much as the banner is.
+    if (controller.state.inputError !== null && key.name === 'escape') {
+      controller.clearInputError();
       key.preventDefault();
       return;
     }
@@ -104,20 +122,20 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    // The focused pane takes the scroll keys. Everything else the chat or the
-    // transcript would normally handle is left alone.
+    // The focused pane takes the scroll keys. Escape belongs to the modal/pane
+    // ladder below, so a right pane's own Escape waits until any modal chat in
+    // front of it has already closed.
     if (
       controller.state.layout.focus === 'right' &&
       controller.state.layout.right !== null &&
-      (key.name === 'pageup' || key.name === 'pagedown' || key.name === 'escape')
+      (key.name === 'pageup' || key.name === 'pagedown')
     ) {
-      if (key.name === 'escape') controller.closeOverlays();
-      else actions.scrollRightPane(key.name === 'pageup' ? -1 : 1);
+      actions.scrollRightPane(key.name === 'pageup' ? -1 : 1);
       key.preventDefault();
       return;
     }
-    // Modal state is authoritative: the theme picker, the modal chat, and any
-    // overlay must contain input before the focused docked chat runs. Otherwise
+    // Modal state is authoritative: the theme picker, command overlay, and
+    // modal chat must contain input before the focused docked chat runs. Otherwise
     // a modal opened while the docked chat has focus would leak printable keys
     // into the hidden composer, let Up/Down drive chat suggestions, and route
     // Escape to the left pane instead of closing the modal.
@@ -133,10 +151,26 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
+    if (controller.state.overlay !== null) {
+      if (key.name === 'escape') {
+        controller.live();
+        viewport.scrollTo(viewport.scrollHeight);
+      } else if (key.name === 'pageup' || key.name === 'pagedown') {
+        // Content taller than the box scrolls here rather than falling through
+        // to the transcript behind it.
+        actions.scrollOverlay(key.name === 'pageup' ? -1 : 1);
+      }
+      // The overlay is modal: everything it does not handle is swallowed so
+      // keys cannot reach the panes or the hidden command input behind it.
+      key.preventDefault();
+      return;
+    }
     if (controller.state.chatOpen) {
       if (key.name === 'escape') {
-        if (controller.state.layout.right !== null) controller.closeOverlays();
-        else actions.closeChat();
+        // The modal chat is the innermost layer: Escape closes only it,
+        // regardless of whatever pane sits behind it. A pane open behind the
+        // chat unwinds on its own Escape, once the chat is gone.
+        actions.closeChat();
         key.preventDefault();
         return;
       }
@@ -151,13 +185,15 @@ export function bindKeybindings(
       }
       return;
     }
-    if (controller.state.overlay !== null) {
-      if (key.name === 'escape') {
-        controller.live();
-        viewport.scrollTo(viewport.scrollHeight);
-      }
-      // The overlay is modal: everything it does not handle is swallowed so
-      // keys cannot reach the panes or the hidden command input behind it.
+    // With the chat closed (or never open), Escape's next layer is the
+    // visualization pane: one press folds it away on its own, leaving
+    // whatever is behind it (a hypothesis trajectory, the round view) intact.
+    if (
+      key.name === 'escape' &&
+      controller.state.layout.focus === 'right' &&
+      controller.state.layout.right !== null
+    ) {
+      controller.closePane();
       key.preventDefault();
       return;
     }
@@ -230,7 +266,9 @@ export function bindKeybindings(
       key.preventDefault();
       return;
     }
-    if (controller.state.todosExpanded) {
+    // The same predicate the todo list's chrome is drawn from, so the marker
+    // and the keys can never disagree about where Up and Down land.
+    if (todoListFocused(controller.state)) {
       if (key.name === 'up' || key.name === 'down') {
         controller.selectNextTodo(key.name === 'down' ? 1 : -1);
         key.preventDefault();
@@ -245,13 +283,18 @@ export function bindKeybindings(
     // Like Enter above, pane focus and round navigation yield to a typed
     // command: cursor keys and brackets belong to a non-empty input.
     if ((key.name === 'left' || key.name === 'right') && actions.inputIsEmpty()) {
+      // The round view is two panes, agents then transcript, so each arrow names
+      // its side and holds there at the edge. The round tabs are not a pane.
       controller.focusRound(key.name === 'left' ? 'agents' : 'transcript');
       key.preventDefault();
       return;
     }
     if (key.name === 'up' || key.name === 'down') {
       if (!actions.navigateSuggestions(key.name === 'up' ? -1 : 1)) {
-        if (controller.state.roundFocus === 'agents') {
+        // `roundFocus` can sit parked on the agents pane while a visualization
+        // hides it, so the keys follow the pane that is actually on screen:
+        // the same authority the focus border reads.
+        if (focusedPane(controller.state) === 'agents') {
           if (key.name === 'down') controller.selectNextAgent();
           else controller.selectPreviousAgent();
         } else {
@@ -264,7 +307,7 @@ export function bindKeybindings(
     }
     if (
       (key.name === 'return' || key.name === 'enter') &&
-      controller.state.roundFocus === 'transcript' &&
+      focusedPane(controller.state) === 'transcript' &&
       actions.inputIsEmpty() &&
       actions.toggleSelectedTool()
     ) {

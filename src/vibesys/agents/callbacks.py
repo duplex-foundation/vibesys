@@ -85,6 +85,9 @@ class AgentLogger(BaseCallbackHandler):
     ):
         self._streaming = False
         self._external_text_streaming = False
+        # Sticky for the logger's lifetime, which is one turn: whether any
+        # assistant text reached the assistant channel from a driver's stream.
+        self._streamed_external_text = False
         self._external_text_ends_with_newline = False
         self._log_file = log_file
         self._call_count = 0
@@ -100,6 +103,11 @@ class AgentLogger(BaseCallbackHandler):
         self._context_window_lookup = context_window_lookup or _default_context_window_lookup
         self._context_window = self._context_window_lookup(model_name)
         self._pending_tool_calls: dict[str, deque[str]] = defaultdict(deque)
+        # In-flight langchain tool runs keyed by run_id: (tool name,
+        # tool_call_id). Recorded in ``on_tool_start`` solely so
+        # ``on_tool_error`` can attribute a failure to the typed tool_call
+        # already emitted from ``on_llm_end``.
+        self._tool_runs: dict[uuid.UUID, tuple[str | None, str | None]] = {}
         self._agent_kind = agent_kind
         self._round_label = round_label
         self._invocation_id = invocation_id
@@ -237,14 +245,19 @@ class AgentLogger(BaseCallbackHandler):
     def on_tool_start(  # noqa: D102  # tracked: #288
         self,
         serialized: dict[str, Any],
-        input_str: str,
+        input_str: str,  # noqa: ARG002 - protocol parity
         *,
-        inputs: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,  # noqa: ARG002 - protocol parity
         **kwargs: Any,  # noqa: ANN401  # tracked: #288
     ) -> None:
-        pass  # tool call already logged in on_llm_end
+        # The tool call itself was already emitted from ``on_llm_end``; record
+        # the run only so ``on_tool_error`` can attribute a failure to it.
+        run_id = kwargs.get("run_id")
+        if run_id is not None:
+            self._tool_runs[run_id] = ((serialized or {}).get("name"), kwargs.get("tool_call_id"))
 
-    def on_tool_end(self, output: Any, **kwargs: Any) -> None:  # noqa: ANN401, ARG002, D102  # tracked: #288
+    def on_tool_end(self, output: Any, **kwargs: Any) -> None:  # noqa: ANN401, D102  # tracked: #288
+        self._tool_runs.pop(kwargs.get("run_id"), None)
         content = output.content if hasattr(output, "content") else str(output)
         name = getattr(output, "name", None) or "unknown"
         call_id = getattr(output, "tool_call_id", None)
@@ -254,7 +267,7 @@ class AgentLogger(BaseCallbackHandler):
             call_id=call_id if isinstance(call_id, str) and call_id else None,
         )
 
-    def on_tool_error(self, error: Any, **kwargs: Any) -> None:  # noqa: ANN401, ARG002, D102  # tracked: #288
+    def on_tool_error(self, error: Any, **kwargs: Any) -> None:  # noqa: ANN401, D102  # tracked: #288
         lines = [f"Tool error: {error!r}"]
         if isinstance(error, BaseException):
             tb = traceback.format_exception(type(error), error, error.__traceback__)
@@ -263,6 +276,33 @@ class AgentLogger(BaseCallbackHandler):
         text = "\n".join(lines)
         self._publish(text + "\n", "diagnostic")
         self._log_line(text)
+
+        # Close the typed tool_call emitted from ``on_llm_end`` so consumers
+        # don't show the tool as running forever. Attribution comes from the
+        # run recorded in ``on_tool_start``, else from the provider call id.
+        name, recorded_call_id = self._tool_runs.pop(kwargs.get("run_id"), (None, None))
+        call_id = kwargs.get("tool_call_id") or recorded_call_id
+        if name is None and call_id is not None:
+            name = next(
+                (n for n, pending in self._pending_tool_calls.items() if call_id in pending),
+                None,
+            )
+        if name is None:
+            # No typed tool_call to close; the diagnostic above is the whole
+            # record, and fabricating an orphan tool_result would mislead.
+            return
+        pending = self._pending_tool_calls.get(name)
+        if not pending or (call_id is not None and call_id not in pending):
+            # A streamed turn emits no typed tool_call (``on_llm_end`` returns
+            # before the emission), so a failure whose call was never queued
+            # has no lifecycle to close either.
+            return
+        self._emit_tool_result(
+            name,
+            f"{type(error).__name__}: {error}" if str(error) else type(error).__name__,
+            call_id=call_id,
+            is_error=True,
+        )
 
     # --- Event emission + log formatting ---
 
@@ -394,17 +434,36 @@ class AgentLogger(BaseCallbackHandler):
     #
     # The deepagents path drives ``AgentLogger`` via the langchain
     # ``BaseCallbackHandler`` hooks (``on_llm_new_token``, ``on_tool_end``, …).
-    # External-agent drivers receive events
-    # from ``vibesys._agent_cli.AgentEventHandler`` directly on this object. Both
-    # paths converge on the same private ``_emit_*`` helpers, so emitted events
-    # and log text are identical regardless of which backend is in use.
+    # External-agent drivers publish normalized ``AgentEvent``s, which
+    # ``_LoggerObserver`` calls through to on this object. Both paths converge
+    # on the same private ``_emit_*`` helpers, so emitted events and log text
+    # are identical regardless of which backend is in use.
 
-    def on_thinking(self, text: str) -> None:  # noqa: D102  # tracked: #288
+    def _publish_channel(self, text: str, channel: AgentOutputChannel) -> None:
+        """Publish ``text`` verbatim on ``channel`` and mirror it to the log."""
         if not text:
             return
         status = self._status()
-        self._publish(text, "analysis", status=status)
+        self._publish(text, channel, status=status)
         self._log_line(f"{format_status_prefix(status)}{text}")
+
+    def on_thinking(self, text: str) -> None:
+        """Publish agent reasoning on the analysis channel.
+
+        Every driver marks its own plumbing with
+        ``payload={"channel": "diagnostic"}``, which the observer routes to
+        :meth:`on_diagnostic`, so nothing that reaches here is inspected.
+        """
+        self._publish_channel(text, "analysis")
+
+    def on_diagnostic(self, text: str) -> None:
+        """Publish driver plumbing on the diagnostic channel.
+
+        The caller has already classified ``text`` as plumbing rather than
+        agent reasoning, so nothing here inspects it. The text is published
+        verbatim; only the channel differs from :meth:`on_thinking`.
+        """
+        self._publish_channel(text, "diagnostic")
 
     def on_tool_call(self, tool: str, args: dict[str, Any] | str | None = None) -> None:  # noqa: D102  # tracked: #288
         if isinstance(args, dict):
@@ -437,10 +496,10 @@ class AgentLogger(BaseCallbackHandler):
 
         Mirrors the deepagents path (:meth:`on_llm_end`): we overwrite, not
         accumulate, because the prefix reflects *current context window
-        pressure*, not cumulative spend.  Claude Code's stream-json already
-        folds ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
-        back into ``input_tokens``, matching what ``langchain-anthropic``
-        does for the deepagents path.
+        pressure*, not cumulative spend.  ``input_tokens`` includes cached
+        tokens on every provider — the CLI drivers fold the cache counts in
+        before reporting, matching what ``langchain-anthropic`` does for the
+        deepagents path.
 
         A zero / missing ``input_tokens`` field is treated as "no update"
         so a stale usage block can't clobber the last real reading.
@@ -453,6 +512,17 @@ class AgentLogger(BaseCallbackHandler):
             self._input_tokens = input_tokens
             self._publish_usage()
 
+    def streamed_external_text_this_turn(self) -> bool:
+        """Whether an external driver already streamed this turn's answer.
+
+        One logger serves exactly one invocation (``AgentClient._invoke_turn``
+        builds it per turn), so this reads as "during this turn". A caller that
+        also holds the turn's final text asks this before printing it, so an
+        answer that already reached the assistant channel as it arrived is not
+        rendered a second time at the end.
+        """
+        return self._streamed_external_text
+
     def log_text(self, text: str) -> None:
         """Emit one exact assistant-text delta from an external driver."""
         if not text:
@@ -463,6 +533,7 @@ class AgentLogger(BaseCallbackHandler):
             self._log_write(format_status_prefix(status))
         self._log_write(text)
         self._external_text_streaming = True
+        self._streamed_external_text = True
         self._external_text_ends_with_newline = text.endswith("\n")
 
     def end_text(self) -> None:

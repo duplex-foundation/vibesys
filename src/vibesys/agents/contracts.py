@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeVar
+
+from pydantic import BaseModel
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
     from datetime import timedelta
     from pathlib import Path
+    from typing import TextIO
 
-    from pydantic import BaseModel
+    from langchain_core.tools import BaseTool
 
+    from vibesys.agents.progress import AgentProgress
+    from vibesys.agents.session_key import AgentSessionKey
     from vs_sandbox import HostResource, ProjectPathPolicy
+
+T = TypeVar("T", bound=BaseModel)
 
 
 class SessionDisposition(StrEnum):
@@ -70,6 +78,10 @@ class AgentCapabilities:
     container_execution: bool = False
     timeouts: bool = False
     session_reuse: bool = True
+    # Whether a session can adopt a provider conversation ID produced by an
+    # earlier process, so a resumed run continues the same conversation instead
+    # of replaying it. ``session_reuse`` only promises reuse within one process.
+    provider_session_resume: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +98,15 @@ class AgentUsage:
 
 @dataclass(frozen=True, slots=True)
 class AgentEvent:
-    """One normalized event emitted while an agent turn is running."""
+    """One normalized event emitted while an agent turn is running.
+
+    A ``THINKING`` event carrying ``payload={"channel": "diagnostic"}`` is
+    driver plumbing (a provider heartbeat, a stderr line, a thread or turn
+    marker), not the agent's reasoning. Consumers route it to the diagnostic
+    channel so a transcript never presents plumbing as chain of thought. A
+    driver that has no separate diagnostic stream marks such events itself;
+    every other ``THINKING`` event is agent reasoning.
+    """
 
     kind: AgentEventKind
     text: str | None = None
@@ -115,6 +135,19 @@ class AgentSessionSpec:
     skills: tuple[Path, ...] = ()
     environment: tuple[tuple[str, str], ...] = ()
     reasoning_effort: str | None = None
+
+
+def session_spec_fingerprint(spec: AgentSessionSpec) -> str:
+    """Return a stable digest of the whole session spec.
+
+    ``AgentClient`` drops a cached session as soon as its spec stops matching
+    the requested one. A resumed process has no earlier spec object to compare
+    against, so it compares this digest instead: same inputs, same rule, so any
+    configuration change that would evict a live session also refuses a
+    checkpointed provider conversation. The digest is content-derived rather
+    than a Python ``hash``, which is not stable across processes.
+    """
+    return hashlib.sha256(repr(spec).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +183,25 @@ class AgentSession(Protocol):
         """Add one turn to the conversation and return its raw result."""
         ...
 
+    def resume_provider_session(self, session_id: str) -> bool:
+        """Continue ``session_id`` on this session's next turn.
+
+        Return whether the ID was actually adopted. A driver returns ``False``
+        when its provider cannot resume, or when the session already holds a
+        live conversation whose history is newer than the caller's checkpoint.
+        Callers must not assume adoption: the return value, not the call, is
+        what says the next turn resumes.
+
+        Implementations that report ``False`` must leave the session usable and
+        unchanged. Drivers whose capabilities set ``provider_session_resume``
+        to ``False`` always return ``False``.
+        """
+        ...
+
+    def cancel(self) -> None:
+        """Stop an in-flight turn, if any. Idempotent. Safe to call from another thread."""
+        ...
+
     def close(self) -> None:
         """Release session resources. Implementations must be idempotent."""
         ...
@@ -169,4 +221,99 @@ class AgentDriver(Protocol):
 
     def close(self) -> None:
         """Release driver resources. Implementations must be idempotent."""
+        ...
+
+
+class AgentClientProtocol(Protocol):
+    """The agent-service surface the run context and every loop depend on.
+
+    Each backend supplies one implementation: the CLI
+    :class:`~vibesys.agents.client.AgentClient`, the deterministic stub, the
+    deepagents runner, and the plain loop's tracker wrapper. Attribution
+    (``backend_name``, ``driver_name``, ``provider``, ``model_for_kind``) is
+    part of this contract because the loop stamps it onto every round record,
+    so a consumer never has to probe an implementation for it.
+    """
+
+    @property
+    def backend_name(self) -> str:
+        """Return the configured agent backend (``"cli"``, ``"stub"``, ...)."""
+        ...
+
+    @property
+    def capabilities(self) -> AgentCapabilities:
+        """Return the features this client's execution system can enforce."""
+        ...
+
+    @property
+    def driver_name(self) -> str | None:
+        """Return the stable configured driver name, or ``None`` when unnamed."""
+        ...
+
+    @property
+    def provider(self) -> str | None:
+        """Return the provider that runs this client's turns."""
+        ...
+
+    def model_for_kind(self, kind: str) -> str | None:
+        """Return the effective model for ``kind``, honoring role overrides."""
+        ...
+
+    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Name the provider conversation the next turn on ``session_key`` continues.
+
+        ``None`` means the next turn starts from no history at all.
+        """
+        ...
+
+    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Name the provider conversation ``session_key``'s last turn ran in."""
+        ...
+
+    def invoke(  # noqa: PLR0913
+        self,
+        *,
+        kind: str,
+        workspace: Path,
+        system_prompt: str,
+        user_prompt: str,
+        response_cls: type[T],
+        fallback_factory: Callable[[], T],
+        round_label: str,
+        env: dict[str, str] | None = None,
+        invocation_id: str | None = None,
+        progress: AgentProgress | None = None,
+        mcp_servers: list[MCPServerSpec] | None = None,
+        tools: list[BaseTool] | None = None,
+        reuse_session: bool | None = None,
+        session_key: AgentSessionKey | None = None,
+    ) -> T:
+        """Run one turn and parse its structured response."""
+        ...
+
+    def invoke_text(  # noqa: PLR0913
+        self,
+        *,
+        kind: str,
+        workspace: Path,
+        system_prompt: str,
+        user_prompt: str,
+        round_label: str,
+        env: dict[str, str] | None = None,
+        invocation_id: str | None = None,
+        progress: AgentProgress | None = None,
+        mcp_servers: list[MCPServerSpec] | None = None,
+        tools: list[BaseTool] | None = None,
+        reuse_session: bool | None = None,
+        session_key: AgentSessionKey | None = None,
+    ) -> str:
+        """Run one conversational turn without a structured-output requirement."""
+        ...
+
+    def set_log_file(self, stream: TextIO | None) -> None:
+        """Direct subsequent application logs to ``stream``."""
+        ...
+
+    def close(self) -> None:
+        """Release client resources. Implementations must be idempotent."""
         ...

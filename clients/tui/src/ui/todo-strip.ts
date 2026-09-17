@@ -2,7 +2,9 @@ import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
 import type {TodoItem} from '@vibesys/core-state';
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
-import {visibleTodos} from '../session-model.js';
+import {focusedPane, visibleTodos} from '../session-model.js';
+import {paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
+import {displayWidth, truncateToWidth} from './text-width.js';
 import type {Theme} from './theme.js';
 
 const STATUS_MARKER: Record<string, string> = {
@@ -28,6 +30,25 @@ const TODO_MIN_WIDTH = 48;
  */
 export function todoStripWidth(agentPaneWidth: number, terminalWidth: number): number {
   return Math.min(terminalWidth, Math.max(agentPaneWidth, TODO_MIN_WIDTH));
+}
+
+/**
+ * The rows the strip is about to occupy for a state, derived from the state
+ * rather than read back from the laid-out box. `output.height` reflects the last
+ * committed layout, so it lags one paint behind a render that just changed it;
+ * a sibling sized in the same paint (the agents pane) needs the height the strip
+ * is taking now, not the one it took last frame. `render` sets the box from this
+ * function, so the two cannot disagree: no visible todos means no strip, a
+ * collapsed strip is one summary row, and an expanded strip is its capped items
+ * plus an optional overflow row inside a border.
+ */
+export function todoStripHeight(state: SessionState): number {
+  const todos = visibleTodos(state);
+  if (todos.length === 0) return 0;
+  if (!state.todosExpanded) return 1;
+  const shown = Math.min(todos.length, MAX_EXPANDED_ITEMS);
+  const hidden = todos.length - shown;
+  return shown + (hidden > 0 ? 1 : 0) + 2;
 }
 
 export function todoMarker(status: string): string {
@@ -59,9 +80,15 @@ export function todoItemLine(todo: TodoItem, maxWidth: number): string {
   return truncate(`${todoMarker(todo.status)} ${todo.content}`, maxWidth);
 }
 
+/**
+ * At most `width` cells, ellipsized. Measured in cells, not code units: a CJK
+ * todo that fits by `String.length` can still be twice as wide on screen, and
+ * slicing by code units can land inside a wide character.
+ */
 function truncate(line: string, maxWidth: number): string {
   const width = Math.max(8, maxWidth);
-  return line.length <= width ? line : `${line.slice(0, width - 1)}…`;
+  if (displayWidth(line) <= width) return line;
+  return `${truncateToWidth(line, width - 1)}…`;
 }
 
 /**
@@ -75,6 +102,7 @@ export class TodoStripView {
   #theme: Theme;
   #renderedTodos: TodoItem[] | null = null;
   #renderedExpanded = false;
+  #renderedFocused = false;
   #renderedSelection: number | null = null;
   #renderedWidth: number | null = null;
 
@@ -113,9 +141,16 @@ export class TodoStripView {
     // The todos belong to the agent whose transcript is on the left, so the box
     // stops where that pane stops rather than running under the right pane.
     this.output.width = width ?? '100%';
+    // One source for the strip's height: siblings sized in this same paint read
+    // it from `todoStripHeight` too, so the box cannot end up a row off them.
+    this.output.height = todoStripHeight(state);
+    // The open list owns the arrow keys, so it is a pane like any other and
+    // asks the same authority whether it is the one holding them.
+    const focused = focusedPane(state) === 'todos';
     if (
       todos === this.#renderedTodos &&
       state.todosExpanded === this.#renderedExpanded &&
+      focused === this.#renderedFocused &&
       state.selectedTodoIndex === this.#renderedSelection &&
       width === this.#renderedWidth
     ) {
@@ -123,15 +158,15 @@ export class TodoStripView {
     }
     this.#renderedTodos = todos;
     this.#renderedExpanded = state.todosExpanded;
+    this.#renderedFocused = focused;
     this.#renderedSelection = state.selectedTodoIndex;
     this.#renderedWidth = width;
     this.#clear();
-    if (state.todosExpanded) this.#renderExpanded(todos, state.selectedTodoIndex);
+    if (state.todosExpanded) this.#renderExpanded(todos, state.selectedTodoIndex, focused);
     else this.#renderCollapsed(todos);
   }
 
   #renderCollapsed(todos: TodoItem[]): void {
-    this.output.height = 1;
     this.output.add(
       new TextRenderable(this.renderer, {
         content: todoSummaryLine(todos, this.#contentWidth(false)),
@@ -142,11 +177,10 @@ export class TodoStripView {
     );
   }
 
-  #renderExpanded(todos: TodoItem[], selected: number | null): void {
+  #renderExpanded(todos: TodoItem[], selected: number | null, focused: boolean): void {
     const shown = todos.slice(0, MAX_EXPANDED_ITEMS);
     const hidden = todos.length - shown.length;
     const height = shown.length + (hidden > 0 ? 1 : 0) + 2;
-    this.output.height = height;
     // The border belongs to a box that only exists while the list is open.
     // Toggling a border on a live box leaves a frame the layout has no rows
     // for, and the list then draws over it.
@@ -158,11 +192,9 @@ export class TodoStripView {
       paddingLeft: 1,
       paddingRight: 1,
       border: true,
-      borderStyle: 'rounded',
-      // The open list owns the arrow keys, so it carries the focus border: the
-      // operator can see where the keys are going without being told.
-      borderColor: this.#theme.borderFocus,
-      title: ` ${todoTitle(todos)} `,
+      borderStyle: paneBorderStyle(focused),
+      borderColor: paneBorderColor(this.#theme, focused),
+      title: paneTitle(todoTitle(todos), focused),
     });
     this.output.add(list);
     for (const [index, todo] of shown.entries()) {
