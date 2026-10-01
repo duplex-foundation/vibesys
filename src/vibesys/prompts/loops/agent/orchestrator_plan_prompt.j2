@@ -28,6 +28,7 @@ nondominated row unless it exposes a declared-contract violation.
 
 Choose the frontier parent whose gap matches the mechanism. Set
 `revert_to_round` when needed; the framework restores code and preserves memory.
+Round 0 is the seed tree the run started from: `revert_to_round` of 0 restores it.
 Reuse trustworthy retained controls; remeasure only for concrete drift.
 
 Profiler findings and suggestions are advisory, not prerequisites. Missing or

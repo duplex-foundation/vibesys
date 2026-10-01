@@ -45,6 +45,7 @@ from vibesys.loops.agent.hypotheses import (
     record_metric_value,
     resolve_hypothesis_outcome,
     scalar_candidate_retained,
+    seed_commit,
     start_hypothesis,
     trusted_perf_provenance,
     update_active_hypothesis,
@@ -2683,15 +2684,25 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
 
                 # --- Optional rollback ---
                 if plan.revert_to_round is not None and not active_hypothesis.revert_applied:
-                    target = next(
-                        (r for r in records if r.round_number == plan.revert_to_round),
-                        None,
-                    )
-                    if target and target.commit:
-                        rollback_commit, failed_child_round = round_history.resolve_rollback_commit(
-                            target, _FAILED_HYPOTHESIS_OUTCOMES
+                    rollback_commit: str | None = None
+                    failed_child_round: int | None = None
+                    if plan.revert_to_round == 0:
+                        # Round 0 is the seed tree, which no round record
+                        # describes: it is what the first hypothesis started from.
+                        rollback_commit = seed_commit(agent_run_state)
+                    else:
+                        target = next(
+                            (r for r in records if r.round_number == plan.revert_to_round),
+                            None,
                         )
-                        assert rollback_commit is not None  # noqa: S101  # tracked: #288
+                        if target and target.commit:
+                            rollback_commit, failed_child_round = (
+                                round_history.resolve_rollback_commit(
+                                    target, _FAILED_HYPOTHESIS_OUTCOMES
+                                )
+                            )
+                            assert rollback_commit is not None  # noqa: S101  # tracked: #288
+                    if rollback_commit is not None:
                         # Restore the tree without moving HEAD so subsequent
                         # commits land on the current branch as new commits
                         # after the reverted state.

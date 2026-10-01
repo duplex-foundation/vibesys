@@ -17,6 +17,7 @@ from vibesys.loops.agent.hypotheses import (
     reproject_run_evidence,
     resolve_hypothesis_outcome,
     scalar_candidate_retained,
+    seed_commit,
     start_hypothesis,
     update_active_hypothesis,
 )
@@ -919,3 +920,32 @@ def test_retention_sees_the_same_history_the_baseline_does() -> None:
     assert resolved.measurement.baseline_value == 100.0
     # ...and so must retention: 90 does not advance a best of 100.
     assert resolved.candidate_retained is False
+
+
+def test_a_hypothesis_may_build_on_round_zero_the_seed_tree() -> None:
+    seeded = start_hypothesis(
+        AgentRunState(), _plan("H-1"), started_round=1, parent_round=0, parent_commit="seed"
+    )
+    assert seeded.hypotheses[0].parent_round == 0
+    with pytest.raises(ValidationError):
+        start_hypothesis(AgentRunState(), _plan("H-2"), started_round=1, parent_round=-1)
+
+
+def test_seed_commit_is_what_the_first_hypothesis_started_from() -> None:
+    assert seed_commit(AgentRunState()) is None
+    first = start_hypothesis(AgentRunState(), _plan("H-1"), started_round=1, parent_commit="c0")
+    completed = append_round(
+        first, _round(1, 100.0, hypothesis_id="H-1", outcome="falsified"), keep_active=False
+    )
+    update = HypothesisStrategyUpdate(
+        hypothesis_id="H-1", disposition="abandoned", reason="Lost a quarter of the throughput."
+    )
+    # The next plan goes back to the seed: round 0, the commit H-1 started from.
+    later = start_hypothesis(
+        completed,
+        _plan("H-2", updates=[update]),
+        started_round=2,
+        parent_round=0,
+        parent_commit="c0",
+    )
+    assert seed_commit(later) == "c0"

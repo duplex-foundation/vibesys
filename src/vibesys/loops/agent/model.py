@@ -76,7 +76,9 @@ class Hypothesis(BaseModel):
     hypothesis_id: str = Field(min_length=1)
     plan: OrchestratorPlan
     started_round: Annotated[int, Field(gt=0)]
-    parent_round: Annotated[int, Field(gt=0)] | None = None
+    # Round 0 is the seed tree the run started from; a plan reverts to it when
+    # every round so far was abandoned.
+    parent_round: Annotated[int, Field(ge=0)] | None = None
     parent_commit: str | None = None
     rounds: list[RoundRecord] = Field(default_factory=list)
 

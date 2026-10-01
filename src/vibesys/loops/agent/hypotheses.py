@@ -221,6 +221,12 @@ def measurement_delta_reason(hypothesis: Hypothesis) -> PerfDeltaReason | None:
     return None
 
 
+def seed_commit(state: AgentRunState) -> str | None:
+    """The commit of round 0, the seed tree: what the first hypothesis started from."""
+    first = min(state.hypotheses, key=lambda item: item.started_round, default=None)
+    return first.parent_commit if first is not None else None
+
+
 def start_hypothesis(
     state: AgentRunState,
     plan: OrchestratorPlan,
