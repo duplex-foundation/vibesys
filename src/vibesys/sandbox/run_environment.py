@@ -137,6 +137,7 @@ class AgentPaths:
     objective: str = "OBJECTIVE.md"
     accuracy_command: str | None = None
     benchmark_command: str | None = None
+    capture_command: str | None = None
     profiler_support: str | None = None
 
 
@@ -190,6 +191,7 @@ class RunEnvironmentRequest:  # noqa: D101  # tracked: #288
     objective_document: Path | None = None
     accuracy_command: str | None = None
     benchmark_command: str | None = None
+    capture_command: str | None = None
     benchmark_output_argument: str | None = None
     evaluator_package_root: Path | None = None
     evaluator_tools_root: Path | None = None
@@ -367,6 +369,7 @@ class LocalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
                     ),
                     accuracy_command=_environment_command(request, request.accuracy_command),
                     benchmark_command=_environment_command(request, request.benchmark_command),
+                    capture_command=_environment_command(request, request.capture_command),
                     profiler_support=request.profiler_support_path,
                 ),
             ),
@@ -738,6 +741,7 @@ class SkyPilotEnvironment(DockerEnvironment):
                     ),
                     accuracy_command=(f"{prefix} accuracy" if "accuracy" in commands else None),
                     benchmark_command=(f"{prefix} benchmark" if "benchmark" in commands else None),
+                    capture_command=None,
                     profiler_support=None,
                 ),
                 prompt_notes=render_template(
@@ -948,6 +952,16 @@ class ModalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
                         _environment_command(
                             request,
                             request.benchmark_command,
+                            isolated=True,
+                            evaluator_package_root=".vibesys-evaluator-package",
+                            evaluator_tools_root=_REMOTE_EVALUATOR_TOOLS_ROOT,
+                        ),
+                    ),
+                    capture_command=_prefix_command(
+                        evaluator_prefix,
+                        _environment_command(
+                            request,
+                            request.capture_command,
                             isolated=True,
                             evaluator_package_root=".vibesys-evaluator-package",
                             evaluator_tools_root=_REMOTE_EVALUATOR_TOOLS_ROOT,
@@ -1283,6 +1297,13 @@ def _isolated_paths(
         benchmark_command=_environment_command(
             request,
             request.benchmark_command,
+            isolated=True,
+            evaluator_tools_root=evaluator_tools_root,
+            agent_path=sandbox.agent_path,
+        ),
+        capture_command=_environment_command(
+            request,
+            request.capture_command,
             isolated=True,
             evaluator_tools_root=evaluator_tools_root,
             agent_path=sandbox.agent_path,

@@ -1,3 +1,4 @@
+{# vs-prompts:unused: capture_command - OTel reads the traces the benchmark command itself emits; there is no separate capture to launch. #}
 You are the OpenTelemetry profiler for a microservice benchmark.
 {# vs-prompts:unused: profile_execution - OTEL is microservices-only, and resolve_profiler_kind forces microservices' AUTO path to NONE (src/vibesys/profilers.py); the example microservice targets run on cpu_backend, which only supports SandboxKind.LOCAL and SandboxKind.DOCKER, so profile_execution can never be "remote" here. #}
 {# vs-prompts:unused: modality - no _modality/*/profiler.j2 partial applies to the microservices domain; the modality concept is GPU/ML-specific. #}

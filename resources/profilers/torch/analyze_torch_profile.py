@@ -13,10 +13,16 @@ Usage:
         --model-dir /workspace --output prof.json [--num-iters 50] \\
         [--prompt "The capital of France is"] [--max-tokens 32]
 
-    # Or capture against a running HTTP server with an injected profile
-    # endpoint (see README for the expected /admin/... contract):
+    # Or capture against a running vLLM server: its /start_profile and
+    # /stop_profile endpoints bracket a burst of requests, and the trace the
+    # server writes under VLLM_TORCH_PROFILER_DIR is converted:
     python analyze_torch_profile.py capture-server \\
-        --url http://localhost:8000 --output prof.json [--requests 10]
+        --url http://localhost:8000 --model <served model name> \\
+        --trace-dir <VLLM_TORCH_PROFILER_DIR> --output prof.json [--requests 10]
+
+    # Or convert a trace the server already wrote (a torch.profiler chrome
+    # trace, .json or .json.gz) into this toolkit's schema:
+    python analyze_torch_profile.py convert <trace> --output prof.json
 
     # Analyze the saved profile:
     python analyze_torch_profile.py kernels prof.json [--top 15]
@@ -178,24 +184,38 @@ def cmd_capture(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Capture: against a running server (needs /admin/profile endpoints)
+# Capture: against a running vLLM server (/start_profile, /stop_profile)
 # ---------------------------------------------------------------------------
+
+# vLLM's profiler endpoints, enabled when the server runs with the environment
+# variable VLLM_TORCH_PROFILER_DIR: start records every rank, stop writes one
+# chrome trace per rank into that directory.
+VLLM_START_PROFILE = "/start_profile"
+VLLM_STOP_PROFILE = "/stop_profile"
+VLLM_TRACE_SUFFIXES = (".pt.trace.json.gz", ".pt.trace.json", ".json.gz", ".json")
+
+
+def newest_trace(trace_dir: Path) -> Path:
+    """The newest chrome trace under *trace_dir*, which vLLM's profiler fills."""
+    traces = [
+        p for p in trace_dir.rglob("*") if p.is_file() and p.name.endswith(VLLM_TRACE_SUFFIXES)
+    ]
+    if not traces:
+        raise FileNotFoundError(f"no torch profiler trace under {trace_dir}")  # noqa: TRY003
+    return max(traces, key=lambda p: p.stat().st_mtime)
 
 
 def cmd_capture_server(args: argparse.Namespace) -> None:
-    """Capture a profile from a running server.
+    """Capture a profile from a running vLLM server.
 
-    Expects the server to expose two admin endpoints:
-      POST /admin/profile/start -> {"ok": true}
-      POST /admin/profile/stop  -> {"events": [...], "total_cuda_time_us": ..., ...}
-
-    The agent must add these endpoints to main.py if they want
-    server-path profiling (captures HTTP/batching overhead).  When
-    absent, use ``capture`` (in-process) instead.
+    Brackets a burst of completions with vLLM's ``/start_profile`` and
+    ``/stop_profile`` endpoints (the server must run with
+    ``VLLM_TORCH_PROFILER_DIR`` set, which is where it writes the trace), then
+    converts the newest trace under ``--trace-dir`` into this toolkit's schema.
     """
     import urllib.request  # noqa: PLC0415  # tracked: #288
 
-    def _post(path: str, body: dict | None = None) -> dict:
+    def _post(path: str, body: dict | None = None) -> bytes:
         data = json.dumps(body or {}).encode("utf-8")
         req = urllib.request.Request(  # noqa: S310  # tracked: #288
             args.url.rstrip("/") + path,
@@ -204,39 +224,116 @@ def cmd_capture_server(args: argparse.Namespace) -> None:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=args.timeout) as resp:  # noqa: S310  # tracked: #288
-            return json.loads(resp.read())
+            return resp.read()
 
-    print(f"[capture-server] POST {args.url}/admin/profile/start", file=sys.stderr)  # noqa: T201  # tracked: #288
-    _post("/admin/profile/start")
-
+    print(f"[capture-server] POST {args.url}{VLLM_START_PROFILE}", file=sys.stderr)  # noqa: T201  # tracked: #288
+    _post(VLLM_START_PROFILE)
     print(  # noqa: T201  # tracked: #288
         f"[capture-server] sending {args.requests} requests (max_tokens={args.max_tokens})...",
         file=sys.stderr,
     )
-    for _i in range(args.requests):
-        _post(
-            "/v1/completions",
+    try:
+        for _i in range(args.requests):
+            _post(
+                "/v1/completions",
+                {
+                    "model": args.model,
+                    "prompt": args.prompt,
+                    "max_tokens": args.max_tokens,
+                    "temperature": 0,
+                },
+            )
+    finally:
+        print(f"[capture-server] POST {args.url}{VLLM_STOP_PROFILE}", file=sys.stderr)  # noqa: T201  # tracked: #288
+        _post(VLLM_STOP_PROFILE)
+
+    trace = newest_trace(Path(args.trace_dir))
+    result = convert_chrome_trace(trace)
+    result["num_iters"] = args.requests
+    Path(args.output).write_text(json.dumps(result, indent=2))
+    print(f"[capture-server] converted {trace} -> {args.output}", file=sys.stderr)  # noqa: T201  # tracked: #288
+
+
+# ---------------------------------------------------------------------------
+# Convert: a torch.profiler chrome trace into this toolkit's schema
+# ---------------------------------------------------------------------------
+
+# Chrome-trace event categories, as torch.profiler's exporter names them.
+_TRACE_GPU_CATEGORIES = {"kernel"}
+_TRACE_MEMORY_CATEGORIES = {"gpu_memcpy", "gpu_memset"}
+_TRACE_OPERATOR_CATEGORIES = {"cpu_op"}
+_TRACE_CPU_CATEGORIES = {"cuda_runtime", "cuda_driver", "user_annotation", "gpu_user_annotation"}
+
+
+def convert_chrome_trace(path: Path) -> dict:
+    """Aggregate a chrome trace's complete events by name into the summary schema.
+
+    A chrome trace carries one event per call, not per-name averages, so the
+    events are summed by name and category. It carries no self times either, so
+    ``self_*`` equal the totals: the ``kernels`` and ``operators`` rankings stay
+    right, the CPU/GPU overlap analysis is approximate.
+    """
+    import gzip  # noqa: PLC0415  # tracked: #288
+
+    opener = gzip.open if path.name.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as fh:
+        data = json.load(fh)
+    raw_events = data["traceEvents"] if isinstance(data, dict) else data
+    totals: dict[tuple[str, str], dict] = {}
+    for event in raw_events:
+        if event.get("ph") != "X":
+            continue
+        cat = str(event.get("cat", "")).lower()
+        if cat in _TRACE_GPU_CATEGORIES:
+            category = "kernel"
+        elif cat in _TRACE_MEMORY_CATEGORIES:
+            category = "memory"
+        elif cat in _TRACE_OPERATOR_CATEGORIES:
+            category = "operator"
+        elif cat in _TRACE_CPU_CATEGORIES:
+            category = "cpu"
+        else:
+            continue
+        name = str(event.get("name", ""))
+        duration = float(event.get("dur", 0.0) or 0.0)
+        entry = totals.setdefault(
+            (name, category),
             {
-                "prompt": args.prompt,
-                "max_tokens": args.max_tokens,
-                "temperature": 0,
+                "name": name,
+                "category": category,
+                "cpu_time_us": 0.0,
+                "cuda_time_us": 0.0,
+                "self_cpu_time_us": 0.0,
+                "self_cuda_time_us": 0.0,
+                "count": 0,
             },
         )
+        side = "cuda" if category in ("kernel", "memory") else "cpu"
+        entry[f"{side}_time_us"] += duration
+        entry[f"self_{side}_time_us"] += duration
+        entry["count"] += 1
+    events = sorted(
+        totals.values(), key=lambda e: e["cuda_time_us"] + e["cpu_time_us"], reverse=True
+    )
+    return {
+        "version": 1,
+        "captured_at": datetime.now(UTC).isoformat(),
+        "mode": "server",
+        "device": "cuda",
+        "source": str(path),
+        "num_iters": 1,
+        "total_cuda_time_us": sum(e["self_cuda_time_us"] for e in events),
+        "total_cpu_time_us": sum(e["self_cpu_time_us"] for e in events),
+        "num_events": len(events),
+        "events": events,
+    }
 
-    print(f"[capture-server] POST {args.url}/admin/profile/stop", file=sys.stderr)  # noqa: T201  # tracked: #288
-    result = _post("/admin/profile/stop")
 
-    if "events" not in result:
-        raise RuntimeError(  # noqa: TRY003  # tracked: #288
-            "/admin/profile/stop response missing 'events' key — "
-            "is the server implementing the expected contract?"
-        )
-
-    result.setdefault("captured_at", datetime.now(UTC).isoformat())
-    result.setdefault("mode", "server")
-    result.setdefault("num_iters", args.requests)
+def cmd_convert(args: argparse.Namespace) -> None:
+    """Convert a chrome trace file into the summary schema the tools read."""
+    result = convert_chrome_trace(Path(args.trace))
     Path(args.output).write_text(json.dumps(result, indent=2))
-    print(f"[capture-server] wrote {args.output}", file=sys.stderr)  # noqa: T201  # tracked: #288
+    print(f"[convert] wrote {args.output} ({result['num_events']} events)", file=sys.stderr)  # noqa: T201  # tracked: #288
 
 
 # ---------------------------------------------------------------------------
@@ -474,14 +571,27 @@ def main() -> None:  # noqa: D103  # tracked: #288
     cap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
 
     srv = sub.add_parser(
-        "capture-server", help="Capture a profile against a server with /admin/profile endpoints"
+        "capture-server",
+        help="Capture a profile against a running vLLM server (/start_profile, /stop_profile)",
     )
     srv.add_argument("--url", required=True, help="Server base URL, e.g. http://localhost:8000")
+    srv.add_argument("--model", required=True, help="The served model name requests are sent under")
+    srv.add_argument(
+        "--trace-dir",
+        required=True,
+        help="Where the server writes its traces: its VLLM_TORCH_PROFILER_DIR",
+    )
     srv.add_argument("--output", required=True)
     srv.add_argument("--requests", type=int, default=10)
     srv.add_argument("--prompt", default="The capital of France is")
     srv.add_argument("--max-tokens", type=int, default=32)
     srv.add_argument("--timeout", type=float, default=300.0)
+
+    conv = sub.add_parser(
+        "convert", help="Convert a torch.profiler chrome trace (.json or .json.gz) into prof.json"
+    )
+    conv.add_argument("trace", help="Path to the chrome trace")
+    conv.add_argument("--output", required=True, help="Output prof.json path")
 
     for name, help_text in [
         ("tables", "List what's available in the profile"),
@@ -504,6 +614,7 @@ def main() -> None:  # noqa: D103  # tracked: #288
     {
         "capture": cmd_capture,
         "capture-server": cmd_capture_server,
+        "convert": cmd_convert,
         "tables": cmd_tables,
         "kernels": cmd_kernels,
         "operators": cmd_operators,

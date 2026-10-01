@@ -217,6 +217,33 @@ class BenchmarkCommand(InputCommand):
         return self
 
 
+class ProfilerInput(BaseModel):
+    """The profiler role's capture command, declared by an input bundle.
+
+    ``capture_command`` serves the candidate as it is, drives a short
+    representative load under the selected profiler and stops everything, so a
+    profiler turn runs it as is instead of discovering a launcher. Same argv
+    rule as the evaluator commands: the executable is relative to the project.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    capture_command: tuple[str, ...]
+
+    @field_validator("capture_command")
+    @classmethod
+    def _non_empty_command(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value:
+            raise ValueError("capture_command must contain at least one argv element")  # noqa: TRY003
+        if any(not part for part in value):
+            raise ValueError("capture_command elements must be non-empty strings")  # noqa: TRY003
+        return value
+
+    def display(self) -> str:
+        """Render the argv the profiler runs."""
+        return " ".join(shlex.quote(part) for part in self.capture_command)
+
+
 class AgentInput(BaseModel):
     """Agent-loop metadata declared by an input bundle."""
 
@@ -264,6 +291,7 @@ class InputManifest(BaseModel):
     agent: AgentInput
     accuracy: InputCommand
     benchmark: BenchmarkCommand
+    profiler: ProfilerInput | None = None
     resources: RunResourceRequest | None = None
     environment: EnvironmentInput | None = None
     workspace: WorkspaceInput | None = None
@@ -375,6 +403,15 @@ def render_input_manifest(manifest: InputManifest) -> str:  # noqa: C901, PLR091
             ]
         )
 
+    if manifest.profiler is not None:
+        lines.extend(
+            [
+                "",
+                "[profiler]",
+                f"capture_command = {toml_array(manifest.profiler.capture_command)}",
+            ]
+        )
+
     if manifest.workspace is not None:
         for source in manifest.workspace.sources:
             lines.extend(
@@ -430,6 +467,7 @@ class InputBundle(BaseModel):
     resolved_accuracy_command: tuple[str, ...]
     resolved_benchmark_command: tuple[str, ...]
     manifest: InputManifest
+    resolved_capture_command: tuple[str, ...] | None = None
 
     @property
     def objective(self) -> str:  # noqa: D102  # tracked: #288
@@ -454,6 +492,13 @@ class InputBundle(BaseModel):
     @property
     def benchmark_command_display(self) -> str:  # noqa: D102  # tracked: #288
         return self.manifest.benchmark.display(resolved_command=self.resolved_benchmark_command)
+
+    @property
+    def capture_command_display(self) -> str | None:
+        """The profiler's capture command as one shell line, or None when undeclared."""
+        if self.manifest.profiler is None:
+            return None
+        return self.manifest.profiler.display()
 
     @property
     def benchmark_result(self) -> BenchmarkResult | None:  # noqa: D102  # tracked: #288
@@ -589,24 +634,12 @@ def _load_input_bundle(  # noqa: C901, PLR0912, PLR0915  # tracked: #288
             continue
         command = command_spec.command
         assert command is not None  # noqa: S101
-        executable = Path(command[0])
-        if executable.is_absolute():
-            raise ValueError(  # noqa: TRY003  # tracked: #288
-                f"{label} executable must be relative to the project: {command[0]}"
-            )
-        if "/" not in command[0]:
-            resolved_commands.append(command)
-            continue
-        resolved = (root / executable).resolve()
-        try:
-            resolved.relative_to(root)
-        except ValueError as exc:
-            raise ValueError(f"{label} executable escapes the project: {command[0]}") from exc  # noqa: TRY003  # tracked: #288
-        if not resolved.exists():
-            raise FileNotFoundError(f"{label} executable does not exist: {resolved}")  # noqa: TRY003  # tracked: #288
-        if not resolved.is_file():
-            raise ValueError(f"{label} executable is not a file: {resolved}")  # noqa: TRY003  # tracked: #288
-        resolved_commands.append(command)
+        resolved_commands.append(_project_command(root, label, command))
+    capture_command = (
+        _project_command(root, "profiler.capture_command", manifest.profiler.capture_command)
+        if manifest.profiler is not None
+        else None
+    )
 
     reference_path = bundle_root / "reference"
     if reference_path.exists() or reference_path.is_symlink():
@@ -645,5 +678,27 @@ def _load_input_bundle(  # noqa: C901, PLR0912, PLR0915  # tracked: #288
         evaluator_package_root=(evaluator_package.root if evaluator_package is not None else None),
         resolved_accuracy_command=resolved_commands[0],
         resolved_benchmark_command=resolved_commands[1],
+        resolved_capture_command=capture_command,
         manifest=manifest,
     )
+
+
+def _project_command(root: Path, label: str, command: tuple[str, ...]) -> tuple[str, ...]:
+    """Check that *command*'s executable is a bare name or a file inside the project."""
+    executable = Path(command[0])
+    if executable.is_absolute():
+        raise ValueError(  # noqa: TRY003  # tracked: #288
+            f"{label} executable must be relative to the project: {command[0]}"
+        )
+    if "/" not in command[0]:
+        return command
+    resolved = (root / executable).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} executable escapes the project: {command[0]}") from exc  # noqa: TRY003  # tracked: #288
+    if not resolved.exists():
+        raise FileNotFoundError(f"{label} executable does not exist: {resolved}")  # noqa: TRY003  # tracked: #288
+    if not resolved.is_file():
+        raise ValueError(f"{label} executable is not a file: {resolved}")  # noqa: TRY003  # tracked: #288
+    return command

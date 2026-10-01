@@ -2089,6 +2089,7 @@ def _run_agent(args: argparse.Namespace, integration: RunIntegration) -> None:
         task_root=bundle.task_root,
         accuracy_command=bundle.accuracy_command_display,
         benchmark_command=bundle.benchmark_command_display,
+        capture_command=bundle.capture_command_display,
         workspace_sources=bundle.workspace_sources,
         evaluator_path=bundle.evaluator_path,
         evaluator_package_root=bundle.evaluator_package_root,

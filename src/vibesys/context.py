@@ -244,6 +244,7 @@ def create_run_context(  # noqa: PLR0913  # tracked: #288
     benchmark_command: str,
     *,
     runs_dir: Path | None,
+    capture_command: str | None = None,
     task_name: str | None = None,
     task_root: Path | None = None,
     workspace_sources: tuple[WorkspaceSource, ...] = (),
@@ -285,6 +286,7 @@ def create_run_context(  # noqa: PLR0913  # tracked: #288
             input_path=input_path,
             accuracy_command=accuracy_command,
             benchmark_command=benchmark_command,
+            capture_command=capture_command,
             runs_dir=runs_dir,
             task_name=task_name,
             task_root=task_root,
@@ -336,6 +338,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
     input_path: str,
     accuracy_command: str,
     benchmark_command: str,
+    capture_command: str | None,
     runs_dir: Path | None,
     task_name: str | None,
     task_root: Path | None,
@@ -863,6 +866,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 objective_document=objective_document,
                 accuracy_command=accuracy_command,
                 benchmark_command=benchmark_command,
+                capture_command=capture_command,
                 benchmark_output_argument=benchmark_output_argument,
                 evaluator_package_root=evaluator_package_root,
                 evaluator_tools_root=evaluator_tools_root,
@@ -884,6 +888,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
                 judge_benchmark_command=session.view.paths.benchmark_command,
                 profiler_support_agent_path=session.view.paths.profiler_support,
                 profiler_benchmark_command=session.view.paths.benchmark_command,
+                profiler_capture_command=session.view.paths.capture_command,
             )
 
             # Start backend-specific background monitoring (CUDA: nvidia-smi).
@@ -970,6 +975,7 @@ def _assemble_run_context(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: 
             effective_objective=objective,
             accuracy_command=accuracy_command,
             benchmark_command=benchmark_command,
+            capture_command=capture_command,
             profiler_kind=resolved_profiler_kind,
             profiler_support_path=profiler_support_path,
             profiler_support_name=profiler_support_name,
@@ -1153,6 +1159,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
                 objective_document=objective_document,
                 accuracy_command=parent.accuracy_command,
                 benchmark_command=parent.benchmark_command,
+                capture_command=parent.capture_command,
                 evaluator_package_root=parent.evaluator_package_root,
                 evaluator_tools_root=parent.evaluator_tools_root,
                 profiler_support_path=parent.profiler_support_path,
@@ -1171,6 +1178,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
         judge_benchmark_command=session.view.paths.benchmark_command,
         profiler_support_agent_path=session.view.paths.profiler_support,
         profiler_benchmark_command=session.view.paths.benchmark_command,
+        profiler_capture_command=session.view.paths.capture_command,
     )
 
     # No session store: an evolve candidate names no conversation narrower than
@@ -1231,6 +1239,7 @@ def _assemble_candidate_context(  # noqa: PLR0913  # tracked: #288
         effective_objective=effective_objective,
         accuracy_command=parent.accuracy_command,
         benchmark_command=parent.benchmark_command,
+        capture_command=parent.capture_command,
         profiler_kind=parent.profiler_kind,
         profiler_support_path=parent.profiler_support_path,
         profiler_support_name=parent.profiler_support_name,
@@ -1293,6 +1302,7 @@ class _RunContext:
         effective_objective: str | None,
         accuracy_command: str,
         benchmark_command: str,
+        capture_command: str | None,
         profiler_kind: ProfilerKind,
         profiler_support_path: str | None,
         profiler_support_name: str | None,
@@ -1338,6 +1348,7 @@ class _RunContext:
         self.effective_objective = effective_objective
         self.accuracy_command = accuracy_command
         self.benchmark_command = benchmark_command
+        self.capture_command = capture_command
         self.profiler_kind = profiler_kind
         self.profiler_support_path = profiler_support_path
         self.profiler_support_name = profiler_support_name
@@ -1644,6 +1655,11 @@ class _RunContext:
     def profiler_benchmark_command(self) -> str | None:
         """Return the benchmark command as seen by the profiler agent."""
         return self.commands.profiler_benchmark_command
+
+    @property
+    def profiler_capture_command(self) -> str | None:
+        """Return the task's capture command as seen by the profiler agent, if declared."""
+        return self.commands.profiler_capture_command
 
     def lprint(self, text: str) -> None:
         self.logger.lprint(text)

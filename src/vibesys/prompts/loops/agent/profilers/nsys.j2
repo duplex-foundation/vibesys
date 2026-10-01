@@ -25,6 +25,9 @@ Your working directory contains the implementer's code. A small `{{ profiler_sup
 {% if benchmark_command is defined and benchmark_command %}
 The benchmark command is `{{ benchmark_command }}`.
 {% endif %}
+{% if capture_command is defined and capture_command %}
+The capture command is `{{ capture_command }}`.
+{% endif %}
 
 {% if modality %}
 {% include "_modality/" ~ modality ~ "/profiler.j2" %}
@@ -57,6 +60,18 @@ Start with `tables`, then pick the analyses that matter most. If `graph_replays`
 ## Capturing a profile (shell)
 
 Capture is a long-running shell step — do it before calling the MCP tools.
+{% if capture_command is defined and capture_command %}
+
+The task declares its own capture command. Run it as is, from the workspace:
+
+    {{ capture_command }}
+
+It serves the candidate's current configuration, drives a short representative
+load under nsys and stops everything; its last output line is a JSON object
+whose `profile` field names the report (`<path>.nsys-rep`). Do not start the
+server, the benchmark or nsys any other way, and do not change its arguments.
+Then continue at step 6 below.
+{% endif %}
 
 1. Read the objective, candidate contract, manifest, build/startup commands, and benchmark `--help` output to understand which implementation and process the workload exercises{% if benchmark_command is defined and benchmark_command %}: `{{ benchmark_command }} --help`{% endif %}. Do not assume a filename, language, or launcher.
 2. Stop any stale candidate processes from previous attempts.

@@ -949,6 +949,7 @@ def _run_pre_round_decision(  # noqa: PLR0913  # tracked: #288
         progress_location=progress_location,
         profiler_kind=ctx.profiler_kind.value,
         profile_execution=ctx.run_environment_view.profile_execution,
+        capture_command=ctx.profiler_capture_command,
         has_history=has_history,
     )
     decision = _invoke_read_only_role(
@@ -1032,6 +1033,7 @@ def _run_profiler(  # noqa: PLR0913  # tracked: #288
         template_dir=_TEMPLATE_DIR,
         profile_focus=profile_focus,
         benchmark_command=ctx.profiler_benchmark_command,
+        capture_command=ctx.profiler_capture_command,
         modality=modality,
         domain_profiler=domain_profiler,
         runtime_notes=ctx.run_environment_view.prompt_notes,
@@ -2287,6 +2289,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
     runs_dir: Path | None,
     task_name: str | None = None,
     task_root: Path | None = None,
+    capture_command: str | None = None,
     metrics: MetricSpace,
     workspace_sources: tuple[WorkspaceSource, ...] = (),
     evaluator_path: Path | None = None,
@@ -2432,6 +2435,7 @@ def run_agent_loop(  # noqa: C901, PLR0912, PLR0913, PLR0915  # tracked: #288
         input_path=input_path,
         accuracy_command=accuracy_command,
         benchmark_command=benchmark_command,
+        capture_command=capture_command,
         task_name=task_name,
         task_root=task_root,
         workspace_sources=workspace_sources,

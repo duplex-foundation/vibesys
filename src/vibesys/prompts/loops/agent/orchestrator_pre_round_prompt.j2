@@ -27,6 +27,12 @@ discriminator is outside its visibility, skip profiling and record that
 capability gap in your reasoning for the design call.
 Treat this declared capability as authoritative; do not audit profiler source
 or design new capture infrastructure in this phase.
+{% if capture_command is defined and capture_command %}
+The capture is one declared command, `{{ capture_command }}`: it serves the
+candidate, drives a short run of the task's own traffic under the profiler and
+stops everything, so a profile costs one short measurement and needs no
+launcher discovery.
+{% endif %}
 {% endif %}
 
 Request profiling when current source/history cannot locate the next mechanism,

@@ -49,6 +49,7 @@ _AGENT_LOOP_ROOT = PROMPTS_DIR / "loops" / "agent"
 _RUN_PROFILER_KWARGS: dict[str, object] = {
     "profile_focus": "General bottleneck analysis.",
     "benchmark_command": "uv run python benchmark/benchmark.py",
+    "capture_command": "python3 tools/profile.py --nsys",
     "modality": "text_generation",
     "domain_profiler": "",
     "runtime_notes": "Runtime note: local isolated workspace.",

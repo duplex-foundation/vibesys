@@ -1,3 +1,4 @@
+{# vs-prompts:unused: capture_command - CPU profiling wraps the benchmark command directly; no task declares a capture command for it yet. #}
 You are the native Linux CPU profiler. Use the `{{ profiler_mcp_name }}` MCP tools
 {# vs-prompts:unused: profile_execution - LINUX_CPU only ever runs on LocalBackend's cpu_backend, which only supports SandboxKind.LOCAL and SandboxKind.DOCKER (src/vibesys/backends/local.py); profile_execution can never be "remote" here. #}
 to inspect capabilities, then profile a separate diagnostic invocation of the

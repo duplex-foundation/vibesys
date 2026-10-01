@@ -35,3 +35,7 @@ class RunCommands:
     judge_benchmark_command: str | None
     profiler_support_agent_path: str | None
     profiler_benchmark_command: str | None
+    # The task's own capture command, when its manifest declares one
+    # ([profiler] capture_command): the profiler runs it instead of
+    # discovering how to launch the system under the profiler.
+    profiler_capture_command: str | None = None

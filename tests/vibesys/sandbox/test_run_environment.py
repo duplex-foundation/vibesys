@@ -2077,3 +2077,22 @@ remote_artifact_root = "/remote/vibesys"
         for agent_path, resource in mounts.items():
             if resource.access is HostResourceAccess.READ_WRITE:
                 assert agent_path in legitimately_writable, (env_name, agent_path)
+
+
+def test_local_environment_carries_the_capture_command_to_the_profiler(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    backend = FakeBackend()
+    env = build_run_environment(RunEnvironmentSpec("local"))
+
+    session = env.open(
+        _request(
+            tmp_path,
+            backend,
+            benchmark_command="uv run python benchmark/benchmark.py",
+            capture_command="python3 tools/profile.py --nsys",
+        )
+    )
+
+    assert session.view.paths.capture_command == "python3 tools/profile.py --nsys"
+
+    without = env.open(_request(tmp_path, backend))
+    assert without.view.paths.capture_command is None

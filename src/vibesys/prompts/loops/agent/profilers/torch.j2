@@ -38,6 +38,9 @@ Your working directory contains the implementer's code and a `{{ profiler_suppor
 {% if benchmark_command is defined and benchmark_command %}
 The benchmark command is `{{ benchmark_command }}`.
 {% endif %}
+{% if capture_command is defined and capture_command %}
+The capture command is `{{ capture_command }}`.
+{% endif %}
 
 {% if modality %}
 {% include "_modality/" ~ modality ~ "/profiler.j2" %}
@@ -86,7 +89,25 @@ captured and explain which entry point or command the implementer must add.
 
 If a remote profiling command fails (entrypoint missing, function errors, JSON empty, returned dict missing required keys, etc.), record the exact error in `analysis` and surface the missing contract as a `suggestions` item. A profile run that produces fabricated or unrelated numbers is worse than a profile run that admits it could not capture.
 {% else %}
-### Mode A: In-process (default)
+{% if capture_command is defined and capture_command %}
+### The task's own capture command (use this)
+
+Run it as is, from the workspace:
+
+    {{ capture_command }}
+
+It serves the candidate's current configuration, drives a short representative
+load with the server's torch profiler on and stops everything; its last output
+line is a JSON object whose `profile` field names the trace it wrote. Convert
+that trace before calling the tools:
+
+    python {{ profiler_support_name }}/analyze_torch_profile.py convert <trace> --output /tmp/prof.json
+
+Do not start the server or the benchmark any other way, and do not change the
+command's arguments.
+
+{% endif %}
+### Mode A: In-process{% if not (capture_command is defined and capture_command) %} (default){% endif %}
 
 Loads the candidate implementation directly and profiles the domain's hot path in a loop. Captures kernel-level detail but may not cover service, batching, or queueing overhead.
 
@@ -100,7 +121,7 @@ Use the exact capture command above only when it matches the domain's artifact c
 
 ### Mode B: Server-path (optional)
 
-Include HTTP, async, and batching overhead by instrumenting the server with two admin endpoints and using `capture-server`. See the docstring of `analyze_torch_profile.py` for the required `/admin/profile/start` and `/admin/profile/stop` contract.
+Include HTTP, async, and batching overhead against a running vLLM server with `capture-server`: it brackets a burst of requests with vLLM's `/start_profile` and `/stop_profile` endpoints and converts the trace the server writes (the directory `VLLM_TORCH_PROFILER_DIR` names). See the docstring of `analyze_torch_profile.py`.
 {% endif %}
 
 {% include "profilers/_observer_effect.j2" %}
