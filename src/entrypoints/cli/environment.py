@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from entrypoints.cli.errors import _configuration_error
 from vibesys.api.request import (
+    InputBundle,
     RunEnvironmentSpec,
     build_task_image,
     make_run_environment_spec,
@@ -112,25 +113,9 @@ def run_environment_spec_from_args(
     ):
         task_image = build_task_image(dockerfile_path, clock=MonotonicClock())
 
-    if requested_environment == "slurm-gpu":
-        return RunEnvironmentSpec(
-            name="slurm-gpu",
-            options={
-                "config_path": str(
-                    slurm_config or Path("~/.config/vibesys/slurm-gpu.toml").expanduser()
-                )
-            },
-            resources=bundle.manifest.resources if bundle is not None else None,
-        )
-    if requested_environment == "slurm":
-        return RunEnvironmentSpec(
-            name="slurm",
-            options={
-                "config_path": str(
-                    slurm_config or Path("~/.config/vibesys/slurm.toml").expanduser()
-                )
-            },
-        )
+    named = _named_environment_spec(requested_environment, slurm_config, bundle)
+    if named is not None:
+        return named
 
     return make_run_environment_spec(
         docker_image=task_image or args.docker_image,
@@ -145,6 +130,34 @@ def run_environment_spec_from_args(
         skypilot_executable=getattr(args, "skypilot_executable", "sky"),
         resources=bundle.manifest.resources if bundle is not None else None,
     )
+
+
+def _named_environment_spec(
+    requested: str, slurm_config: Path | None, bundle: InputBundle | None
+) -> RunEnvironmentSpec | None:
+    """The environments a name alone selects: this host, and the Slurm clusters."""
+    if requested == "host":
+        return RunEnvironmentSpec(name="host", options={})
+    if requested == "slurm-gpu":
+        return RunEnvironmentSpec(
+            name="slurm-gpu",
+            options={
+                "config_path": str(
+                    slurm_config or Path("~/.config/vibesys/slurm-gpu.toml").expanduser()
+                )
+            },
+            resources=bundle.manifest.resources if bundle is not None else None,
+        )
+    if requested == "slurm":
+        return RunEnvironmentSpec(
+            name="slurm",
+            options={
+                "config_path": str(
+                    slurm_config or Path("~/.config/vibesys/slurm.toml").expanduser()
+                )
+            },
+        )
+    return None
 
 
 def _validate_run_environment_profiler(args: argparse.Namespace) -> None:
