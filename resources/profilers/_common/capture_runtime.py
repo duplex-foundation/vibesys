@@ -1,0 +1,2037 @@
+"""Shared, engine-agnostic capture-lifecycle runtime for profiler plugins.
+
+Every ``profile_*`` MCP tool (``profile_timeline``, ``profile_counters``,
+``profile_kernel_deep``, ``profile_instructions``, ``profile_ops``, ...)
+drives the same generic lifecycle: optionally run an unprofiled
+``setup_command`` to completion, start a target command under a profiler,
+optionally wait for it to become ready and apply a load generator, then stop
+it cleanly so the profiler can flush its trace, escalating to a forceful
+kill only if the target refuses to exit. This module owns that lifecycle so
+no per-profiler tool code has to reimplement process supervision.
+
+Nothing here knows about any specific serving engine: ``command``,
+``ready_command``, ``load_command``, and ``setup_command`` are opaque shell
+strings supplied by the calling tool (ultimately chosen by the agent).
+Engine-specific knowledge belongs in skill docs and prompt templates, not
+here.
+
+Standalone module: stdlib only, Python 3.10+, no ``vibesys`` imports. It is
+staged alongside every profiler plugin (see the profiler packaging
+tests) so it must run both from a repository checkout
+(``resources/profilers/_common/capture_runtime.py``, a sibling of each
+``resources/profilers/<kind>/``) and from an agent workspace, where it is
+staged as ``<workspace>/profilers_common/capture_runtime.py``, a sibling of
+each ``<workspace>/<kind>_profiler/``. A plugin's own ``server.py`` finds it
+with a small path shim, e.g.::
+
+    import sys
+    from pathlib import Path
+
+    _HERE = Path(__file__).resolve().parent
+    for _name in ("_common", "profilers_common"):
+        _candidate = _HERE.parent / _name
+        if (_candidate / "capture_runtime.py").is_file():
+            sys.path.insert(0, str(_candidate))
+            break
+    import capture_runtime  # noqa: E402
+"""
+
+from __future__ import annotations
+
+import contextlib
+import csv
+import ctypes
+import dataclasses
+import io
+import json
+import math
+import os
+import platform
+import secrets
+import signal
+import socket
+import sqlite3
+import stat
+import subprocess
+import threading
+import time
+import types
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+__all__ = [
+    "WORKLOAD_RAN_STATUSES",
+    "ActiveCapture",
+    "BirthBoundSignalsUnavailableError",
+    "CaptureBusyError",
+    "CaptureFailedError",
+    "CaptureProcessGroup",
+    "CaptureResult",
+    "CaptureStatus",
+    "CaptureSummary",
+    "CommandRunner",
+    "Lifecycle",
+    "LinuxProcessTable",
+    "ManagedProcess",
+    "ProcessHost",
+    "ProcessIdentity",
+    "ProcessSnapshot",
+    "ProcessTable",
+    "StopResult",
+    "SubprocessCaptureProcessGroup",
+    "SubprocessHost",
+    "TargetInfo",
+    "TraceCompletion",
+    "acquire_capture_slot",
+    "active_capture",
+    "exclusive_capture",
+    "format_busy",
+    "format_result",
+    "format_targets",
+    "get_target",
+    "host",
+    "list_captures",
+    "list_targets",
+    "load_manifest",
+    "new_capture",
+    "owned_process_ids",
+    "profiles_root",
+    "read_json_file",
+    "read_process_identity",
+    "release_capture_slot",
+    "require_profile",
+    "resolve",
+    "run_analysis",
+    "run_capture",
+    "signal_target",
+    "start_target",
+    "stop_all_targets",
+    "stop_capture",
+    "stop_target",
+    "use_host",
+    "workload_failure",
+    "write_manifest",
+]
+
+_MANIFEST_NAME = "manifest.json"
+_SETUP_LOG_NAME = "setup.log"
+_TARGET_LOG_NAME = "target.log"
+_LOAD_LOG_NAME = "load.log"
+_ESCALATION_WAIT_S = 2.0
+_STARTTIME_FIELD_INDEX = 19
+_TARGET_COMMAND_HEAD_MAX_CHARS = 60
+
+# Every blocking process-wait below polls in chunks of this size (instead of
+# one blocking wait() call for the whole remaining budget) so an optional
+# cancellation signal (see ``cancel_event`` on ``run_capture``) is noticed
+# and escalated promptly rather than only at the next scheduled timeout.
+_POLL_CHUNK_S = 1.0
+
+# Lifecycle commands are written to script files rather than passed as
+# inline ``bash -lc <text>`` argv (see ``_write_script``'s docstring for
+# why); one script name per lifecycle command.
+_SETUP_SCRIPT_NAME = "setup.sh"
+_TARGET_SCRIPT_NAME = "target.sh"
+_READY_SCRIPT_NAME = "ready.sh"
+_LOAD_SCRIPT_NAME = "load.sh"
+_SCRIPT_SHEBANG = "#!/usr/bin/env bash\n"
+_SCRIPT_EXEC_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+
+
+class CaptureStatus(str, Enum):
+    """Terminal outcome of one ``run_capture`` call."""
+
+    OK = "ok"
+    TARGET_FAILED = "target_failed"
+    NOT_READY = "not_ready"
+    LOAD_FAILED = "load_failed"
+    TIMED_OUT = "timed_out"
+    KILLED_AFTER_GRACE = "killed_after_grace"
+    CANCELLED = "cancelled"
+    SETUP_FAILED = "setup_failed"
+
+
+@dataclass(frozen=True)
+class Lifecycle:
+    """Generic start/ready/load/stop lifecycle for one capture target.
+
+    ``command`` is written to a script file and run via plain ``bash
+    <script>`` (see ``run_capture``); it may be arbitrary multi-line shell
+    text (heredocs, embedded quotes, `$vars`, ...) since nothing re-tokenizes
+    it after this. When ``load_command`` is ``None``,
+    the target is expected to exit on its own (a bounded benchmark script);
+    ``run_capture`` just waits for it, up to ``timeout_s``. When
+    ``load_command`` is set, the target is expected to keep running (a
+    server) until ``run_capture`` polls ``ready_command`` to completion,
+    runs ``load_command`` against it, then stops it with ``stop_signal``.
+    ``load_timeout_s``, when given, independently limits the load after
+    readiness. Unused startup time cannot increase this limit; timeout and
+    cancellation use the same process-group cleanup as the overall deadline.
+
+    ``setup_command``, when given, runs to completion *before* ``command``
+    starts -- outside the profiler entirely (never wrapped in
+    ``profiler_prefix``), in the same ``cwd``/``env`` as everything else,
+    bounded by the overall ``timeout_s`` budget. Use it for any step whose
+    own output or child processes must not run under the profiler: a
+    profiler that injects itself into every descendant of the *profiled*
+    command (rocprofv3 does, via ``LD_PRELOAD``) can
+    otherwise print its own diagnostic banner into a small helper's stdout,
+    corrupting a value like a port number picked via `$(...)`. The
+    recommended pattern is: pick the value in ``setup_command``, write it to
+    a file, then have ``command`` read it back with the shell's ``read``
+    builtin (``read -r VAR < file``), never `$(...)`/`$(cat ...)` (`cat` is
+    itself a child of the profiled command and gets the same injection). A
+    nonzero exit, a timeout, or cancellation during ``setup_command`` stops
+    the capture immediately with no target ever started (``status``
+    ``setup_failed``/``timed_out``/``cancelled``); its output is captured to
+    ``setup.log`` and reported the same way ``target``/``load`` output is.
+    """
+
+    command: str
+    cwd: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
+    ready_command: str | None = None
+    ready_timeout_s: float = 60.0
+    ready_interval_s: float = 1.0
+    load_command: str | None = None
+    load_timeout_s: float | None = None
+    stop_signal: str = "SIGINT"
+    grace_s: float = 10.0
+    timeout_s: float = 300.0
+    setup_command: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.load_timeout_s is not None and (
+            isinstance(self.load_timeout_s, bool)
+            or not isinstance(self.load_timeout_s, (int, float))
+            or not math.isfinite(self.load_timeout_s)
+            or self.load_timeout_s <= 0
+        ):
+            message = "load_timeout_s must be finite and positive"
+            raise ValueError(message)
+
+    def load_budget(self, remaining_s: float) -> float:
+        """Bound the load after readiness by its own limit and the remaining capture budget."""
+        remaining_s = max(0.0, remaining_s)
+        return remaining_s if self.load_timeout_s is None else min(remaining_s, self.load_timeout_s)
+
+
+@dataclass(frozen=True)
+class CaptureResult:
+    """Outcome of one ``run_capture`` call, sized for a prompt reply."""
+
+    capture_id: str
+    kind: str
+    status: CaptureStatus
+    out_dir: Path
+    target_returncode: int | None
+    load_returncode: int | None
+    ready_achieved: bool | None
+    escalated: bool
+    timings: dict[str, float]
+    target_log_tail: str
+    load_log_tail: str | None
+    manifest_path: Path
+    setup_returncode: int | None = None
+    setup_log_tail: str | None = None
+
+
+@dataclass(frozen=True)
+class CaptureSummary:
+    """One row of ``list_captures``."""
+
+    capture_id: str
+    dir: Path
+    kind: str | None
+    status: str | None
+
+
+@dataclass(frozen=True)
+class ActiveCapture:
+    """The one capture currently in flight in this process, if any."""
+
+    capture_id: str
+    kind: str
+    started_at: float  # time.time()
+
+
+# A trace is profile evidence only when the configured workload ran to its end:
+# both statuses are reached only after the load command exited 0 (or, without a
+# load command, after the target exited 0). KILLED_AFTER_GRACE is the documented
+# serving-engine case where the target outlives its stop signal after a clean load.
+WORKLOAD_RAN_STATUSES = frozenset({CaptureStatus.OK.value, CaptureStatus.KILLED_AFTER_GRACE.value})
+
+
+class CommandRunner(Protocol):
+    """Run a bounded argv command with subprocess-compatible options."""
+
+    def __call__(self, args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]: ...
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """A PID and its kernel birth tick, preventing ownership after PID reuse."""
+
+    pid: int
+    started_ticks: int
+
+
+def owned_process_ids(expected: set[ProcessIdentity], current: set[ProcessIdentity]) -> set[int]:
+    """Return only processes whose identity still matches the owned snapshot."""
+    return {identity.pid for identity in expected & current}
+
+
+class CaptureProcessGroup(Protocol):
+    """Owned capture tree with bounded waits and cleanup.
+
+    poll/wait report exit only after every owned process has stopped, even
+    when the original wrapper exited before its descendants.
+    """
+
+    def members(self) -> set[int]: ...
+    def poll(self) -> int | None: ...
+    def wait(self, timeout_s: float) -> int | None: ...
+    def stop(self, signal_name: str) -> None: ...
+    def history_complete(self) -> bool: ...
+    def quiesce(self) -> set[int] | None: ...
+    def resume(self) -> None: ...
+    def cleanup(self) -> None: ...
+
+
+class TraceCompletion(Protocol):
+    """Backend proof that every trace writer finished after the stop request."""
+
+    def begin(self, process_ids: set[int]) -> None: ...
+    def complete(self, process_ids: set[int]) -> bool: ...
+
+
+@dataclass(frozen=True)
+class StopResult:
+    """Trace completion or process exit permits bounded tree cleanup."""
+
+    exited: bool
+    escalated: bool
+    trace_complete: bool = False
+
+
+def stop_capture(
+    group: CaptureProcessGroup,
+    lifecycle: Lifecycle,
+    *,
+    completion: TraceCompletion | None = None,
+    cancel_event: threading.Event | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> StopResult:
+    """Stop a capture, retaining the full grace unless its backend proves completion.
+
+    A surviving runtime can keep the profiler wrapper alive after its trace is
+    finalized. Early teardown additionally requires a complete owned birth
+    history, which a polling-only process table cannot establish. Only the
+    backend's positive completion proof permits early
+    escalation; file existence or stable size alone is never such a proof.
+    The injected clock and process group make the policy executable on the host.
+    """
+    if group.poll() is not None:
+        return StopResult(exited=True, escalated=False)
+    if completion is not None:
+        completion.begin(group.members())
+    group.stop(lifecycle.stop_signal)
+    monotonic = monotonic or host().monotonic
+    deadline = monotonic() + max(lifecycle.grace_s, 0.0)
+    while True:
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        if cancelled:
+            group.cleanup()
+            return StopResult(exited=False, escalated=True)
+        if (
+            completion is not None
+            and completion.complete(group.members())
+            and group.history_complete()
+        ):
+            # Freeze the owned tree before the final inventory: two scans alone
+            # cannot fence a fork between validation and cleanup.
+            try:
+                fenced = group.quiesce()
+                proven = (
+                    fenced is not None and group.history_complete() and completion.complete(fenced)
+                )
+                if proven:
+                    group.cleanup()
+                    return StopResult(exited=False, escalated=True, trace_complete=True)
+            finally:
+                group.resume()
+            # A writer outside the original proof must retain the normal grace.
+            completion = None
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            group.cleanup()
+            return StopResult(exited=False, escalated=True)
+        if group.wait(min(_POLL_CHUNK_S, remaining)) is not None:
+            return StopResult(exited=True, escalated=False)
+
+
+@dataclass(frozen=True)
+class ProcessSnapshot:
+    """One /proc observation binding lineage, group, state and kernel birth."""
+
+    identity: ProcessIdentity
+    parent_pid: int
+    group_pid: int
+    state: str
+
+
+class ProcessTable(Protocol):
+    """Birth-bound process observations and identity-checked capture signals."""
+
+    def snapshot(self) -> dict[int, ProcessSnapshot]: ...
+    def history_complete(self, observed: set[ProcessIdentity]) -> bool: ...
+    def signal(self, identity: ProcessIdentity, sig: signal.Signals) -> None: ...
+    def wait_for_death(self, pids: set[int], timeout_s: float) -> bool: ...
+
+
+class BirthBoundSignalsUnavailableError(RuntimeError):
+    """The platform cannot deliver signals bound to a verified process birth."""
+
+    def __init__(self) -> None:
+        super().__init__("birth-bound capture signals require Python pidfd support")
+
+
+class LinuxProcessTable:
+    """Linux /proc observations; pidfd signals never target a reused birth."""
+
+    def __init__(self) -> None:
+        self._open_pidfd = getattr(os, "pidfd_open", None)
+        self._send_pidfd_signal = getattr(signal, "pidfd_send_signal", None)
+        self._syscall = ctypes.CDLL(None, use_errno=True).syscall
+        self._syscall.restype = ctypes.c_long
+        # Standalone Python builds may omit pidfd bindings. These Linux
+        # ABIs share the kernel's asm-generic pidfd syscall numbers, so
+        # libc.syscall works even before glibc added named pidfd wrappers.
+        if (
+            self._open_pidfd is None or self._send_pidfd_signal is None
+        ) and platform.machine() not in {"x86_64", "aarch64"}:
+            raise BirthBoundSignalsUnavailableError
+
+    def _open(self, pid: int) -> int:
+        if self._open_pidfd is not None:
+            return self._open_pidfd(pid)
+        fd = self._syscall(434, pid, 0)
+        if fd < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        return fd
+
+    def _send(self, fd: int, sig: signal.Signals) -> None:
+        if self._send_pidfd_signal is not None:
+            self._send_pidfd_signal(fd, sig)
+            return
+        if self._syscall(424, fd, sig, ctypes.c_void_p(), 0) < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
+    def history_complete(self, _observed: set[ProcessIdentity]) -> bool:
+        # /proc polling can miss a writer born and exited between snapshots.
+        # Without a continuous birth journal, finalization cannot prove every
+        # writer since begin, so production preserves the configured grace.
+        return False
+
+    def snapshot(self) -> dict[int, ProcessSnapshot]:
+        processes: dict[int, ProcessSnapshot] = {}
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                text = (entry / "stat").read_text()
+                fields = text[text.rfind(")") + 2 :].split()
+                pid = int(entry.name)
+                processes[pid] = ProcessSnapshot(
+                    ProcessIdentity(pid, int(fields[_STARTTIME_FIELD_INDEX])),
+                    int(fields[1]),
+                    int(fields[2]),
+                    fields[0],
+                )
+            except (OSError, IndexError, ValueError):
+                continue
+        # /proc is not an atomic snapshot. Verify births again after collecting
+        # lineage so an exited/reused parent cannot lend ownership to the new
+        # holder's children read later in this scan.
+        return {
+            pid: process
+            for pid, process in processes.items()
+            if read_process_identity(pid) == process.identity
+        }
+
+    def signal(self, identity: ProcessIdentity, sig: signal.Signals) -> None:
+        # Open first, then validate birth. The fd remains bound to that process
+        # even if it exits and the integer PID is reassigned before delivery.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            fd = self._open(identity.pid)
+            try:
+                if read_process_identity(identity.pid) == identity:
+                    self._send(fd, sig)
+            finally:
+                os.close(fd)
+
+    def wait_for_death(self, pids: set[int], timeout_s: float) -> bool:
+        return _wait_for_others_death(pids, timeout_s)
+
+
+@dataclass
+class SubprocessCaptureProcessGroup:
+    """Own a subprocess tree, including detached descendants born during teardown.
+
+    quiesce stops every live owned process before returning its final inventory;
+    failure returns None and resume releases all processes stopped by this scope.
+    """
+
+    proc: subprocess.Popen[bytes]
+    descendants: set[int] = field(default_factory=set)
+    identities: dict[int, ProcessIdentity] = field(default_factory=dict)
+    table: ProcessTable = field(default_factory=LinuxProcessTable)
+    frozen: set[ProcessIdentity] = field(default_factory=set)
+    observed: set[ProcessIdentity] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        current = self.table.snapshot()
+        if self.proc.pid not in self.identities and self.proc.pid in current:
+            self.identities[self.proc.pid] = current[self.proc.pid].identity
+        self._refresh(current)
+
+    def _owned(self, current: dict[int, ProcessSnapshot] | None = None) -> set[int]:
+        current = self.table.snapshot() if current is None else current
+        return {
+            pid
+            for pid, identity in self.identities.items()
+            if pid in current and current[pid].identity == identity and current[pid].state != "Z"
+        }
+
+    def _refresh(self, current: dict[int, ProcessSnapshot] | None = None) -> None:
+        current = self.table.snapshot() if current is None else current
+        owned = self._owned(current)
+        found = set(owned)
+        frontier = set(owned)
+        while frontier:
+            children = {
+                pid for pid, process in current.items() if process.parent_pid in frontier
+            } - found
+            found |= children
+            frontier = children
+        group = {pid for pid, process in current.items() if process.group_pid == self.proc.pid}
+        if group & owned:
+            found |= group
+        for pid in found:
+            # An identity can change only with fresh lineage/group evidence
+            # rooted in another owned birth from this same snapshot.
+            self.identities[pid] = current[pid].identity
+            self.observed.add(current[pid].identity)
+        self.descendants |= found - {self.proc.pid}
+
+    def members(self) -> set[int]:
+        self._refresh()
+        return self._owned()
+
+    def poll(self) -> int | None:
+        self._refresh()
+        rc = self.proc.poll()
+        return rc if rc is not None and not self._owned() else None
+
+    def wait(self, timeout_s: float) -> int | None:
+        self._refresh()
+        start = time.monotonic()
+        try:
+            self.proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return None
+        self.table.wait_for_death(
+            self._owned() - {self.proc.pid}, max(0.0, timeout_s - (time.monotonic() - start))
+        )
+        return self.poll()
+
+    def stop(self, signal_name: str) -> None:
+        self._refresh()
+        self._signal(_resolve_signal(signal_name))
+
+    def _signal(self, sig: signal.Signals) -> None:
+        for pid in self._owned():
+            self.table.signal(self.identities[pid], sig)
+
+    def history_complete(self) -> bool:
+        """Require a continuous birth history covering every owned observation."""
+        return self.table.history_complete(self.observed)
+
+    def quiesce(self) -> set[int] | None:
+        # Bounded observations await kernel acknowledgement, never substitute
+        # SIGSTOP delivery for proof that fork has become impossible.
+        for _ in range(32):
+            current = self.table.snapshot()
+            self._refresh(current)
+            owned = self._owned(current)
+            for pid in owned:
+                if current[pid].state not in {"T", "t"}:
+                    identity = self.identities[pid]
+                    self.frozen.add(identity)
+                    self.table.signal(identity, signal.SIGSTOP)
+            current = self.table.snapshot()
+            self._refresh(current)
+            fenced = self._owned(current)
+            if fenced <= owned and all(current[pid].state in {"T", "t"} for pid in fenced):
+                return fenced
+        return None
+
+    def resume(self) -> None:
+        errors: list[OSError] = []
+        for identity in self.frozen:
+            try:
+                self.table.signal(identity, signal.SIGCONT)
+            except OSError as error:
+                errors.append(error)
+        self.frozen.clear()
+        if errors:
+            raise errors[0]
+
+    def cleanup(self) -> None:
+        if self.frozen:
+            # Keep the proof's fork fence through cleanup rather than allowing
+            # SIGTERM handlers to create new writers after the final inventory.
+            self._signal(signal.SIGKILL)
+        else:
+            self._refresh()
+            self._signal(signal.SIGTERM)
+            _reap(self.proc, _ESCALATION_WAIT_S)
+            self.table.wait_for_death(self._owned() - {self.proc.pid}, 0.5)
+            self._refresh()
+            self._signal(signal.SIGKILL)
+        _reap(self.proc, _ESCALATION_WAIT_S)
+        self.table.wait_for_death(self._owned() - {self.proc.pid}, _ESCALATION_WAIT_S)
+
+
+class ManagedProcess(Protocol):
+    """The slice of ``subprocess.Popen`` the lifecycle drives: a started, pollable child."""
+
+    pid: int
+    returncode: int | None
+
+    def poll(self) -> int | None: ...
+    def wait(self, timeout: float | None = None) -> int:
+        """Block up to *timeout*; raise ``subprocess.TimeoutExpired`` when it did not exit."""
+        ...
+
+
+class ProcessHost(Protocol):
+    """Everything the lifecycle needs from the operating system, as one injectable role.
+
+    The lifecycle (``run_capture``, warm targets) starts shell scripts, polls
+    readiness checks, supervises the started tree and waits against deadlines.
+    ``SubprocessHost`` does that with real processes and the real clock; a test
+    installs a scripted host with ``use_host`` so the same lifecycle runs on a
+    virtual clock with no process, signal or sleep.
+    """
+
+    def spawn(
+        self, argv: list[str], *, cwd: str | None, env: dict[str, str], log_path: Path
+    ) -> ManagedProcess:
+        """Start *argv* in its own session with stdout and stderr appended to *log_path*."""
+        ...
+
+    def check(
+        self, argv: list[str], *, cwd: str | None, env: dict[str, str], timeout_s: float
+    ) -> int | None:
+        """Run a short check to completion; its exit status, or ``None`` when it timed out."""
+        ...
+
+    def process_group(
+        self, proc: ManagedProcess, identities: dict[int, ProcessIdentity] | None = None
+    ) -> CaptureProcessGroup:
+        """The owned tree rooted at *proc*."""
+        ...
+
+    def probe(self, argv: list[str], *, timeout_s: float) -> tuple[int | None, str]:
+        """Run a short host-capability query; ``(status, stdout + stderr)``.
+
+        The status is ``None`` (with a reason as the text) when the program could not be
+        launched at all or timed out.
+        """
+        ...
+
+    def pid_alive(self, pid: int) -> bool:
+        """Whether process *pid* is running (a zombie is not)."""
+        ...
+
+    def monotonic(self) -> float:
+        """Seconds on a clock that never goes backwards."""
+        ...
+
+    def wall_time(self) -> float:
+        """Seconds since the epoch."""
+        ...
+
+    def sleep(self, seconds: float) -> None:
+        """Pause for *seconds*."""
+        ...
+
+
+class SubprocessHost:
+    """The production host: real subprocesses, ``/proc`` ownership and the real clock."""
+
+    def spawn(
+        self, argv: list[str], *, cwd: str | None, env: dict[str, str], log_path: Path
+    ) -> ManagedProcess:
+        """Start *argv* as a new session leader logging to *log_path*."""
+        with log_path.open("wb") as handle:
+            return subprocess.Popen(  # noqa: S603  # LW-910002; the subprocess argv is a fixed sequence built by this code, not attacker-controlled shell input
+                argv,
+                cwd=cwd,
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+
+    def check(
+        self, argv: list[str], *, cwd: str | None, env: dict[str, str], timeout_s: float
+    ) -> int | None:
+        """Run *argv* to completion, discarding output."""
+        try:
+            result = subprocess.run(  # noqa: S603  # LW-910003; the subprocess argv is a fixed sequence built by this code, not attacker-controlled shell input
+                argv,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(timeout_s, 0.01),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        return result.returncode
+
+    def process_group(
+        self, proc: ManagedProcess, identities: dict[int, ProcessIdentity] | None = None
+    ) -> CaptureProcessGroup:
+        """Own *proc*'s tree through ``/proc`` observations."""
+        return SubprocessCaptureProcessGroup(
+            cast("subprocess.Popen[bytes]", proc), identities=dict(identities or {})
+        )
+
+    def probe(self, argv: list[str], *, timeout_s: float) -> tuple[int | None, str]:
+        """Run *argv* to completion and return its status and combined output."""
+        try:
+            result = subprocess.run(  # noqa: S603  # LW-910048; the subprocess argv is a fixed sequence built by this code, not attacker-controlled shell input
+                argv, capture_output=True, text=True, timeout=timeout_s, check=False
+            )
+        except FileNotFoundError:
+            return None, "executable not found"
+        except OSError as exc:
+            return None, str(exc)
+        except subprocess.TimeoutExpired:
+            return None, "timed out"
+        return result.returncode, result.stdout + result.stderr
+
+    def pid_alive(self, pid: int) -> bool:
+        """Probe the real process table."""
+        return _alive(pid)
+
+    def monotonic(self) -> float:
+        """The real monotonic clock."""
+        return time.monotonic()
+
+    def wall_time(self) -> float:
+        """The real wall clock."""
+        return time.time()
+
+    def sleep(self, seconds: float) -> None:
+        """Really sleep."""
+        time.sleep(seconds)
+
+
+_host: ProcessHost = SubprocessHost()
+
+
+def host() -> ProcessHost:
+    """The host the lifecycle is currently running against."""
+    return _host
+
+
+@contextlib.contextmanager
+def use_host(replacement: ProcessHost) -> Iterator[None]:
+    """Run the lifecycle against *replacement* inside the block, restoring the real host after."""
+    global _host  # noqa: PLW0603  # LW-910399; the host is process-global like the capture slot and target registry it serves, and this context manager is the only writer
+    previous = _host
+    _host = replacement
+    try:
+        yield
+    finally:
+        _host = previous
+
+
+class CaptureFailedError(RuntimeError):
+    """A capture ended without a profile of the requested workload.
+
+    Raised instead of returning the capture's analysis, so an MCP tool reports
+    a tool error rather than a normal result. The message carries the
+    capture's diagnostic report.
+    """
+
+    def __init__(self, status: str, report: str) -> None:
+        """Name the failed status and keep the diagnostic report."""
+        super().__init__(f"capture failed ({status}); no profile was produced\n{report}")
+        self.status = status
+        self.report = report
+
+    @classmethod
+    def analysis_failed(cls, diagnostic: object) -> CaptureFailedError:
+        """Translate invalid report inputs and failed analyzer commands."""
+        return cls("analysis_failed", str(diagnostic))
+
+
+def require_profile(status: str, report: str) -> None:
+    """Raise :class:`CaptureFailedError` unless *status* is a capture whose workload ran."""
+    if status not in WORKLOAD_RAN_STATUSES:
+        raise CaptureFailedError(status, report)
+
+
+def run_analysis(fn: Callable[..., object], **kwargs: object) -> str:
+    """Capture analyzer output, translating rejected external inputs into typed failures."""
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            fn(types.SimpleNamespace(**kwargs))
+    except (SystemExit, OSError, ValueError, TypeError, sqlite3.DatabaseError, csv.Error) as exc:
+        raise CaptureFailedError.analysis_failed(exc) from exc
+    return output.getvalue() or "(no output)"
+
+
+def workload_failure(profiles_path: Path, capture_ids: list[str]) -> str | None:
+    """Return why the captured workload did not run, or None when every capture ran it.
+
+    A capture whose load failed (for example a benchmark preflight the engine
+    cannot pass) still leaves a trace of the load window; that trace does not
+    describe the requested workload, so it must not become a profile.
+    """
+    for capture_id in capture_ids:
+        try:
+            manifest = load_manifest(profiles_path / capture_id)
+        except (OSError, ValueError) as exc:
+            return f"not profilable: capture {capture_id} has no readable manifest ({exc})"
+        status = manifest.get("status")
+        if status not in WORKLOAD_RAN_STATUSES:
+            return (
+                f"not profilable: the configured workload did not run (capture {capture_id} "
+                f"status={status}, load_rc={manifest.get('load_returncode')}, "
+                f"target_rc={manifest.get('target_returncode')}); the trace covers no "
+                "completed workload, see the load log tail above"
+            )
+    return None
+
+
+def format_busy(active: ActiveCapture) -> str:
+    """A prompt-sized "busy" reply naming the capture already running."""
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(active.started_at))
+    return f"busy: capture {active.capture_id} ({active.kind}) running since {started}"
+
+
+class CaptureBusyError(RuntimeError):
+    """Raised by ``acquire_capture_slot``/``exclusive_capture`` when a capture is already running.
+
+    Every ``profile_*`` capture drives the GPU (directly, or via the torch
+    ``profile_ops`` delegate, which shares the same physical GPU); running
+    two at once in the same server process would corrupt both, and a client
+    that abandons a call on timeout must not silently queue a second one
+    behind it. ``exclusive_capture`` serializes captures *within this
+    process* (one profiler MCP server process per profiler kind per round,
+    so this is the right scope -- it does not coordinate across processes).
+    """
+
+    def __init__(self, active: ActiveCapture) -> None:
+        self.active = active
+        super().__init__(format_busy(active))
+
+
+_active_capture: ActiveCapture | None = None
+_active_capture_lock = threading.Lock()
+
+
+def active_capture() -> ActiveCapture | None:
+    """The capture currently in flight in this process, if any."""
+    with _active_capture_lock:
+        return _active_capture
+
+
+def acquire_capture_slot(kind: str, capture_id: str) -> ActiveCapture:
+    """Claim the single in-process capture slot, or raise ``CaptureBusyError``.
+
+    Never blocks or queues: a concurrent second capture call fails
+    immediately with the currently running capture's identity, so the
+    caller can return a clear "busy" response right away.
+    """
+    global _active_capture  # noqa: PLW0603  # LW-910000; this module holds intentional process-lifetime state (a capture slot) mutated across calls
+    with _active_capture_lock:
+        if _active_capture is not None:
+            raise CaptureBusyError(_active_capture)
+        _active_capture = ActiveCapture(
+            capture_id=capture_id, kind=kind, started_at=host().wall_time()
+        )
+        return _active_capture
+
+
+def release_capture_slot() -> None:
+    """Clear the in-process capture slot. Idempotent."""
+    global _active_capture  # noqa: PLW0603  # LW-910001; this module holds intentional process-lifetime state (a capture slot) mutated across calls
+    with _active_capture_lock:
+        _active_capture = None
+
+
+@contextlib.contextmanager
+def exclusive_capture(kind: str, capture_id: str) -> Iterator[None]:
+    """Context manager: hold the in-process capture slot for *capture_id*.
+
+    Raises ``CaptureBusyError`` immediately (before running anything) if
+    another capture already holds the slot; always releases it on exit,
+    success or failure.
+    """
+    acquire_capture_slot(kind, capture_id)
+    try:
+        yield
+    finally:
+        release_capture_slot()
+
+
+@dataclass
+class _Outcome:
+    status: CaptureStatus
+    target_returncode: int | None
+    load_returncode: int | None = None
+    escalated: bool = False
+    ready_achieved: bool | None = None
+    load_tail: str | None = None
+    # Wall-clock/monotonic timestamps bracketing the load phase (the window
+    # between ready_command succeeding and load_command finishing), or None
+    # when there is no load_command (a bounded script has no separate
+    # "startup" vs. "steady state" phase to distinguish). See
+    # ``_clock_stamps`` for the fields each phase's stamp carries.
+    load_window: dict[str, dict[str, int]] | None = None
+    # setup_command's own outcome, when the lifecycle has one. None/None
+    # when there is no setup_command; a non-None setup_returncode != 0 (or
+    # a timed-out/cancelled setup, distinguished by ``status`` instead) is
+    # what makes ``run_capture`` skip ever starting the profiled target.
+    setup_returncode: int | None = None
+    setup_tail: str | None = None
+
+
+@dataclass(frozen=True)
+class _ManifestContext:
+    capture_id: str
+    kind: str
+    argv: list[str]
+    lifecycle: Lifecycle
+    out_dir: Path
+    meta: dict[str, Any]
+    outcome: _Outcome
+    timings: dict[str, float]
+    scripts: dict[str, str]
+    capture_start: dict[str, int]
+    capture_end: dict[str, int]
+
+
+# -- capture store ------------------------------------------------------------
+
+
+def _profiles_root() -> Path:
+    """The capture store root, always resolved to an absolute path.
+
+    ``new_capture``'s returned directory is passed both to the profiled
+    subprocess (as the profiler's ``-d`` output-directory argument, a
+    process started with ``cwd=lifecycle.cwd``) and used directly by this
+    process's own analysis code afterward. A relative default
+    (``./.profiles``) is ambiguous between those two: the subprocess
+    resolves it against ``lifecycle.cwd`` while this process resolves it
+    against its own cwd, and those differ whenever a capture tool's
+    ``cwd`` argument names anything other than the server's own launch
+    directory -- the profiler then writes its whole output tree somewhere
+    this process never looks, and every downstream ``summary``/analyzer
+    call sees an empty capture. Resolving here, once, before the path is
+    handed to either side, keeps both sides pointed at the same directory
+    regardless of ``lifecycle.cwd``.
+    """
+    raw = os.environ.get("VIBESYS_PROFILE_DIR", "./.profiles")
+    return Path(raw).expanduser().resolve()
+
+
+def profiles_root() -> Path:
+    """Public accessor for the capture store root (``$VIBESYS_PROFILE_DIR``, default ``./.profiles``)."""
+    return _profiles_root()
+
+
+def new_capture(kind: str) -> tuple[str, Path]:
+    """Allocate a fresh capture id + directory under ``$VIBESYS_PROFILE_DIR``."""
+    root = _profiles_root()
+    root.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(10):
+        timestamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        capture_id = f"{kind}-{timestamp}-{secrets.token_hex(2)}"
+        directory = root / capture_id
+        try:
+            directory.mkdir(parents=False)
+        except FileExistsError:
+            continue
+        return capture_id, directory
+    raise RuntimeError("could not allocate a unique capture directory")  # noqa: TRY003  # LW-920001; this is a boundary error that deliberately embeds the offending value for the operator to act on
+
+
+def write_manifest(directory: Path, manifest: dict[str, Any]) -> Path:
+    """Write ``manifest.json`` into *directory* and return its path."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / _MANIFEST_NAME
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=str) + "\n")
+    return path
+
+
+def resolve(capture_id_or_path: str) -> Path:
+    """Resolve a capture id or explicit path to its capture directory."""
+    candidate = Path(capture_id_or_path).expanduser()
+    if candidate.is_dir():
+        return candidate.resolve()
+    root = _profiles_root()
+    by_id = root / capture_id_or_path
+    if by_id.is_dir():
+        return by_id.resolve()
+    raise FileNotFoundError(  # noqa: TRY003  # LW-920002; this is a boundary error that deliberately embeds the offending value for the operator to act on
+        f"capture not found: {capture_id_or_path!r} (checked that path and {root})"
+    )
+
+
+def read_json_file(path: Path) -> object:
+    """Decode the JSON file at *path*, whatever bytes a workload left in it.
+
+    Python's ``json`` recurses once per nesting level and raises ``RecursionError``
+    past the interpreter's limit, and invalid UTF-8 is a ``UnicodeDecodeError``
+    rather than a ``JSONDecodeError``; both become ``ValueError`` here, so a caller
+    handles every undecodable file with one ``except (OSError, ValueError)``.
+
+    Raises:
+        OSError: the file cannot be read.
+        ValueError: the file is not UTF-8 JSON, or nests deeper than ``json`` reads.
+    """
+    data = path.read_bytes()
+    try:
+        return json.loads(data)
+    except RecursionError as exc:
+        message = f"{path} nests deeper than the JSON decoder reads"
+        raise ValueError(message) from exc
+
+
+def load_manifest(capture_dir: Path) -> dict[str, Any]:
+    """Load ``manifest.json`` from *capture_dir*, raising a clear error if absent/malformed."""
+    path = Path(capture_dir) / _MANIFEST_NAME
+    if not path.is_file():
+        raise FileNotFoundError(f"no manifest.json under {capture_dir}")  # noqa: TRY003  # LW-920003; this is a boundary error that deliberately embeds the offending value for the operator to act on
+    try:
+        data = read_json_file(path)
+    except ValueError as exc:
+        raise ValueError(f"malformed manifest.json under {capture_dir}: {exc}") from exc  # noqa: TRY003  # LW-920004; this is a boundary error that deliberately embeds the offending value for the operator to act on
+    if isinstance(data, dict):
+        return data
+    raise ValueError(f"manifest.json under {capture_dir} is not a JSON object")  # noqa: TRY003  # LW-920005; this is a boundary error that deliberately embeds the offending value for the operator to act on
+
+
+def list_captures(limit: int = 20, *, root: Path | None = None) -> list[CaptureSummary]:
+    """Return the most recently modified captures under *root*, newest first.
+
+    *root* defaults to ``$VIBESYS_PROFILE_DIR``. A capture whose manifest is unreadable,
+    not JSON, or not an object is still listed, with no kind or status.
+    """
+    root = _profiles_root() if root is None else root
+    if not root.is_dir():
+        return []
+    entries = [p for p in root.iterdir() if p.is_dir()]
+    entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    summaries: list[CaptureSummary] = []
+    for entry in entries[:limit]:
+        kind: str | None = None
+        status: str | None = None
+        manifest_path = entry / _MANIFEST_NAME
+        if manifest_path.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                data = read_json_file(manifest_path)
+                if isinstance(data, dict):
+                    kind = _text_or_none(data.get("kind"))
+                    status = _text_or_none(data.get("status"))
+        summaries.append(CaptureSummary(capture_id=entry.name, dir=entry, kind=kind, status=status))
+    return summaries
+
+
+def _text_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def format_result(result: CaptureResult, *, max_log_chars: int = 800) -> str:
+    """A prompt-sized summary of *result*: status, timings, capped log tail."""
+    lines = [
+        f"capture {result.capture_id} ({result.kind}): {result.status.value}",
+        f"  duration={result.timings.get('duration_s', 0.0):.2f}s "
+        f"target_rc={result.target_returncode} load_rc={result.load_returncode} "
+        f"escalated={result.escalated}",
+        f"  manifest={result.manifest_path}",
+    ]
+    if result.setup_log_tail:
+        setup_tail = result.setup_log_tail[-max_log_chars:]
+        lines.append("  setup log tail:")
+        lines.extend(f"    {line}" for line in setup_tail.splitlines()[-20:])
+    tail = result.target_log_tail[-max_log_chars:]
+    if tail:
+        lines.append("  target log tail:")
+        lines.extend(f"    {line}" for line in tail.splitlines()[-20:])
+    if result.load_log_tail:
+        load_tail = result.load_log_tail[-max_log_chars:]
+        lines.append("  load log tail:")
+        lines.extend(f"    {line}" for line in load_tail.splitlines()[-20:])
+    return "\n".join(lines)
+
+
+# -- process lifecycle ---------------------------------------------------------
+
+
+def _effective_env(lifecycle: Lifecycle) -> dict[str, str]:
+    return {**os.environ, **lifecycle.env}
+
+
+def _remaining(start: float, timeout_s: float) -> float:
+    return max(0.0, timeout_s - (host().monotonic() - start))
+
+
+def _tail(path: Path, *, max_chars: int = 4000) -> str:
+    if not path.is_file():
+        return ""
+    text = path.read_bytes().decode("utf-8", errors="replace")
+    return text if len(text) <= max_chars else text[-max_chars:]
+
+
+def _write_script(directory: Path, name: str, text: str) -> Path:
+    """Write *text* verbatim (after a shebang line) as an executable script.
+
+    A lifecycle command used to be passed as inline argv text (``bash -lc
+    "<text>"``) to whatever ``profiler_prefix`` wraps it. That is fragile in
+    general: a multi-line command with embedded quotes depends on every
+    layer between here and the final ``bash`` treating the trailing argv as
+    fully opaque, which is not guaranteed of every profiler wrapper. Writing
+    the command to a script file and handing the wrapper a single, simple
+    path argument removes that whole class of risk: nothing between here and
+    the ``bash`` that finally reads and runs the file re-tokenizes *text*, so
+    newlines, quotes, ``$vars``, and heredocs all survive intact regardless
+    of what a profiler wrapper does to simple argv tokens. (A real rocprofv3
+    incident this branch also hardens against turned out to have a different
+    root cause -- rocprofv3 injecting itself into every descendant process,
+    including a `$(...)`-captured helper, and one of those descendants
+    printing a diagnostic banner into the value being captured; confirmed on
+    real MI210 hardware that no profiler-side env/flag suppresses this, so
+    the fix is ``Lifecycle.setup_command`` -- do that kind of work entirely
+    outside the profiler -- not a quieting env var.)
+
+    *text* is preserved byte-for-byte after the shebang line: no ``set -e``
+    or other semantics are injected.
+    """
+    path = directory / name
+    path.write_text(_SCRIPT_SHEBANG + text)
+    path.chmod(path.stat().st_mode | _SCRIPT_EXEC_BITS)
+    return path
+
+
+def _clock_stamps() -> dict[str, int]:
+    """Wall-clock + monotonic readings of "now", for later clock alignment.
+
+    Records ``time.monotonic_ns()``, the raw ``time.clock_gettime_ns(
+    time.CLOCK_MONOTONIC)`` reading (implemented the same way on
+    CPython/Linux, but both kept since a downstream analyzer may only trust
+    one), and ``time.clock_gettime_ns(time.CLOCK_REALTIME)`` (wall-clock
+    epoch ns). An external tool's own trace timestamps (e.g. rocprofv3's
+    system-trace CSV ``Start_Timestamp``/``End_Timestamp`` columns, verified
+    against real MI210 captures to be CLOCK_MONOTONIC-based ns) can then be
+    compared directly against ``clock_monotonic_ns`` when both processes ran
+    on the same host, without any offset math. A downstream analyzer that cannot
+    verify this alignment for a given capture must fall back to analyzing
+    the whole run rather than silently mis-slicing it.
+    """
+    return {
+        "monotonic_ns": time.monotonic_ns(),
+        "clock_monotonic_ns": time.clock_gettime_ns(time.CLOCK_MONOTONIC),
+        "realtime_ns": time.clock_gettime_ns(time.CLOCK_REALTIME),
+    }
+
+
+def _start_process(
+    lifecycle: Lifecycle, profiler_prefix: list[str], log_path: Path, script_path: Path
+) -> ManagedProcess:
+    argv = [*profiler_prefix, "bash", str(script_path)]
+    return host().spawn(argv, cwd=lifecycle.cwd, env=_effective_env(lifecycle), log_path=log_path)
+
+
+def _wait_with_cancel(
+    proc: ManagedProcess, timeout: float, cancel_event: threading.Event | None
+) -> tuple[int | None, bool]:
+    """Wait up to *timeout* for *proc* to exit, polling in ``_POLL_CHUNK_S`` chunks.
+
+    Chunked (rather than one blocking ``proc.wait(timeout=...)`` call) so an
+    optional *cancel_event* is noticed within one chunk instead of only at
+    the end of the full timeout. Returns ``(returncode, cancelled)``:
+    ``returncode`` is ``None`` on either plain timeout or cancellation;
+    ``cancelled`` distinguishes the two so the caller can report the right
+    status. Behaviorally identical to a single ``proc.wait(timeout=timeout)``
+    when *cancel_event* is ``None`` (every existing caller before this
+    change), aside from the coarser-grained wakeups.
+    """
+    deadline = host().monotonic() + max(timeout, 0.0)
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return None, True
+        remaining = deadline - host().monotonic()
+        if remaining <= 0:
+            return proc.poll(), False
+        try:
+            return proc.wait(timeout=min(_POLL_CHUNK_S, remaining)), False
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _run_no_load(
+    proc: ManagedProcess,
+    lifecycle: Lifecycle,
+    start: float,
+    cancel_event: threading.Event | None,
+) -> _Outcome:
+    rc, cancelled = _wait_with_cancel(proc, _remaining(start, lifecycle.timeout_s), cancel_event)
+    if cancelled:
+        _escalate(proc)
+        return _Outcome(CaptureStatus.CANCELLED, proc.returncode, escalated=True)
+    if rc is None:
+        _escalate(proc)
+        return _Outcome(CaptureStatus.TIMED_OUT, None, escalated=True)
+    status = CaptureStatus.OK if rc == 0 else CaptureStatus.TARGET_FAILED
+    return _Outcome(status, rc)
+
+
+def _run_check(script_path: Path, lifecycle: Lifecycle, timeout: float) -> int | None:
+    return host().check(
+        ["bash", str(script_path)],
+        cwd=lifecycle.cwd,
+        env=_effective_env(lifecycle),
+        timeout_s=timeout,
+    )
+
+
+def _poll_ready(
+    proc: ManagedProcess,
+    lifecycle: Lifecycle,
+    start: float,
+    ready_script: Path,
+    cancel_event: threading.Event | None,
+) -> tuple[bool, bool]:
+    """Poll ``ready_command`` (as *ready_script*) until it succeeds.
+
+    Return (ready, target_exited_early). When *cancel_event* becomes set,
+    returns ``(False, False)`` promptly (within one ``_POLL_CHUNK_S``) so the
+    caller can distinguish "cancelled" from a genuine not-ready/timeout.
+    """
+    assert lifecycle.ready_command is not None  # noqa: S101  # LW-910005; test code uses assert as the standard pytest assertion mechanism
+    ready_start = host().monotonic()
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return False, False
+        if proc.poll() is not None:
+            return False, True
+        elapsed_ready = host().monotonic() - ready_start
+        remaining_overall = _remaining(start, lifecycle.timeout_s)
+        if elapsed_ready >= lifecycle.ready_timeout_s or remaining_overall <= 0:
+            return False, False
+        check_budget = min(10.0, lifecycle.ready_timeout_s - elapsed_ready, remaining_overall)
+        if cancel_event is not None:
+            check_budget = min(check_budget, _POLL_CHUNK_S)
+        if _run_check(ready_script, lifecycle, check_budget) == 0:
+            return True, False
+        if cancel_event is not None and cancel_event.is_set():
+            return False, False
+        sleep_for = min(
+            lifecycle.ready_interval_s,
+            lifecycle.ready_timeout_s - (host().monotonic() - ready_start),
+            _remaining(start, lifecycle.timeout_s),
+        )
+        if cancel_event is not None:
+            sleep_for = min(sleep_for, _POLL_CHUNK_S)
+        if sleep_for > 0:
+            host().sleep(sleep_for)
+
+
+def _run_unprofiled_step(  # noqa: PLR0913  # LW-910006; this function's parameters mirror an external tool's CLI/API surface and are not grouped further
+    lifecycle: Lifecycle,
+    timeout: float,
+    out_dir: Path,
+    script: Path,
+    log_name: str,
+    cancel_event: threading.Event | None,
+) -> tuple[int | None, str, bool, bool]:
+    """Run *script* as a plain ``bash <script>`` (never wrapped in ``profiler_prefix``) to completion.
+
+    Shared by ``_run_load`` (the load generator) and ``_run_setup``
+    (``setup_command``): both are unprofiled steps that run alongside/before
+    the profiled target rather than under the profiler itself. Returns
+    ``(returncode, log_tail, timed_out, cancelled)``.
+    """
+    log_path = out_dir / log_name
+    proc = host().spawn(
+        ["bash", str(script)], cwd=lifecycle.cwd, env=_effective_env(lifecycle), log_path=log_path
+    )
+    rc, cancelled = _wait_with_cancel(proc, max(timeout, 0.0), cancel_event)
+    if cancelled:
+        _escalate(proc)
+        return None, _tail(log_path), False, True
+    if rc is None:
+        _escalate(proc)
+        return None, _tail(log_path), True, False
+    return rc, _tail(log_path), False, False
+
+
+def _run_load(
+    lifecycle: Lifecycle,
+    timeout: float,
+    out_dir: Path,
+    load_script: Path,
+    cancel_event: threading.Event | None,
+) -> tuple[int | None, str, bool, bool]:
+    """Run ``load_command``. Returns ``(returncode, log_tail, timed_out, cancelled)``."""
+    assert lifecycle.load_command is not None  # noqa: S101  # LW-910009; test code uses assert as the standard pytest assertion mechanism
+    return _run_unprofiled_step(
+        lifecycle,
+        lifecycle.load_budget(timeout),
+        out_dir,
+        load_script,
+        _LOAD_LOG_NAME,
+        cancel_event,
+    )
+
+
+def _run_setup(
+    lifecycle: Lifecycle,
+    timeout: float,
+    out_dir: Path,
+    setup_script: Path,
+    cancel_event: threading.Event | None,
+) -> tuple[int | None, str, bool, bool]:
+    """Run ``setup_command`` to completion, unprofiled, before the target starts.
+
+    See ``Lifecycle.setup_command``'s docstring for why this must never be
+    wrapped in ``profiler_prefix``. Returns
+    ``(returncode, log_tail, timed_out, cancelled)``.
+    """
+    assert lifecycle.setup_command is not None  # noqa: S101  # LW-910010; test code uses assert as the standard pytest assertion mechanism
+    return _run_unprofiled_step(
+        lifecycle, timeout, out_dir, setup_script, _SETUP_LOG_NAME, cancel_event
+    )
+
+
+def _stop_and_wait_grace(
+    group: CaptureProcessGroup,
+    lifecycle: Lifecycle,
+    cancel_event: threading.Event | None,
+    completion: TraceCompletion | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> tuple[bool, bool]:
+    result = stop_capture(
+        group,
+        lifecycle,
+        completion=completion,
+        cancel_event=cancel_event,
+        monotonic=monotonic,
+    )
+    # A proved trace is successful even if bounded cleanup stops its runtime.
+    return result.exited or result.trace_complete, result.escalated
+
+
+def _run_with_load(  # noqa: PLR0913  # LW-910011; this function's parameters mirror an external tool's CLI/API surface and are not grouped further
+    proc: ManagedProcess,
+    lifecycle: Lifecycle,
+    start: float,
+    out_dir: Path,
+    ready_script: Path,
+    load_script: Path,
+    cancel_event: threading.Event | None,
+    completion: TraceCompletion | None,
+    group: CaptureProcessGroup,
+    monotonic: Callable[[], float] | None = None,
+) -> _Outcome:
+    ready, target_exited_early = _poll_ready(proc, lifecycle, start, ready_script, cancel_event)
+    if target_exited_early:
+        return _Outcome(CaptureStatus.TARGET_FAILED, proc.returncode, ready_achieved=False)
+
+    if not ready:
+        _exited, escalated = _stop_and_wait_grace(
+            group, lifecycle, cancel_event, completion, monotonic
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            status = CaptureStatus.CANCELLED
+        elif _remaining(start, lifecycle.timeout_s) <= 0:
+            status = CaptureStatus.TIMED_OUT
+        else:
+            status = CaptureStatus.NOT_READY
+        return _Outcome(status, proc.returncode, escalated=escalated, ready_achieved=False)
+
+    # The load phase (ready_command succeeded -> load_command finishes) is
+    # the "steady state" window a capture's later analysis wants, distinct
+    # from everything before it (server startup: weight load, warmup, KV
+    # init, ...). Bracket it with clock stamps so an analyzer can slice a
+    # timeline capture down to just this window instead of the whole run.
+    ready_stamp = _clock_stamps()
+    load_start_stamp = _clock_stamps()
+    remaining = _remaining(start, lifecycle.timeout_s)
+    load_rc, load_tail, load_timed_out, load_cancelled = _run_load(
+        lifecycle, remaining, out_dir, load_script, cancel_event
+    )
+    load_window = {"ready": ready_stamp, "start": load_start_stamp, "end": _clock_stamps()}
+    if load_cancelled or load_timed_out or load_rc != 0:
+        _exited, escalated = _stop_and_wait_grace(
+            group, lifecycle, cancel_event, completion, monotonic
+        )
+        status = (
+            CaptureStatus.CANCELLED
+            if load_cancelled
+            else CaptureStatus.TIMED_OUT
+            if load_timed_out
+            else CaptureStatus.LOAD_FAILED
+        )
+        return _Outcome(
+            status,
+            proc.returncode,
+            load_returncode=load_rc,
+            escalated=escalated,
+            ready_achieved=True,
+            load_tail=load_tail,
+            load_window=load_window,
+        )
+
+    exited, escalated = _stop_and_wait_grace(group, lifecycle, cancel_event, completion, monotonic)
+    if cancel_event is not None and cancel_event.is_set():
+        status = CaptureStatus.CANCELLED
+    else:
+        status = CaptureStatus.OK if exited else CaptureStatus.KILLED_AFTER_GRACE
+    return _Outcome(
+        status,
+        proc.returncode,
+        load_returncode=load_rc,
+        escalated=escalated,
+        ready_achieved=True,
+        load_tail=load_tail,
+        load_window=load_window,
+    )
+
+
+# -- forceful cleanup: never leave a stray process ------------------------------
+
+
+def _resolve_signal(name: str) -> signal.Signals:
+    try:
+        return signal.Signals[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown stop_signal: {name!r}") from exc  # noqa: TRY003  # LW-920006; this is a boundary error that deliberately embeds the offending value for the operator to act on
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+        state = stat_text[stat_text.rfind(")") + 2 :].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state != "Z"
+
+
+def read_process_identity(pid: int, process_root: Path = Path("/proc")) -> ProcessIdentity | None:
+    """Read the kernel birth identity, returning None for unknown process data."""
+    try:
+        text = (process_root / str(pid) / "stat").read_text()
+        # starttime is field 22 in proc_pid_stat(5), index 19 after comm.
+        fields = text[text.rfind(")") + 2 :].split()
+        return ProcessIdentity(pid, int(fields[_STARTTIME_FIELD_INDEX]))
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _reap(proc: ManagedProcess, timeout: float) -> bool:
+    """Wait for *proc* (our own child) to exit, reaping it. False on timeout.
+
+    Reaping our own child through ``Popen.wait`` matters, not just signaling
+    it: until we do, it is a zombie, and ``os.kill(pid, 0)`` (what liveness
+    checks below use for processes we do *not* own) keeps reporting it alive
+    forever, since a zombie still holds its PID table slot.
+    """
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def _wait_for_others_death(pids: set[int], timeout: float) -> bool:
+    """Poll liveness of descendants we do not directly own (not our child).
+
+    Once their original parent has actually terminated, the kernel
+    reparents them to an ancestor that reaps orphans (init or a subreaper),
+    so a short poll is enough once *our* child (the tree root) is reaped.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not any(_alive(pid) for pid in pids):
+            return True
+        time.sleep(0.05)
+    return not any(_alive(pid) for pid in pids)
+
+
+def _escalate(
+    proc: ManagedProcess, *, identities: dict[int, ProcessIdentity] | None = None
+) -> None:
+    """Use the same owned-tree cleanup on every capture and helper exit path."""
+    host().process_group(proc, identities).cleanup()
+
+
+# -- warm targets: launch once, profile repeatedly, stop when done -------------
+#
+# A "target" is a process this server process launches and keeps running
+# indefinitely (unlike a capture's target, which run_capture starts, loads,
+# and stops within one bounded call). It exists for profiling mechanisms
+# that can take more than one measurement window against the same
+# already-running process instead of needing a fresh process per capture
+# (on a ROCm build without rocprofiler-sdk default-attachment support,
+# rocprofv3 --attach cannot reuse a target at all, but the torch plugin's
+# own signal-window injection can, once armed for repeated windows). This
+# module only owns generic process lifecycle
+# (launch, ready-wait, stop/escalate, registry); which env vars "arm" a
+# target for a specific profiling mechanism is entirely up to the caller
+# (see resources/profilers/torch/capture_ops.py's start_target wrapper).
+
+_TARGETS_LOCK = threading.Lock()
+
+
+@dataclass
+class _LiveTarget:
+    target_id: str
+    command: str
+    cwd: str | None
+    out_dir: Path
+    started_at: float
+    stop_signal: str
+    grace_s: float
+    proc: ManagedProcess
+    group: CaptureProcessGroup
+    ready_achieved: bool | None
+
+
+_targets: dict[str, _LiveTarget] = {}
+
+
+@dataclass(frozen=True)
+class TargetInfo:
+    """A snapshot of one live (or just-stopped) target, safe to hand to a caller."""
+
+    target_id: str
+    command: str
+    pid: int
+    out_dir: Path
+    started_at: float
+    ready_achieved: bool | None
+    alive: bool
+
+
+def start_target(  # noqa: PLR0913  # LW-910012; this function's parameters mirror an external tool's CLI/API surface and are not grouped further
+    command: str,
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    setup_command: str | None = None,
+    ready_command: str | Callable[[Path], str] | None = None,
+    ready_timeout_s: float = 60.0,
+    ready_interval_s: float = 1.0,
+    stop_signal: str = "SIGINT",
+    grace_s: float = 10.0,
+    timeout_s: float = 300.0,
+    arm: dict[str, str] | Callable[[Path], dict[str, str]] | None = None,
+) -> str:
+    """Launch *command* as a warm target and keep it running until ``stop_target``.
+
+    Unlike ``run_capture``, this never stops the target itself: it starts
+    it (optionally after ``setup_command`` runs to completion, unprofiled,
+    exactly like a capture's setup phase), optionally waits for
+    ``ready_command`` to succeed, registers it in this process's target
+    registry, and returns its ``target_id``. The target keeps running,
+    process-group-owned by this server process, until ``stop_target`` is
+    called or this process exits (see ``stop_all_targets``).
+
+    *arm* supplies the env additions that make the target profileable by
+    whatever mechanism the caller has in mind (this module has no opinion):
+    either a plain ``dict[str, str]`` merged over *env*, or a callable
+    invoked with the target's own allocated output directory once known
+    (needed when the arming env references a path under it, e.g. a
+    control-file directory -- see ``capture_ops.start_target``). *arm*
+    always wins over *env* on key conflicts. *ready_command* accepts the
+    same callable form, for the same reason (e.g. checking for a marker
+    file under the target's own output directory that a profiling
+    mechanism writes once it is actually ready to receive signals/requests
+    -- see ``capture_ops.start_target``'s default).
+
+    ``timeout_s`` bounds ``setup_command`` plus the ready-wait only (there
+    is no "overall" timeout for a target that is meant to keep running).
+    Raises ``RuntimeError`` if ``setup_command`` fails, or the target never
+    becomes ready, in which case nothing is left running (the target is
+    escalated/stopped before raising) and nothing is registered.
+    """
+    target_id, out_dir = new_capture("target")
+    arm_env = arm(out_dir) if callable(arm) else dict(arm or {})
+    effective_env = {**(env or {}), **arm_env}
+    resolved_ready_command = ready_command(out_dir) if callable(ready_command) else ready_command
+    lifecycle = Lifecycle(
+        command=command,
+        cwd=cwd,
+        env=effective_env,
+        ready_command=resolved_ready_command,
+        ready_timeout_s=ready_timeout_s,
+        ready_interval_s=ready_interval_s,
+        load_command=None,
+        stop_signal=stop_signal,
+        grace_s=grace_s,
+        timeout_s=max(timeout_s, 0.01),
+        setup_command=setup_command,
+    )
+    start = host().monotonic()
+
+    if setup_command is not None:
+        setup_script = _write_script(out_dir, _SETUP_SCRIPT_NAME, setup_command)
+        setup_rc, setup_tail, setup_timed_out, _cancelled = _run_setup(
+            lifecycle, _remaining(start, lifecycle.timeout_s), out_dir, setup_script, None
+        )
+        if setup_timed_out or setup_rc != 0:
+            raise RuntimeError(  # noqa: TRY003  # LW-910013; this is a boundary error that deliberately embeds the offending value for the operator to act on
+                f"target setup_command failed for {target_id} "
+                f"(rc={setup_rc}, timed_out={setup_timed_out}): {setup_tail[-500:]}"
+            )
+
+    # A warm target's whole point is to receive non-terminating signals
+    # (e.g. the torch injection's SIGUSR1/SIGUSR2 window triggers, relayed
+    # via signal_target's process-group broadcast) while staying alive
+    # between them. Bash's *default* disposition for SIGUSR1/SIGUSR2 is to
+    # terminate the process; without this trap, the wrapping shell -- not
+    # just the profiled process -- would die on the very first such signal,
+    # even though the profiled child handles it and survives (orphaned,
+    # with no wrapper left for stop_target/signal_target to resolve a pgid
+    # from). Ignoring them at the shell level lets a descendant that
+    # installs its own real handler (signal.signal() always overrides an
+    # inherited disposition) still react normally, while bash itself never
+    # dies from a signal it was never meant to be a target of.
+    target_script = _write_script(
+        out_dir, _TARGET_SCRIPT_NAME, f"trap '' SIGUSR1 SIGUSR2\n{command}"
+    )
+    target_log_path = out_dir / _TARGET_LOG_NAME
+    proc = _start_process(lifecycle, [], target_log_path, target_script)
+    group = host().process_group(proc)
+
+    ready_achieved: bool | None = None
+    if resolved_ready_command is not None:
+        ready_script = _write_script(out_dir, _READY_SCRIPT_NAME, resolved_ready_command)
+        ready_achieved, exited_early = _poll_ready(proc, lifecycle, start, ready_script, None)
+        if exited_early or not ready_achieved:
+            group.cleanup()
+            raise RuntimeError(  # noqa: TRY003  # LW-910014; this is a boundary error that deliberately embeds the offending value for the operator to act on
+                f"target {target_id} failed to become ready within ready_timeout_s="
+                f"{ready_timeout_s}: {_tail(target_log_path)[-500:]}"
+            )
+
+    with _TARGETS_LOCK:
+        _targets[target_id] = _LiveTarget(
+            target_id=target_id,
+            command=command,
+            cwd=cwd,
+            out_dir=out_dir,
+            started_at=host().wall_time(),
+            stop_signal=stop_signal,
+            grace_s=grace_s,
+            proc=proc,
+            group=group,
+            ready_achieved=ready_achieved,
+        )
+    return target_id
+
+
+def _target_info(target: _LiveTarget) -> TargetInfo:
+    return TargetInfo(
+        target_id=target.target_id,
+        command=target.command,
+        pid=target.proc.pid,
+        out_dir=target.out_dir,
+        started_at=target.started_at,
+        ready_achieved=target.ready_achieved,
+        alive=target.group.poll() is None,
+    )
+
+
+def get_target(target_id: str) -> TargetInfo:
+    """The current state of one registered target. Raises ``KeyError`` if unknown."""
+    with _TARGETS_LOCK:
+        target = _targets.get(target_id)
+    if target is None:
+        raise KeyError(f"unknown target: {target_id!r}")  # noqa: TRY003  # LW-910015; this is a boundary error that deliberately embeds the offending value for the operator to act on
+    return _target_info(target)
+
+
+def list_targets() -> list[TargetInfo]:
+    """Every target currently registered in this process (running or not yet reaped)."""
+    with _TARGETS_LOCK:
+        snapshot = list(_targets.values())
+    return [_target_info(target) for target in snapshot]
+
+
+def signal_target(target_id: str, sig_name: str) -> None:
+    """Send *sig_name* (e.g. ``"SIGUSR1"``) to a target's whole process group.
+
+    Raises ``KeyError`` if *target_id* is not a currently registered target.
+    """
+    with _TARGETS_LOCK:
+        target = _targets.get(target_id)
+    if target is None:
+        raise KeyError(f"unknown target: {target_id!r}")  # noqa: TRY003  # LW-910016; this is a boundary error that deliberately embeds the offending value for the operator to act on
+    target.group.stop(sig_name)
+
+
+def _stop_and_wait_grace_target(target: _LiveTarget) -> None:
+    stop_capture(
+        target.group,
+        Lifecycle(command=target.command, stop_signal=target.stop_signal, grace_s=target.grace_s),
+    )
+
+
+def stop_target(target_id: str) -> None:
+    """Stop a warm target: ``stop_signal`` -> wait ``grace_s`` -> escalate.
+
+    Always leaves no process running for this target, mirroring
+    ``run_capture``'s cleanup guarantee. Raises ``KeyError`` if *target_id*
+    is not a currently registered target (including one already stopped).
+    """
+    with _TARGETS_LOCK:
+        target = _targets.pop(target_id, None)
+    if target is None:
+        raise KeyError(f"unknown or already-stopped target: {target_id!r}")  # noqa: TRY003  # LW-910017; this is a boundary error that deliberately embeds the offending value for the operator to act on
+    _stop_and_wait_grace_target(target)
+
+
+def stop_all_targets() -> None:
+    """Stop every target registered in this process. Idempotent; safe at shutdown.
+
+    Intended to be registered with ``atexit`` by each profiler ``server.py``
+    so a warm target is never left running past the MCP server process's
+    own lifetime.
+    """
+    with _TARGETS_LOCK:
+        targets = list(_targets.values())
+        _targets.clear()
+    for target in targets:
+        _stop_and_wait_grace_target(target)
+
+
+def format_targets(infos: list[TargetInfo]) -> str:
+    """A prompt-sized table of ``list_targets()``'s output."""
+    if not infos:
+        return f"(no targets running in this server process; store: {profiles_root()})"
+    lines = [f"{'target_id':<32} {'pid':<8} {'alive':<6} command"]
+    for info in infos:
+        command = (
+            info.command
+            if len(info.command) <= _TARGET_COMMAND_HEAD_MAX_CHARS
+            else info.command[: _TARGET_COMMAND_HEAD_MAX_CHARS - 1] + "..."
+        )
+        lines.append(f"{info.target_id:<32} {info.pid:<8} {info.alive!s:<6} {command}")
+    return "\n".join(lines)
+
+
+# -- manifest -------------------------------------------------------------------
+
+
+def _redact_lifecycle(lifecycle: Lifecycle) -> dict[str, Any]:
+    payload = dataclasses.asdict(lifecycle)
+    payload["env_keys"] = sorted(lifecycle.env)
+    del payload["env"]
+    return payload
+
+
+def _git_head(cwd: str | None) -> str | None:
+    try:
+        result = subprocess.run(  # noqa: S603  # LW-910018; the subprocess argv is a fixed sequence built by this code, not attacker-controlled shell input
+            ["git", "-C", cwd or ".", "rev-parse", "HEAD"],  # noqa: S607  # LW-910019; the executable is resolved from the fixed rocprof/torch toolchain name, not a user-controlled path
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _output_files(out_dir: Path) -> list[str]:
+    return sorted(
+        str(p.relative_to(out_dir))
+        for p in out_dir.rglob("*")
+        if p.is_file() and p.name != _MANIFEST_NAME
+    )
+
+
+def _build_manifest(ctx: _ManifestContext) -> dict[str, Any]:
+    outcome = ctx.outcome
+    return {
+        "capture_id": ctx.capture_id,
+        "kind": ctx.kind,
+        "profiler_command": ctx.argv,
+        "lifecycle": _redact_lifecycle(ctx.lifecycle),
+        "cwd": ctx.lifecycle.cwd,
+        "hostname": socket.gethostname(),
+        "timings": ctx.timings,
+        "status": outcome.status.value,
+        "setup_returncode": outcome.setup_returncode,
+        "target_returncode": outcome.target_returncode,
+        "load_returncode": outcome.load_returncode,
+        "ready_achieved": outcome.ready_achieved,
+        "escalated": outcome.escalated,
+        "meta": ctx.meta,
+        "git_head": _git_head(ctx.lifecycle.cwd),
+        "output_files": _output_files(ctx.out_dir),
+        "scripts": ctx.scripts,
+        "load_window": outcome.load_window,
+        # Bracket the whole capture (not just the load phase) so an
+        # analyzer can also reconstruct a "startup" window
+        # (capture_start .. load_window["start"], i.e. everything before
+        # load_command ran: server boot, weight load, warmup, KV init) and
+        # sanity-check clock alignment (do the profiled tool's own trace
+        # timestamps fall inside this same span, same clock domain) before
+        # trusting a "load"/"startup" slice at all.
+        "capture_start": ctx.capture_start,
+        "capture_end": ctx.capture_end,
+    }
+
+
+# -- entry point ------------------------------------------------------------
+
+
+def _finish(  # noqa: PLR0913  # LW-910020; this function's parameters mirror an external tool's CLI/API surface and are not grouped further
+    *,
+    capture_id: str,
+    kind: str,
+    argv: list[str],
+    lifecycle: Lifecycle,
+    out_dir: Path,
+    meta: dict[str, Any],
+    outcome: _Outcome,
+    timings: dict[str, float],
+    scripts: dict[str, str],
+    capture_start: dict[str, int],
+    start: float,
+    target_log_path: Path,
+) -> CaptureResult:
+    """Finalize timings, write the manifest, and build the returned ``CaptureResult``.
+
+    Shared by both ``run_capture`` return paths: a normal (or timed-out/
+    cancelled) run of the target, and the early setup-failure path that
+    never starts the target at all (``target_log_path`` then names a file
+    that was never created; ``_tail`` handles that by returning ``""``).
+    """
+    timings["finished_at"] = host().wall_time()
+    timings["duration_s"] = host().monotonic() - start
+    capture_end = _clock_stamps()
+
+    manifest = _build_manifest(
+        _ManifestContext(
+            capture_id=capture_id,
+            kind=kind,
+            argv=argv,
+            lifecycle=lifecycle,
+            out_dir=out_dir,
+            meta=meta,
+            outcome=outcome,
+            timings=timings,
+            scripts=scripts,
+            capture_start=capture_start,
+            capture_end=capture_end,
+        )
+    )
+    manifest_path = write_manifest(out_dir, manifest)
+
+    return CaptureResult(
+        capture_id=capture_id,
+        kind=kind,
+        status=outcome.status,
+        out_dir=out_dir,
+        target_returncode=outcome.target_returncode,
+        load_returncode=outcome.load_returncode,
+        ready_achieved=outcome.ready_achieved,
+        escalated=outcome.escalated,
+        timings=timings,
+        target_log_tail=_tail(target_log_path),
+        load_log_tail=outcome.load_tail,
+        setup_returncode=outcome.setup_returncode,
+        setup_log_tail=outcome.setup_tail,
+        manifest_path=manifest_path,
+    )
+
+
+def run_capture(  # noqa: PLR0913  # LW-910021; this function's parameters mirror an external tool's CLI/API surface and are not grouped further
+    profiler_prefix: list[str],
+    lifecycle: Lifecycle,
+    *,
+    kind: str,
+    out_dir: Path,
+    meta: dict[str, Any],
+    cancel_event: threading.Event | None = None,
+    completion: TraceCompletion | None = None,
+    group_factory: Callable[[ManagedProcess], CaptureProcessGroup] | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> CaptureResult:
+    """Run one profiler-wrapped capture through its full lifecycle.
+
+    Always leaves the process tree clean: the target (and, when
+    ``load_command`` is set, the load generator) is either waited for to a
+    natural exit or escalated through SIGTERM/SIGKILL across its whole
+    descendant tree, never left running past this call. Writes
+    ``manifest.json`` into *out_dir* before returning.
+
+    ``setup_command``, when the lifecycle has one, runs first, to
+    completion, as a plain ``bash <script>`` with no ``profiler_prefix`` at
+    all, bounded by the overall ``timeout_s`` budget. A nonzero exit,
+    timeout, or cancellation during setup skips starting the target
+    entirely and returns with ``status`` ``setup_failed``/``timed_out``/
+    ``cancelled`` (see ``Lifecycle.setup_command``'s docstring for why this
+    step exists and must never run under the profiler).
+
+    ``command`` (and ``ready_command``/``load_command``/``setup_command``,
+    when given) are written to script files under *out_dir* rather than
+    passed as inline ``bash -lc <text>`` argv -- see ``_write_script``'s
+    docstring -- and run as ``profiler_prefix + ["bash", <script path>]``
+    (``setup_command``/``load_command`` are never given ``profiler_prefix``:
+    both run as a plain ``bash <script>``). Their paths (relative to
+    *out_dir*) are recorded in the manifest under ``"scripts"``.
+
+    *cancel_event*, when given, is polled in small increments (see
+    ``_POLL_CHUNK_S``) throughout every wait below; setting it from another
+    thread stops whichever process is currently running (escalating through
+    the same SIGTERM/SIGKILL path a timeout uses) and returns a result with
+    ``status=CaptureStatus.CANCELLED`` instead of blocking to completion.
+    This is what lets an MCP tool wrapper honor a client-initiated
+    cancellation without leaving a GPU process running (see
+    ``resources/profilers/_common/mcp_async.py``).
+
+    *group_factory* and *monotonic* are the stop-phase seams: the factory
+    builds the owned process group from the started target, and *monotonic*
+    is the clock the stop grace deadline is measured on. Both default to the
+    real process tree and clock; tests inject scripted ones so the grace
+    outcome does not depend on host scheduling.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    capture_id = out_dir.name
+
+    scripts: dict[str, str] = {}
+    setup_script: Path | None = None
+    if lifecycle.setup_command is not None:
+        setup_script = _write_script(out_dir, _SETUP_SCRIPT_NAME, lifecycle.setup_command)
+        scripts["setup"] = setup_script.name
+
+    target_script = _write_script(out_dir, _TARGET_SCRIPT_NAME, lifecycle.command)
+    scripts["target"] = target_script.name
+    ready_script: Path | None = None
+    if lifecycle.ready_command is not None:
+        ready_script = _write_script(out_dir, _READY_SCRIPT_NAME, lifecycle.ready_command)
+        scripts["ready"] = ready_script.name
+    load_script: Path | None = None
+    if lifecycle.load_command is not None:
+        load_script = _write_script(out_dir, _LOAD_SCRIPT_NAME, lifecycle.load_command)
+        scripts["load"] = load_script.name
+
+    argv = [*profiler_prefix, "bash", str(target_script)]
+    target_log_path = out_dir / _TARGET_LOG_NAME
+
+    start = host().monotonic()
+    capture_start = _clock_stamps()
+    timings: dict[str, float] = {"started_at": host().wall_time()}
+
+    finish_kwargs: dict[str, Any] = {
+        "capture_id": capture_id,
+        "kind": kind,
+        "argv": argv,
+        "lifecycle": lifecycle,
+        "out_dir": out_dir,
+        "meta": meta,
+        "timings": timings,
+        "scripts": scripts,
+        "capture_start": capture_start,
+        "start": start,
+        "target_log_path": target_log_path,
+    }
+
+    setup_returncode: int | None = None
+    setup_tail: str | None = None
+    if setup_script is not None:
+        setup_returncode, setup_tail, setup_timed_out, setup_cancelled = _run_setup(
+            lifecycle, _remaining(start, lifecycle.timeout_s), out_dir, setup_script, cancel_event
+        )
+        if setup_cancelled or setup_timed_out or setup_returncode != 0:
+            status = (
+                CaptureStatus.CANCELLED
+                if setup_cancelled
+                else CaptureStatus.TIMED_OUT
+                if setup_timed_out
+                else CaptureStatus.SETUP_FAILED
+            )
+            outcome = _Outcome(
+                status,
+                target_returncode=None,
+                setup_returncode=setup_returncode,
+                setup_tail=setup_tail,
+            )
+            return _finish(outcome=outcome, **finish_kwargs)
+
+    proc = _start_process(lifecycle, profiler_prefix, target_log_path, target_script)
+    group = (group_factory or host().process_group)(proc)
+
+    if lifecycle.load_command is None:
+        outcome = _run_no_load(proc, lifecycle, start, cancel_event)
+    else:
+        assert ready_script is not None  # noqa: S101  # LW-910022; test code uses assert as the standard pytest assertion mechanism
+        assert load_script is not None  # noqa: S101  # LW-910023; test code uses assert as the standard pytest assertion mechanism
+        outcome = _run_with_load(
+            proc,
+            lifecycle,
+            start,
+            out_dir,
+            ready_script,
+            load_script,
+            cancel_event,
+            completion,
+            group,
+            monotonic,
+        )
+    outcome.setup_returncode = setup_returncode
+    outcome.setup_tail = setup_tail
+
+    return _finish(outcome=outcome, **finish_kwargs)
+
+
+WITHHELD_TOOLS_ENV = "VIBESYS_PROFILER_WITHHELD_TOOLS"
+"""Comma-separated tool names the run does not offer; the product sets it in the server env."""
+
+
+def withheld_tools_from_env() -> frozenset[str]:
+    """Tools this server must not register, as named by the run (``$VIBESYS_PROFILER_WITHHELD_TOOLS``)."""
+    raw = os.environ.get(WITHHELD_TOOLS_ENV, "")
+    return frozenset(name for name in (part.strip() for part in raw.split(",")) if name)

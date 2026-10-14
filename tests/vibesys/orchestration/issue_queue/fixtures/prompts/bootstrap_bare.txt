@@ -1,0 +1,21 @@
+## Background
+
+This is the task the run was given. Inspect the reference at
+`.` and the checker rather than substituting a generic
+solution. Keep all candidate work in this workspace.
+
+Objective: Build the candidate.
+
+
+
+## Acceptance criteria
+
+- Satisfy the objective above, as the checker and the configured commands measure it.
+- Meet every interface and contract the reference and the checker require.
+- Add tests that cover the behavior the objective asks for.
+- Run the configured checks and leave a reproducible candidate.
+
+## Commands
+
+Accuracy command: <not configured>
+Benchmark command: <not configured>

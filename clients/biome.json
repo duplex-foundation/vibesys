@@ -1,0 +1,147 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.3/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "root": "..",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "includes": [
+      ".dependency-cruiser.mjs",
+      "**/*.ts",
+      "**/*.tsx",
+      "**/*.cts",
+      "**/*.mts",
+      "tools/scripts/**/*.mjs",
+      "!**/dist",
+      "!libs/contracts/src/generated"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "plugins": ["./tools/lint-rules/no-raw-html-sinks.grit"],
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "complexity": {
+        "useLiteralKeys": "off",
+        "noExcessiveCognitiveComplexity": {
+          "level": "error",
+          "options": { "maxAllowedComplexity": 15 }
+        },
+        "noExcessiveLinesPerFunction": {
+          "level": "error",
+          "options": { "maxLines": 80, "skipBlankLines": true }
+        },
+        "useMaxParams": {
+          "level": "error",
+          "options": { "max": 6 }
+        }
+      },
+      "security": {
+        "noDangerouslySetInnerHtml": "error",
+        "noDangerouslySetInnerHtmlWithChildren": "error",
+        "noGlobalEval": "error"
+      },
+      "style": {
+        "noExcessiveLinesPerFile": {
+          "level": "error",
+          "options": { "maxLines": 2000 }
+        }
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["**/ui/**/*.ts", "**/ui/**/*.tsx", "!**/*.test.ts", "!**/*.test.tsx"],
+      "plugins": [
+        "./tools/lint-rules/ui-no-io-calls.grit",
+        "./tools/lint-rules/ui-no-effect-hooks.grit",
+        "./tools/lint-rules/ui-no-io-imports.grit"
+      ]
+    },
+    {
+      "includes": [
+        "apps/web/src/**/*.ts",
+        "apps/web/src/**/*.tsx",
+        "features/*/src/**/*.ts",
+        "features/*/src/**/*.tsx",
+        "!apps/web/src/platform/backend.ts",
+        "!**/*.test.ts",
+        "!**/*.test.tsx"
+      ],
+      "plugins": ["./tools/lint-rules/web-fetch-only-in-backend.grit"]
+    },
+    {
+      "includes": [
+        "**/ui/**/*.ts",
+        "**/ui/**/*.tsx",
+        "!**/*.test.ts",
+        "!**/*.test.tsx",
+        "!tui/src/ui/activity-bar.ts",
+        "!tui/src/ui/agent-map.ts",
+        "!tui/src/ui/chat-composer.ts",
+        "!tui/src/ui/experiment-log.ts",
+        "!tui/src/ui/round-rail.ts"
+      ],
+      "plugins": ["./tools/lint-rules/ui-no-timers.grit"]
+    },
+    {
+      "includes": [
+        "features/*/src/**/state/**/*.ts",
+        "features/*/src/**/state/**/*.tsx",
+        "features/*/src/**/effects/**/*.ts",
+        "features/*/src/**/effects/**/*.tsx",
+        "libs/connection/src/state/**/*.ts",
+        "!**/*.test.ts",
+        "!**/*.test.tsx",
+        "!features/gateway-connect/src/renderer/effects/gateway-connect.ts",
+        "!features/hosts/src/renderer/effects/stores.ts"
+      ],
+      "plugins": ["./tools/lint-rules/features-no-hand-rolled-control.grit"]
+    },
+    {
+      "includes": [
+        "features/run-control/src/**/*.ts",
+        "features/run-control/src/**/*.tsx",
+        "libs/run-session/src/**/*.ts",
+        "!libs/run-session/src/run.ts",
+        "libs/connection/src/**/*.ts",
+        "!**/*.test.ts",
+        "!**/*.test.tsx"
+      ],
+      "plugins": ["./tools/lint-rules/control-state-no-store-kernel.grit"]
+    },
+    {
+      "includes": ["**/*.test.ts", "**/*.test.tsx"],
+      "linter": {
+        "rules": {
+          "complexity": {
+            "noExcessiveLinesPerFunction": "off"
+          },
+          "style": {
+            "noExcessiveLinesPerFile": {
+              "level": "error",
+              "options": { "maxLines": 10000 }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "javascript": {
+    "formatter": {
+      "arrowParentheses": "asNeeded",
+      "bracketSpacing": false,
+      "quoteStyle": "single",
+      "semicolons": "always",
+      "trailingCommas": "all"
+    }
+  }
+}

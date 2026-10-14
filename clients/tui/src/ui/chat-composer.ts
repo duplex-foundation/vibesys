@@ -7,11 +7,11 @@ import {
 } from '@opentui/core';
 import {suggestSlashCommands} from '../commands.js';
 import type {ChatMenuRow, SessionState} from '../session-model.js';
+import type {Theme} from '../theme.js';
 import {SPINNER_FRAMES, SPINNER_INTERVAL_MS} from './activity-bar.js';
 import {applyPaneFocus, paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
 import {elapsedLabel} from './previews.js';
 import {SuggestionMenu} from './suggestion-menu.js';
-import type {Theme} from './theme.js';
 
 const MIN_EDITOR_ROWS = 1;
 const MAX_EDITOR_ROWS = 6;
@@ -172,7 +172,7 @@ export class ChatComposerView {
       zIndex: 5,
       border: true,
       // Square with an outer fill, the overlay exception to the fill rule
-      // (tui-conventions.md): this menu floats over the composer, so the fill
+      // (tui/conventions.md): this menu floats over the composer, so the fill
       // has to reach the border ring or the text under it shows through there,
       // and a fill that reaches the ring can only be honest under a square
       // corner.

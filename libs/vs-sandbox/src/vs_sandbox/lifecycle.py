@@ -15,14 +15,110 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from deepagents.backends.protocol import SandboxBackendProtocol
+    from vs_sandbox.execution import CommandResult, CommandRunner
+
+
+def start_sandbox(sandbox: CommandRunner) -> None:
+    """Start a sandbox that owns an execution environment.
+
+    The base :class:`CommandRunner` contract intentionally has no lifecycle because
+    host sandboxes have nothing to start. Callers that requested a container
+    sandbox use this adapter and receive an immediate, named failure if the
+    backend returned a sandbox without the required capability.
+    """
+    start = getattr(sandbox, "start", None)
+    if not callable(start):
+        message = f"{type(sandbox).__name__} has no execution environment to start"
+        raise TypeError(message)
+    start()
+
+
+def execute_as_root(
+    sandbox: CommandRunner,
+    command: str,
+    *,
+    timeout: int | None = None,
+) -> CommandResult:
+    """Run *command* as root inside a started container sandbox.
+
+    Like :func:`start_sandbox`, this adapts a capability the base
+    :class:`CommandRunner` contract leaves out. A sandbox that cannot run
+    commands as root (a host sandbox, where "root" would mean the operator's
+    machine) fails immediately and by name instead of running the command as
+    the wrong user.
+    """
+    run = getattr(sandbox, "execute_as_root", None)
+    if not callable(run):
+        message = f"{type(sandbox).__name__} cannot run commands as root"
+        raise TypeError(message)
+    return run(command, timeout=timeout)
+
+
+def stop_sandbox(sandbox: CommandRunner) -> None:
+    """Stop a sandbox-owned execution environment when one exists."""
+    stop = getattr(sandbox, "stop", None)
+    if callable(stop):
+        stop()
+
+
+class SandboxSession[ViewT]:
+    """Context-managed ownership of one sandbox and its caller-defined view.
+
+    ``borrowed`` wraps a sandbox whose lifecycle is owned elsewhere. ``start``
+    starts a lifecycle-capable sandbox and makes this session responsible for
+    stopping it. Cleanup is idempotent in both cases.
+
+    The view is opaque to this library. It lets an application pair its own
+    immutable description with the owned sandbox without moving application
+    policy into ``vs_sandbox``.
+    """
+
+    def __init__(
+        self,
+        sandbox: CommandRunner,
+        view: ViewT,
+        *,
+        stop_on_close: bool,
+    ) -> None:
+        """Record ownership selected by one of the named constructors."""
+        self.sandbox = sandbox
+        self.view = view
+        self._stop_on_close = stop_on_close
+        self._closed = False
+
+    @classmethod
+    def borrowed(cls, sandbox: CommandRunner, view: ViewT) -> SandboxSession[ViewT]:
+        """Pair a view with a sandbox whose lifecycle the caller still owns."""
+        return cls(sandbox, view, stop_on_close=False)
+
+    @classmethod
+    def start(cls, sandbox: CommandRunner, view: ViewT) -> SandboxSession[ViewT]:
+        """Start a sandbox and own its cleanup for the session lifetime."""
+        start_sandbox(sandbox)
+        return cls(sandbox, view, stop_on_close=True)
+
+    def __enter__(self) -> SandboxSession[ViewT]:
+        """Return this opened session."""
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        """Release the sandbox on every context-manager exit path."""
+        self.close()
+
+    def close(self) -> None:
+        """Stop an owned sandbox at most once."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._stop_on_close:
+            stop_sandbox(self.sandbox)
 
 
 @dataclass(frozen=True)
 class BeforeReadyContext:
     """Resources available while a sandbox is transitioning to ready."""
 
-    sandbox: SandboxBackendProtocol
+    sandbox: CommandRunner
 
 
 class SandboxLifecycleHooks:
@@ -60,7 +156,7 @@ class SandboxLifecycle:
         """Return the hooks providers in their deterministic execution order."""
         return self._hooks
 
-    def before_ready(self, sandbox: SandboxBackendProtocol) -> None:
+    def before_ready(self, sandbox: CommandRunner) -> None:
         """Run every provider's hook, stopping at the first failure."""
         context = BeforeReadyContext(sandbox=sandbox)
         for provider in self._hooks:

@@ -42,7 +42,6 @@
     "chat_thread": {
       "thread_id": "mock-thread",
       "title": "mock",
-      "driver": "mock",
       "provider": "mock",
       "model": "mock"
     }
@@ -63,6 +62,12 @@
     "ack": {
       "action": "resume",
       "status": "consumed"
+    }
+  },
+  "command.stop": {
+    "ack": {
+      "action": "stop",
+      "status": "pending"
     }
   },
   "command.steer": {

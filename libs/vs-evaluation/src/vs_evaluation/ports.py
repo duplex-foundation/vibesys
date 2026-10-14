@@ -1,0 +1,187 @@
+"""Substitutable effects required by the evaluation coordinator."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from types import TracebackType
+
+    from vs_evaluation.models import (
+        AvailabilitySnapshot,
+        EvaluationLifecycleEvent,
+        EvaluationRequest,
+        ExecutorObservation,
+        ExecutorPoll,
+        ResourceRequirements,
+        StoredEvaluation,
+    )
+
+
+class ExecutorSubmissionError(RuntimeError):
+    """Submission response was unavailable; acceptance may be ambiguous."""
+
+    def __init__(self, cause: Exception) -> None:
+        """Retain the underlying transport or executor error."""
+        super().__init__(str(cause))
+        self.__cause__ = cause
+
+
+class ExecutorCancellationUnknownError(RuntimeError):
+    """No provider identity can prove termination of a possibly dispatched operation."""
+
+    def __init__(self, handle_id: str) -> None:
+        """Retain the stable logical identity that still needs reconciliation."""
+        super().__init__(
+            f"evaluation {handle_id!r} has unknown external identity; cancellation is unresolved"
+        )
+        self.handle_id = handle_id
+
+
+class ExecutorCancellationUnconfirmedError(RuntimeError):
+    """Cancellation was requested for a known external job that is not yet seen ending.
+
+    The job identity is known, so this is not an unknown identity: the executor
+    sent its cancel request and its bounded confirmation wait ended while the
+    provider still reported the job active (for example while it tears down).
+    The caller treats the job as still owned and reconciles later, by cancelling
+    again or inspecting until a terminal state appears.
+    """
+
+    def __init__(self, handle_id: str, job_id: str) -> None:
+        """Retain the logical handle and the provider job that is still active."""
+        super().__init__(
+            f"cancellation of evaluation {handle_id!r} was requested for job {job_id!r}, "
+            "but the job was not observed to end within the confirmation wait"
+        )
+        self.handle_id = handle_id
+        self.job_id = job_id
+
+
+class ExecutorRejectedError(ValueError):
+    """The executor refused the request before accepting it; a retry cannot succeed.
+
+    Raise it for a request the executor can never run, such as an evidence
+    kind it does not produce. The coordinator records the handle as failed
+    with this reason instead of retrying the submission.
+    """
+
+
+class EvaluationEventSink(Protocol):
+    """Receive lifecycle facts after their authoritative store write."""
+
+    def __call__(self, event: EvaluationLifecycleEvent, /) -> None:
+        """Publish one fact; reconciliation may repeat a revision."""
+        ...
+
+
+class NullEvaluationEventSink:
+    """No-op sink used when no lifecycle observer is attached."""
+
+    def __call__(self, event: EvaluationLifecycleEvent, /) -> None:
+        """Discard one lifecycle fact."""
+        del event
+
+
+NULL_EVALUATION_EVENT_SINK = NullEvaluationEventSink()
+
+
+class DeadlineScope(Protocol):
+    """Cancelable async scope that reports whether its deadline expired."""
+
+    async def __aenter__(self) -> object:
+        """Begin the bounded operation."""
+        ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        """Translate deadline cancellation into TimeoutError."""
+        ...
+
+    def expired(self) -> bool:
+        """Distinguish deadline expiry from a provider TimeoutError."""
+        ...
+
+
+class EvaluationExecutor(Protocol):
+    """Idempotent execution port addressed by stable handle ID."""
+
+    async def availability(self, requirements: ResourceRequirements) -> AvailabilitySnapshot:
+        """Observe capacity for generic resource requirements."""
+        ...
+
+    async def submit(self, request: EvaluationRequest, *, handle_id: str) -> None:
+        """Ensure work for handle_id exists, idempotently across resume.
+
+        Wrap a submission failure in ExecutorSubmissionError. A raised error
+        does not imply that the executor rejected the request. Raise
+        ExecutorRejectedError only when the executor definitely did not
+        accept the request and never will.
+        """
+        ...
+
+    async def inspect_only(self, handle_id: str) -> ExecutorObservation | None:
+        """Observe once without dispatch, cancellation, or starting recovery tasks.
+
+        None means external execution state or terminal evidence is unknown.
+        """
+        ...
+
+    async def inspect(self, handle_id: str) -> ExecutorObservation | None:
+        """Return current execution state, or None when it was not submitted."""
+        ...
+
+    async def wait_for_change(self, handle_id: str, timeout_s: float) -> None:
+        """Wait at most timeout_s for state to change; may return spuriously.
+
+        Notifications must remain visible if a change lands between inspect
+        and this call. A sticky event or generation counter satisfies this
+        contract; clearing an event before checking it does not.
+        """
+        ...
+
+    async def cancel(self, handle_id: str) -> None:
+        """Request cancellation; inspect the resulting stage to confirm it."""
+        ...
+
+
+class PollingEvaluationExecutor(EvaluationExecutor, Protocol):
+    """Executor that can be inspected purely, without recovery tasks or workspaces."""
+
+    async def poll(self, handle_id: str) -> ExecutorPoll:
+        """Inspect handle_id once. Never submit, resume, cancel or create a workspace."""
+        ...
+
+
+class EvaluationStore(Protocol):
+    """Durable, atomic storage for idempotency keys and lifecycle records."""
+
+    async def claim(self, request: EvaluationRequest, *, handle_id: str) -> StoredEvaluation:
+        """Insert an accepted record or return the record already owning its key."""
+        ...
+
+    async def get(self, handle_id: str) -> StoredEvaluation | None:
+        """Read a record by stable handle ID."""
+        ...
+
+    async def get_by_key(self, key: str) -> StoredEvaluation | None:
+        """Read the record owning an idempotency key."""
+        ...
+
+    async def compare_and_set(
+        self, record: StoredEvaluation, *, expected_revision: int
+    ) -> StoredEvaluation:
+        """Replace a record iff its current revision matches expected_revision."""
+        ...
+
+    async def records(self) -> tuple[StoredEvaluation, ...]:
+        """Return every durable lifecycle record without refreshing execution."""
+        ...
+
+    async def nonterminal(self) -> tuple[StoredEvaluation, ...]:
+        """Return records that may need resume reconciliation."""
+        ...

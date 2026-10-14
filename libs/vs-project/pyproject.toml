@@ -1,22 +1,20 @@
 [build-system]
-requires = ["setuptools>=70.1"]
+requires = ["setuptools>=70.1", "wheel>=0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vs-project"
 version = "0.1.0"
-description = "Repository-native project layout and state for VibeSys"
-readme = "README.md"
+description = "The .vibesys filesystem contract for a repository-native project"
 requires-python = ">=3.12"
-license = "MIT"
-dependencies = [
-    "pydantic>=2",
-    "vs-loop-state",
-]
+dependencies = ["pydantic>=2", "pygit2>=1.18,<2", "vs-decode", "vs-sim"]
+
+[tool.uv.sources]
+vs-decode = { workspace = true }
+vs-sim = { workspace = true }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["vs_project*"]
 
 [tool.setuptools.package-data]
 vs_project = ["py.typed"]

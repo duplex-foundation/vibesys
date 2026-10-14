@@ -1,11 +1,11 @@
 import {BoxRenderable, type CliRenderer, TextRenderable} from '@opentui/core';
-import type {TodoItem} from '@vibesys/core-state';
+import type {TodoItem} from '@vibesys/run-state';
 import type {SessionController} from '../session-controller.js';
 import type {SessionState} from '../session-model.js';
 import {focusedPane, visibleTodos} from '../session-model.js';
+import type {Theme} from '../theme.js';
 import {paneBorderColor, paneBorderStyle, paneTitle} from './focus.js';
 import {displayWidth, truncateToWidth} from './text-width.js';
-import type {Theme} from './theme.js';
 
 const STATUS_MARKER: Record<string, string> = {
   pending: '○',
@@ -36,7 +36,7 @@ export function todoStripWidth(agentPaneWidth: number, terminalWidth: number): n
  * The rows the strip is about to occupy for a state, derived from the state
  * rather than read back from the laid-out box. `output.height` reflects the last
  * committed layout, so it lags one paint behind a render that just changed it;
- * a sibling sized in the same paint (the agents pane) needs the height the strip
+ * a sibling sized in the same paint (the rounds rail) needs the height the strip
  * is taking now, not the one it took last frame. `render` sets the box from this
  * function, so the two cannot disagree: no visible todos means no strip, a
  * collapsed strip is one summary row, and an expanded strip is its capped items
@@ -51,23 +51,23 @@ export function todoStripHeight(state: SessionState): number {
   return shown + (hidden > 0 ? 1 : 0) + 2;
 }
 
-export function todoMarker(status: string): string {
+function todoMarker(status: string): string {
   return STATUS_MARKER[status] ?? UNKNOWN_MARKER;
 }
 
-export function todoColor(status: string, theme: Theme): string {
+function todoColor(status: string, theme: Theme): string {
   if (status === 'pending') return theme.textSubtle;
   if (status === 'in_progress') return theme.warning;
   if (status === 'completed') return theme.success;
   return theme.textMuted;
 }
 
-export function todoTitle(todos: TodoItem[]): string {
+function todoTitle(todos: readonly TodoItem[]): string {
   const completed = todos.filter(todo => todo.status === 'completed').length;
   return `Todo ${completed}/${todos.length}`;
 }
 
-export function todoSummaryLine(todos: TodoItem[], maxWidth: number): string {
+export function todoSummaryLine(todos: readonly TodoItem[], maxWidth: number): string {
   const current =
     todos.find(todo => todo.status === 'in_progress') ??
     todos.find(todo => todo.status !== 'completed');
@@ -100,7 +100,7 @@ function truncate(line: string, maxWidth: number): string {
 export class TodoStripView {
   readonly output: BoxRenderable;
   #theme: Theme;
-  #renderedTodos: TodoItem[] | null = null;
+  #renderedTodos: readonly TodoItem[] | null = null;
   #renderedExpanded = false;
   #renderedFocused = false;
   #renderedSelection: number | null = null;
@@ -166,7 +166,7 @@ export class TodoStripView {
     else this.#renderCollapsed(todos);
   }
 
-  #renderCollapsed(todos: TodoItem[]): void {
+  #renderCollapsed(todos: readonly TodoItem[]): void {
     this.output.add(
       new TextRenderable(this.renderer, {
         content: todoSummaryLine(todos, this.#contentWidth(false)),
@@ -177,7 +177,7 @@ export class TodoStripView {
     );
   }
 
-  #renderExpanded(todos: TodoItem[], selected: number | null, focused: boolean): void {
+  #renderExpanded(todos: readonly TodoItem[], selected: number | null, focused: boolean): void {
     const shown = todos.slice(0, MAX_EXPANDED_ITEMS);
     const hidden = todos.length - shown.length;
     const height = shown.length + (hidden > 0 ? 1 : 0) + 2;

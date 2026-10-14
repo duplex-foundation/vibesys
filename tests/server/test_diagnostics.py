@@ -1,6 +1,11 @@
 """Tests for the server diagnostic contract."""
 
-from server.api.protocol import ProtocolErrorMessage, Response
+from datetime import UTC, datetime
+
+from pydantic import BaseModel, ConfigDict, ValidationError
+from tests.server.support import REQUEST_TIME
+
+from server.api.protocol import ProtocolErrorMessage, Response, SubscribeRequest
 from server.diagnostics import (
     Diagnostic,
     DiagnosticRetryability,
@@ -11,6 +16,12 @@ from server.diagnostics import (
     redact_diagnostic_text,
 )
 from server.events import EventType, RunEvent, make_event
+
+
+class _NestedValidationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[int]
 
 
 def test_diagnostic_round_trips_on_protocol_and_event_models() -> None:
@@ -26,7 +37,11 @@ def test_diagnostic_round_trips_on_protocol_and_event_models() -> None:
     )
 
     response = Response(
-        request_id="request", ok=False, error=diagnostic.summary, diagnostic=diagnostic
+        timestamp=REQUEST_TIME,
+        request_id="request",
+        ok=False,
+        error=diagnostic.summary,
+        diagnostic=diagnostic,
     )
     restored_response = Response.model_validate_json(response.model_dump_json())
     assert restored_response.diagnostic == diagnostic
@@ -39,13 +54,20 @@ def test_diagnostic_round_trips_on_protocol_and_event_models() -> None:
         == diagnostic
     )
 
-    event = make_event(EventType.RUN_FAILED, diagnostic.summary, diagnostic=diagnostic)
+    event = make_event(
+        EventType.RUN_FAILED,
+        diagnostic.summary,
+        diagnostic=diagnostic,
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+    )
     restored_event = RunEvent.model_validate_json(event.model_dump_json())
     assert restored_event.diagnostic == diagnostic
 
 
 def test_legacy_payloads_without_diagnostic_still_parse() -> None:
-    response = Response.model_validate_json('{"request_id":"request","ok":false,"error":"failed"}')
+    response = Response.model_validate_json(
+        '{"request_id":"request","timestamp":"2026-01-01T00:00:00Z","ok":false,"error":"failed"}'
+    )
     assert response.diagnostic is None
     event = RunEvent.model_validate_json(
         '{"protocol_version":1,"timestamp":"2026-01-01T00:00:00Z","type":"run_failed","text":"failed"}'
@@ -125,7 +147,9 @@ def test_diagnostic_redacts_explicit_text_on_construction_and_round_trip() -> No
 
 def test_failure_factories_keep_legacy_fields_consistent_and_sanitized() -> None:
     error = PermissionError("OPENAI_API_KEY=secret")
-    response = Response.from_exception("request", error, operation="Codex startup")
+    response = Response.from_exception(
+        "request", error, timestamp=REQUEST_TIME, operation="Codex startup"
+    )
     assert response.ok is False
     assert response.diagnostic is not None
     assert response.error == response.diagnostic.summary
@@ -139,6 +163,37 @@ def test_failure_factories_keep_legacy_fields_consistent_and_sanitized() -> None
     assert protocol_error.code == protocol_error.diagnostic.code == "stream_failed"
     assert protocol_error.message == protocol_error.diagnostic.summary
     assert "secret" not in protocol_error.model_dump_json()
+
+
+def test_response_validation_diagnostic_preserves_all_pydantic_location_segments() -> None:
+    """A capability probe reads locations, never Pydantic's rendered message."""
+    try:
+        SubscribeRequest.model_validate(
+            {
+                "type": "subscribe",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "after_sequence": "not-a-number",
+                "heartbeat_ms": 15_000,
+            }
+        )
+    except ValidationError as error:
+        response = Response.from_exception("request", error, timestamp=REQUEST_TIME)
+    else:  # pragma: no cover - the invalid payload above must stay invalid
+        raise AssertionError
+
+    assert response.diagnostic is not None
+    assert response.diagnostic.validation_paths == (("after_sequence",), ("heartbeat_ms",))
+
+
+def test_validation_diagnostic_preserves_string_and_integer_location_segments() -> None:
+    try:
+        _NestedValidationInput.model_validate({"items": ["not-an-integer"]})
+    except ValidationError as error:
+        diagnostic = exception_to_diagnostic(error, scope=DiagnosticScope.REQUEST)
+    else:  # pragma: no cover - the invalid payload above must stay invalid
+        raise AssertionError
+
+    assert diagnostic.validation_paths == (("items", 0),)
 
 
 def test_empty_exception_uses_exception_type_as_user_message() -> None:

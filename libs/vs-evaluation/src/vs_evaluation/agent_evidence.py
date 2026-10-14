@@ -1,0 +1,141 @@
+"""Semantic evidence contracts used at the agent evaluation boundary.
+
+These models identify optimization facts accepted from completed stages.
+Product orchestration supplies the adapter that validates and stores them;
+this module keeps the private agent protocol independent of that policy.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from enum import StrEnum
+from typing import Literal, Self
+
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
+
+from vs_evaluator_protocol.api import PartialMeasurement
+
+MAX_EVIDENCE_SUMMARY_CHARS = 16_384
+
+
+class EvidenceKind(StrEnum):
+    """Semantic facts available through the evaluation agent service."""
+
+    ACCURACY = "accuracy"
+    BENCHMARK = "benchmark"
+    PROFILE = "profile"
+
+
+class EvidenceOutcome(StrEnum):
+    """Typed conclusion carried by accepted evidence."""
+
+    PASSED = "passed"
+    FAILED = "failed"
+    OBSERVED = "observed"
+
+
+class EvidenceFailureKind(StrEnum):
+    """Whose fault a failed stage is: the candidate's workload, or the machinery running it.
+
+    A workload failure is a permanent fact about the candidate, so it is never retried.
+    An infrastructure failure (a node loss, a preemption, a job that never reported an
+    exit status) says nothing about the candidate, so the measurement may be repeated up
+    to the submission bound. An ambiguous failure (a process killed with no outcome
+    record, for example) may be the candidate's or the machinery's: it is measured once
+    more, and a second one is final and counts against the candidate.
+    """
+
+    WORKLOAD = "workload"
+    INFRASTRUCTURE = "infrastructure"
+    AMBIGUOUS = "ambiguous"
+
+
+class ContentDigest(BaseModel):
+    """A content address used for exact candidate and evaluator identity."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    algorithm: Literal["sha256"] = "sha256"
+    value: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @classmethod
+    def sha256(cls, content: bytes) -> Self:
+        """Create the canonical digest for *content*."""
+        return cls(value=hashlib.sha256(content).hexdigest())
+
+
+class EvidenceFingerprints(BaseModel):
+    """Immutable identity of one reusable evaluation fact."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate: ContentDigest
+    evaluator: ContentDigest
+    workload: ContentDigest
+    environment: ContentDigest
+
+
+class EvidenceMetric(BaseModel):
+    """One named finite measurement in an accepted result."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(min_length=1)
+    value: FiniteFloat
+    direction: Literal["max", "min"] | None = None
+    unit: str | None = None
+
+
+class ArtifactDigest(BaseModel):
+    """One content-addressed artifact relative to its evaluation root."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str = Field(min_length=1)
+    digest: ContentDigest
+
+
+class TrustedEvidence(BaseModel):
+    """A stage result already accepted by the host's trust policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evidence_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evaluation_id: str = Field(min_length=1)
+    stage_name: str = Field(min_length=1)
+    result_protocol: Literal[1] = 1
+    kind: EvidenceKind
+    fingerprints: EvidenceFingerprints
+    trusted_inputs: ContentDigest
+    outcome: EvidenceOutcome
+    semantic_summary: str | None = Field(default=None, max_length=MAX_EVIDENCE_SUMMARY_CHARS)
+    metrics: tuple[EvidenceMetric, ...] = ()
+    # What a failed stage measured before it stopped, as its evaluator
+    # reported it through the evaluator result protocol; never inferred.
+    partial_measurement: PartialMeasurement | None = None
+    # Set by the executor that ran the stage, only on failed evidence. Absent on
+    # evidence recorded before failures were classified, which proves neither kind.
+    failure_kind: EvidenceFailureKind | None = None
+    artifacts: tuple[ArtifactDigest, ...] = ()
+    accepted_round: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _kind_only_when_failed(self) -> Self:
+        if self.failure_kind is not None and self.outcome is not EvidenceOutcome.FAILED:
+            message = "only failed evidence carries a failure kind"
+            raise ValueError(message)
+        return self
+
+
+__all__ = [
+    "MAX_EVIDENCE_SUMMARY_CHARS",
+    "ArtifactDigest",
+    "ContentDigest",
+    "EvidenceFailureKind",
+    "EvidenceFingerprints",
+    "EvidenceKind",
+    "EvidenceMetric",
+    "EvidenceOutcome",
+    "PartialMeasurement",
+    "TrustedEvidence",
+]

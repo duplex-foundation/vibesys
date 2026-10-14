@@ -22,11 +22,12 @@
  *   gives each role a tone: the run state carries a verdict, the phase and the
  *   title are content, the metadata recedes.
  */
-import {hasRunEnded} from '@vibesys/core-state';
-import {runStatusLabel, type SessionState} from '../session-model.js';
-import {agentKindText, describePhase, phaseText} from './phase-label.js';
+
+import {type CoreRunStatus, hasRunEnded} from '@vibesys/run-state';
+import {activeRunFocus, agentKindText, phaseText} from '@vibesys/run-state/rounds';
+import type {SessionState} from '../session-model.js';
+import type {Theme} from '../theme.js';
 import {displayWidth, truncateToWidth} from './text-width.js';
-import type {Theme} from './theme.js';
 
 /** Separator between header segments, matching the rest of the interface. */
 const SEPARATOR = ' · ';
@@ -76,7 +77,7 @@ const PRIORITY = {
 } as const;
 
 /** What a segment is. `headerSegments` emits at most one segment per role. */
-export type HeaderRole = keyof typeof PRIORITY;
+type HeaderRole = keyof typeof PRIORITY;
 
 /** A drawn run of the header: one segment, or one separator between two. */
 export type HeaderSpanRole = HeaderRole | 'separator';
@@ -118,6 +119,29 @@ const DISCONNECTED = 'disconnected';
 
 /** The widest word `runStateText` produces; every status label is shorter. */
 const WIDEST_STATE = DISCONNECTED;
+
+/** How one semantic backend lifecycle status reads in the TUI header. */
+export function runStatusLabel(status: CoreRunStatus): string {
+  switch (status) {
+    case 'pausing':
+      return 'pausing…';
+    case 'stopping':
+      return 'stopping…';
+    case 'connecting':
+    case 'starting':
+    case 'running':
+    case 'paused':
+    case 'stopped':
+    case 'completed':
+    case 'failed':
+    case 'interrupted':
+      return status;
+    default: {
+      const unhandled: never = status;
+      return unhandled;
+    }
+  }
+}
 
 /**
  * The narrowest terminal this header supports, in cells.
@@ -190,7 +214,11 @@ export function headerSegments(state: SessionState, showLog: boolean): Segment[]
   if (showLog) {
     segments.push({text: 'experiments', role: 'phase', priority: PRIORITY.phase});
   } else {
-    const phase = phaseText(describePhase(state.core.roundLabel, state.core.agentKind));
+    const active = activeRunFocus(state.core);
+    const phase =
+      active.length > 1
+        ? `${active.length} agents active`
+        : phaseText(active[0]?.description ?? null);
     if (phase !== null) segments.push({text: phase, role: 'phase', priority: PRIORITY.phase});
     if (state.hypothesisScope !== null) {
       segments.push({
@@ -345,6 +373,11 @@ export function headerSpanStyle(theme: Theme, span: HeaderSpan): HeaderSpanStyle
  * `pausing` shares the warning of `paused` rather than getting a tone of its
  * own: it is the same verdict, and the word is what says the pause has not
  * landed yet. A colour the operator has to learn would say it less clearly.
+ * `stopping` and `stopped` take the same warning: an operator stop is a
+ * deliberate end, neither the success of `completed` nor the failure of
+ * `failed`. `interrupted` joins them for the same reason: a signal or the
+ * launcher ending the run is not the candidate's own failure, so it does not
+ * earn `error`, but it is also not a clean `completed`.
  */
 function stateColor(theme: Theme, state: string): string {
   if (state === runStatusLabel('completed')) return theme.success;
@@ -352,6 +385,10 @@ function stateColor(theme: Theme, state: string): string {
   if (state === runStatusLabel('pausing') || state === runStatusLabel('paused')) {
     return theme.warning;
   }
+  if (state === runStatusLabel('stopping') || state === runStatusLabel('stopped')) {
+    return theme.warning;
+  }
+  if (state === runStatusLabel('interrupted')) return theme.warning;
   if (state === DISCONNECTED) return theme.warning;
   return theme.textPrimary;
 }

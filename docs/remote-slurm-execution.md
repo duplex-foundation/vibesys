@@ -5,7 +5,62 @@ evaluators on a Slurm cluster through SkyPilot. The integration is site-neutral:
 task manifests declare portable capacity, an operator profile supplies runtime
 policy, and SkyPilot/SSH configuration supplies site access.
 
-## Configuration ownership
+## Direct Slurm (`--run-environment slurm`)
+
+`--run-environment slurm --slurm-config PATH` runs trusted accuracy and
+benchmark evaluations, and ROCprof captures, on a Slurm cluster the submit host reaches
+directly (for example over SSH), without SkyPilot. The editor is the same local
+Docker container as in every other environment, with the workspace mounted at
+its host path.
+
+The container cannot hold the cluster's tools or credentials, so trusted work never
+runs there. Every loop's agents request trusted evaluation through the evaluation
+tool (`submit_evaluation`, then `validate_evaluation_wait`), which the run answers on
+the host; only its results count, and the framework's own trusted evaluation of a
+round runs the same stages on the cluster through the core evaluation executor. The
+agents get no shell client for evaluation: no accuracy or benchmark command in their
+paths and no evaluation command in their prompts. Without agent GPU commands the
+container reaches no host broker at all.
+
+The ROCprof server runs in the container and reaches the cluster through a
+second host broker. It imports the Slurm adapter from the framework's `libs`
+directory, mounted read-only at its host path, so the agent image needs only a
+`python3` (3.11 or newer) with `pydantic`, which its MCP library already
+requires. When the submit host is itself the machine that runs VibeSys, the
+configuration can use the `local` transport (`[slurm.transport] kind = "local"`,
+see the `vs-slurm` README) instead of SSH: evaluations run through the same
+sbatch, poll and collect path. The local transport starts its programs in a
+login-like environment (`HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `LANG`,
+`LC_*`, `TZ`, `TMPDIR`, and nothing else), as sshd would, so the host's
+credentials and any `SLURM_*` variables of an enclosing allocation never reach
+a job. The profiler broker exists only for the SSH transport, so a
+local-transport run without agent GPU commands offers no ad hoc ROCprof capture,
+and no profiler.
+
+A trusted profile capture needs the task's `[profile]` command. With an operator
+`[vibesys.service]` the service runs under the profiler and that command is the load
+driven against it. Without a service the command is itself the profiled target: it runs to
+completion under the profiler and is never signalled, so it must exit by itself. A run that
+cannot capture (no profile command, or no remote profiling) is not offered profile
+workstreams, and its start log says so.
+
+### Agent GPU commands (optional)
+
+On a host that is itself a Slurm submit node (`[slurm.transport] kind = "local"`),
+the operator can also let the agent run its own GPU commands as Slurm jobs, by
+adding a `[vibesys.agent_gpu]` table to the same operator file. The same host
+broker then offers `vibesys-gpu`, and the agent profiles
+through its own commands instead of through the remote ROCprof capture. The
+table is rejected with any other transport. See
+[GPU commands through Slurm](slurm-gpu-commands.md) for the table, the agent's
+view, and the deprecated `--run-environment slurm-gpu` alias.
+
+The dynamic loop runs on `slurm` with or without agent GPU commands. Each
+parallel candidate gets its own container session and its own host broker,
+and a broker accepts only its own candidate's worktree, so one candidate's
+agent cannot run a GPU job in another candidate's files.
+
+## SkyPilot configuration ownership
 
 - `vibesys.input.toml` owns portable requirements such as node count, accelerator
   count, and `cuda` or `rocm`.

@@ -1,12 +1,9 @@
 import {describe, expect, it} from 'bun:test';
-import type {RunEvent} from '@vibesys/backend-client';
-import {applyRunMapEvent, type CoreRunStatus} from '@vibesys/core-state';
-import {
-  initialSessionState,
-  runStatusLabel,
-  type SessionState,
-  selectAgent,
-} from '../session-model.js';
+import type {RunEvent} from '@vibesys/contracts';
+import {type CoreRunStatus, initialCoreState, reduceEvent} from '@vibesys/run-state';
+import {selectAgent} from '../round-agent-selection.js';
+import {initialSessionState, type SessionState} from '../session-model.js';
+import {contrastRatio, listThemes, resolveTheme, type Theme} from '../theme.js';
 import {
   type HeaderSpan,
   type HeaderSpanRole,
@@ -16,10 +13,10 @@ import {
   MIN_WIDTH,
   renderHeader,
   runStateText,
+  runStatusLabel,
   usageText,
 } from './header.js';
 import {displayWidth} from './text-width.js';
-import {contrastRatio, listThemes, resolveTheme, type Theme} from './theme.js';
 
 const WIDE = 200;
 const NARROW = 100;
@@ -63,6 +60,30 @@ function runningImplementer(): SessionState {
       status: 'running',
       agentKind: 'implementer',
       roundLabel: 'round-1-retry-2-implementer',
+      phases: [
+        {
+          kind: 'implementer',
+          status: 'active',
+          roundNumber: 1,
+          roundKey: {kind: 'number', number: 1},
+          roundLabel: 'round-1-retry-2-implementer',
+          executionId: 'exec-1',
+        },
+      ],
+      activeExecutions: {
+        'exec-1': {
+          executionId: 'exec-1',
+          agentKind: 'implementer',
+          roundLabel: 'round-1-retry-2-implementer',
+          roundNumber: 1,
+          roundKey: {kind: 'number', number: 1},
+          stage: 'implementation',
+          attempt: 2,
+          assignment: 'Implement',
+          startedAt: '2026-01-01T00:00:00Z',
+          activity: {mode: 'thinking', summary: 'Implementing'},
+        },
+      },
       usage: {inputTokens: 223_000, contextWindow: 400_000, model: 'claude-opus-5'},
     },
   );
@@ -123,6 +144,19 @@ describe('header', () => {
       expect(header).not.toContain(roundLabel);
       expect(header).not.toMatch(/round-\d|gen-\d|cand-\d|retry-\d|att\d/);
     }
+  });
+
+  it('ignores the deprecated cursor when active execution focus disagrees', () => {
+    const state = runningImplementer();
+    const header = line(
+      {...state, core: {...state.core, agentKind: 'judge', roundLabel: 'round-99-judge'}},
+      false,
+      WIDE,
+    );
+
+    expect(header).toContain('implementing · attempt 2');
+    expect(header).not.toContain('judging');
+    expect(header).not.toContain('round-99-judge');
   });
 
   it('fits 100 columns whole, where the old header clipped the title', () => {
@@ -194,6 +228,7 @@ describe('header', () => {
       'paused',
       'completed',
       'failed',
+      'interrupted',
       'connecting',
     ];
     for (const status of states) {
@@ -210,10 +245,7 @@ describe('header', () => {
     // `selectAgent` stores the phase kind verbatim, so an operator selecting
     // the measurement phase put `selected perf_eval` on the curated header:
     // the backend identifier this header exists to remove.
-    const seeded = applyRunMapEvent(
-      {outerLoop: 'plain', expectedRoles: null, rounds: [], phases: [], lastEventTimestamp: null},
-      perfEvalStart(),
-    );
+    const seeded = reduceEvent(initialCoreState(), perfEvalStart());
     const kinds = seeded.phases.map(phase => phase.kind);
     expect(kinds).toContain('perf_eval');
 
@@ -346,6 +378,19 @@ describe('run state', () => {
     expect(line(pausing, false, WIDE)).toContain('pausing…');
   });
 
+  it('spells out a stop the backend has requested but not yet landed', () => {
+    // `/stop` lands at the next invocation boundary the way `/pause` does, so
+    // the header reads `stopping…` until the backend says the run ended.
+    const stopping = stateWith({}, {status: 'stopping'});
+    expect(runStateText(stopping)).toBe('stopping…');
+    const stopped = stateWith({}, {status: 'stopped'});
+    expect(runStateText(stopped)).toBe('stopped');
+    // A stopped run whose socket closed is finished, not disconnected.
+    expect(runStateText(stateWith({eventStreamAvailable: false}, {status: 'stopped'}))).toBe(
+      'stopped',
+    );
+  });
+
   it('shows a lost event stream while the run is still going', () => {
     const dropped = stateWith({eventStreamAvailable: false}, {status: 'running'});
     expect(runStateText(dropped)).toBe('disconnected');
@@ -387,13 +432,25 @@ const SPAN_ROLES: readonly HeaderSpanRole[] = [
  * Every run state `runStateText` can produce, plus one it cannot.
  *
  * The statuses go through `runStatusLabel`, which is what puts them on the
- * line, so this covers the labels rather than the raw status words. There is no
- * `interrupted`: `RunStatus` has no such member, and `run_interrupted` ends the
- * run as `failed`.
+ * line, so this covers the labels rather than the raw status words.
+ * `interrupted` is included even though `RunStatus` has no such member: core
+ * state derives it itself from the separate `run_interrupted` event (#804),
+ * so it is one of the values `runStateText` can actually show.
  */
 const RUN_STATES = [
   ...(
-    ['starting', 'running', 'pausing', 'paused', 'completed', 'failed', 'connecting'] as const
+    [
+      'starting',
+      'running',
+      'pausing',
+      'paused',
+      'stopping',
+      'stopped',
+      'completed',
+      'failed',
+      'interrupted',
+      'connecting',
+    ] as const
   ).map(runStatusLabel),
   'disconnected',
   // A status the backend adds after this was written, which has no verdict here.
@@ -463,6 +520,13 @@ describe('header hierarchy', () => {
     // The label, not the status: `pausing` is on the line as `pausing…`.
     expect(tone(runStatusLabel('pausing'))).toBe(theme.warning);
     expect(tone('pausing')).toBe(theme.textPrimary);
+    // An operator stop is a deliberate end: a warning, not a failure.
+    expect(tone('stopped')).toBe(theme.warning);
+    expect(tone(runStatusLabel('stopping'))).toBe(theme.warning);
+    expect(tone('stopping')).toBe(theme.textPrimary);
+    // A signal or the launcher ending the run (#804) is not the candidate's
+    // own failure either: same warning, not `error`.
+    expect(tone('interrupted')).toBe(theme.warning);
     expect(tone('disconnected')).toBe(theme.warning);
     // Not verdicts. Bold is what sets these apart, and the word is spelled out.
     expect(tone('running')).toBe(theme.textPrimary);
@@ -486,6 +550,9 @@ describe('header hierarchy', () => {
     // against.
     expect(stateTone(stateWith({}, {status: 'pausing'}))).toBe(theme.warning);
     expect(stateTone(stateWith({}, {status: 'paused'}))).toBe(theme.warning);
+    // A stop before and after it lands, rendered as `stopping…` then `stopped`.
+    expect(stateTone(stateWith({}, {status: 'stopping'}))).toBe(theme.warning);
+    expect(stateTone(stateWith({}, {status: 'stopped'}))).toBe(theme.warning);
     // A lost stream, over a status that still says the run is going.
     expect(stateTone(stateWith({eventStreamAvailable: false}, {status: 'running'}))).toBe(
       theme.warning,

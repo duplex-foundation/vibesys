@@ -1,80 +1,42 @@
 """Serialization and atomic I/O for typed VibeSys project state."""
 
-# TRY003: these boundary errors deliberately embed the offending metadata path
-# and value.
-# ruff: noqa: TRY003
-
 from __future__ import annotations
 
 import json
-import math
 import os
 import tempfile
-from pathlib import Path, PurePosixPath
+from contextlib import AbstractContextManager, contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from vs_loop_state import RoundRecord, serialize_round_record
-from vs_project.errors import ProjectStateError, StateModelNotFoundError
+from vs_decode.api import Unreadable, ValidationOptions, decode_json
+from vs_project._framework_writes import FRAMEWORK_WRITES
+from vs_project.errors import (
+    ProjectStateError,
+    StateDocumentDamagedError,
+    StateModelNotFoundError,
+)
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
-def _validate_portable_round(record: RoundRecord, *, source: Path | None = None) -> None:
-    """Reject machine-local paths and non-finite metrics at the commit boundary."""
-    subject = f"Completed-round metadata at {source}" if source is not None else "Completed-round"
-    for field_name in ("evaluation_artifact", "candidate_evaluation_artifact"):
-        value = getattr(record, field_name)
-        if value is None:
-            continue
-        artifact = PurePosixPath(value)
-        if (
-            not value
-            or "\\" in value
-            or artifact.is_absolute()
-            or artifact == PurePosixPath(".")
-            or ".." in artifact.parts
-        ):
-            raise ProjectStateError(
-                f"{subject} {field_name} must be a portable project-relative path"
-            )
-    metric_values = [
-        record.perf_metric,
-        *record.metrics.values(),
-        *record.candidate_metrics.values(),
-    ]
-    if any(value is not None and not math.isfinite(value) for value in metric_values):
-        raise ProjectStateError(f"{subject} metrics must be finite numbers")
-
-
-def serialize_round(record: RoundRecord) -> bytes:
-    """Return validated canonical bytes for one portable completed round."""
-    if record.round_number < 1:
-        raise ProjectStateError(f"Round number must be positive, got {record.round_number}")
-    _validate_portable_round(record)
-    try:
-        contents = json.dumps(
-            serialize_round_record(record),
-            allow_nan=False,
-            indent=2,
-            sort_keys=True,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ProjectStateError(
-            f"Could not serialize completed-round metadata for round {record.round_number}"
-        ) from exc
-    return f"{contents}\n".encode()
+STATE_DOCUMENT_MAX_BYTES = 256 * 1024 * 1024
+"""The largest state document read; far past any the framework writes."""
 
 
 def _serialize_state_model(model: BaseModel) -> bytes:
     """Return canonical JSON bytes for a typed state model."""
     try:
         content = json.dumps(
-            model.model_dump(mode="json"),
+            model.model_dump(mode="json", round_trip=True),
             allow_nan=False,
             indent=2,
             sort_keys=True,
         )
     except (TypeError, ValueError) as exc:
-        raise ProjectStateError("Could not serialize VibeSys state model") from exc
+        raise ProjectStateError.state_serialization_failed() from exc
     return f"{content}\n".encode()
 
 
@@ -83,7 +45,7 @@ def _serialize_json_object(value: dict[str, object], *, subject: str) -> bytes:
     try:
         content = json.dumps(value, allow_nan=False, indent=2, sort_keys=True)
     except (TypeError, ValueError) as exc:
-        raise ProjectStateError(f"Could not serialize {subject}") from exc
+        raise ProjectStateError.json_serialization_failed(subject) from exc
     return f"{content}\n".encode()
 
 
@@ -92,61 +54,179 @@ def _atomic_write_model(path: Path, model: BaseModel) -> None:
     _atomic_write_bytes(path, _serialize_state_model(model))
 
 
-def _atomic_write_bytes(path: Path, contents: bytes) -> None:
-    """Atomically replace a file with bytes from the same directory."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
+class AtomicWriteStream(Protocol):
+    """Writable binary stream used for staging an atomic publication."""
+
+    def write(self, contents: bytes, /) -> int | None:
+        """Accept bytes, returning the number written."""
+        ...
+
+    def flush(self) -> None:
+        """Flush buffered bytes to the underlying file."""
+        ...
+
+    def fileno(self) -> int:
+        """Return the local descriptor used for durability."""
+        ...
+
+    @property
+    def closed(self) -> bool:
+        """Whether the stream is closed."""
+        ...
+
+
+class AtomicWriteEffects(Protocol):
+    """Filesystem operations used to durably replace a single file."""
+
+    def temporary(
+        self, destination: Path
+    ) -> AbstractContextManager[tuple[Path, AtomicWriteStream]]:
+        """Create a private temporary file beside the destination."""
+        ...
+
+    def sync_file(self, stream: AtomicWriteStream) -> None:
+        """Persist the flushed stream before publishing its name."""
+        ...
+
+    def replace(self, temporary: Path, destination: Path) -> None:
+        """Atomically publish a complete temporary file."""
+        ...
+
+    def sync_directory(self, directory: Path) -> None:
+        """Persist the directory entry after replacement."""
+        ...
+
+    def remove_temporary(self, temporary: Path) -> None:
+        """Remove staging residue; a published temporary is already absent."""
+        ...
+
+
+class StoreDurabilityEffects(AtomicWriteEffects, Protocol):
+    """Atomic publication plus synchronizing a file this process did not just write."""
+
+    def sync_existing_file(self, path: Path) -> None:
+        """Persist the current bytes of an already published file."""
+        ...
+
+
+class LocalAtomicWriteEffects:
+    """Local filesystem implementation of atomic replacement effects."""
+
+    @contextmanager
+    def temporary(self, destination: Path) -> Iterator[tuple[Path, AtomicWriteStream]]:
+        """Own a private staging stream on the destination filesystem."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="wb",
-            dir=path.parent,
-            prefix=f".{path.name}.",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
             suffix=".tmp",
             delete=False,
-        ) as temporary:
-            temporary.write(contents)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            temporary_path = Path(temporary.name)
-        temporary_path.replace(path)
+        ) as stream:
+            yield Path(stream.name), stream
+
+    def sync_file(self, stream: AtomicWriteStream) -> None:
+        """Persist the complete staging file."""
+        os.fsync(stream.fileno())
+
+    def sync_existing_file(self, path: Path) -> None:
+        """Persist a published file, refusing to follow a symlink at ``path``."""
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def replace(self, temporary: Path, destination: Path) -> None:
+        """Atomically publish the staging file."""
+        temporary.replace(destination)
+
+    def sync_directory(self, directory: Path) -> None:
+        """Persist replacement of the destination directory entry."""
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def remove_temporary(self, temporary: Path) -> None:
+        """Clean up both successful and interrupted staging files."""
+        temporary.unlink(missing_ok=True)
+
+
+def sync_directory_chain(
+    directory: Path, durable_root: Path, *, effects: AtomicWriteEffects | None = None
+) -> None:
+    """Persist namespace links through an existing durable root, inclusive.
+
+    The caller owns this storage subtree. Its unchanged outer ancestors need
+    only traversal permission and are outside the durability boundary.
+    """
+    directory.relative_to(durable_root)
+    filesystem = effects if effects is not None else LocalAtomicWriteEffects()
+    current = directory
+    while True:
+        filesystem.sync_directory(current)
+        if current == durable_root:
+            return
+        current = current.parent
+
+
+def atomic_write_bytes(
+    path: Path, contents: bytes, *, effects: AtomicWriteEffects | None = None
+) -> None:
+    """Durably replace bytes using a private file, fsync, and atomic rename.
+
+    Readers observe complete old or new bytes, including if writing fails.
+    An error after replacement can leave the new contents published. The
+    destination directory must permit replacement, and callers must not use
+    this operation for files whose existing inode must remain granted.
+    """
+    filesystem = effects if effects is not None else LocalAtomicWriteEffects()
+    temporary_path: Path | None = None
+    try:
+        with filesystem.temporary(path) as (temporary_path, stream):
+            offset = 0
+            while offset < len(contents):
+                written = stream.write(contents[offset:])
+                if written is None or written <= 0:
+                    raise ProjectStateError.incomplete_write(path)
+                offset += written
+            stream.flush()
+            filesystem.sync_file(stream)
+        with FRAMEWORK_WRITES.publishing(path, contents):
+            filesystem.replace(temporary_path, path)
+        filesystem.sync_directory(path.parent)
     finally:
         if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+            filesystem.remove_temporary(temporary_path)
+
+
+def _atomic_write_bytes(path: Path, contents: bytes) -> None:
+    """Replace owned state bytes through the shared durability mechanism."""
+    atomic_write_bytes(path, contents)
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Atomically replace a UTF-8 text file from the same directory."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            temporary_path = Path(temporary.name)
-        temporary_path.replace(path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+    """Replace UTF-8 text through the same durability mechanism as bytes."""
+    atomic_write_bytes(path, content.encode("utf-8"))
 
 
 def _read_json_object(path: Path) -> dict[str, object]:
-    """Read a JSON object from a metadata path."""
+    """Read a JSON object from a metadata path.
+
+    Bad UTF-8 (a ``UnicodeDecodeError``), truncation and nesting past the interpreter's
+    recursion limit (a ``RecursionError`` from ``json``) are each a
+    ``ProjectStateError``, so a caller that skips damaged metadata skips all of it.
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise ProjectStateError(f"VibeSys metadata file does not exist: {path}") from exc
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ProjectStateError(f"Could not read VibeSys metadata at {path}: {exc}") from exc
+        raise ProjectStateError.metadata_file_missing(path) from exc
+    except (OSError, ValueError, RecursionError) as exc:
+        raise ProjectStateError.metadata_read_failed(path, exc) from exc
     if not isinstance(raw, dict):
-        raise ProjectStateError(f"Expected a JSON object in VibeSys metadata at {path}")
+        raise ProjectStateError.metadata_not_object(path)
     return raw
 
 
@@ -156,32 +236,79 @@ def _load_model[ModelT: BaseModel](path: Path, model_type: type[ModelT]) -> Mode
         content = path.read_text(encoding="utf-8")
         return model_type.model_validate_json(content, strict=True)
     except FileNotFoundError as exc:
-        raise ProjectStateError(f"VibeSys metadata file does not exist: {path}") from exc
+        raise ProjectStateError.metadata_file_missing(path) from exc
     except (OSError, UnicodeError) as exc:
-        raise ProjectStateError(f"Could not read VibeSys metadata at {path}: {exc}") from exc
+        raise ProjectStateError.metadata_read_failed(path, exc) from exc
     except ValidationError as exc:
-        raise ProjectStateError(
-            f"Invalid VibeSys metadata at {path}: {_validation_message(exc)}"
-        ) from exc
+        raise ProjectStateError.invalid_metadata(path, _validation_message(exc)) from exc
 
 
 def _load_state_model[ModelT: BaseModel](path: Path, model_type: type[ModelT]) -> ModelT:
     """Load and strictly validate a required operational-state model."""
     try:
-        content = path.read_text(encoding="utf-8")
-        return model_type.model_validate_json(content, strict=True)
+        content = path.read_bytes()
     except FileNotFoundError as exc:
-        raise StateModelNotFoundError(f"VibeSys state model does not exist: {path}") from exc
-    except (OSError, UnicodeError) as exc:
-        raise ProjectStateError(f"Could not read VibeSys state model at {path}: {exc}") from exc
-    except ValidationError as exc:
-        raise ProjectStateError(
-            f"Invalid VibeSys state model at {path}: {_validation_message(exc)}"
-        ) from exc
+        raise StateModelNotFoundError.missing(path) from exc
+    except OSError as exc:
+        raise ProjectStateError.state_read_failed(path, exc) from exc
+    return decode_state_document(model_type, content, source=path)
+
+
+def decode_state_document[ModelT: BaseModel](
+    model_type: type[ModelT],
+    data: bytes | str,
+    *,
+    source: Path | str,
+    context: dict[str, Any] | None = None,
+    versioned_by: tuple[str, int] | None = None,
+) -> ModelT:
+    """Strictly decode persisted bytes as ``model_type``: the one path every reader uses.
+
+    Every decode failure (malformed or truncated JSON, bad UTF-8, schema
+    violation, a version this release does not read) raises
+    ``StateDocumentDamagedError`` naming ``source`` and the failing fields,
+    never echoing the document. ``versioned_by=(field, expected)`` makes a
+    document whose integer ``field`` differs from ``expected`` report both
+    versions instead of a schema error.
+    """
+    if versioned_by is not None:
+        field, expected = versioned_by
+        found = _declared_version(data, field)
+        if found is not None and found != expected:
+            raise StateDocumentDamagedError.unsupported_version(source, found, expected)
+    decoded = decode_json(
+        data,
+        model_type,
+        source=str(source),
+        max_bytes=STATE_DOCUMENT_MAX_BYTES,
+        options=ValidationOptions(strict=True, context=context),
+    )
+    if isinstance(decoded, Unreadable):
+        raise StateDocumentDamagedError.invalid(source, decoded.details("metadata"))
+    return decoded
+
+
+_JSON_OBJECT = TypeAdapter(dict[str, Any])
+
+
+def _declared_version(data: bytes | str, field: str) -> int | None:
+    """The integer version a JSON object declares, or None when it declares none."""
+    document = decode_json(
+        data, _JSON_OBJECT, source="state document", max_bytes=STATE_DOCUMENT_MAX_BYTES
+    )
+    if isinstance(document, Unreadable):
+        # The model decode that follows reports the damage.
+        return None
+    value = document.get(field)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _validation_message(error: ValidationError) -> str:
-    """Render stable validation details without echoing input values."""
+    """Render stable validation details without echoing input values.
+
+    Field locations are reported, including the name of an unknown field (a
+    newer release's key is the diagnostic), but never the offending values.
+    """
     failures: list[str] = []
     for detail in error.errors(include_url=False, include_context=False, include_input=False):
         location = ".".join(str(part) for part in detail["loc"]) or "metadata"

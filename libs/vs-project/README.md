@@ -1,13 +1,27 @@
 # vs-project
 
-One filesystem boundary for a repository-native VibeSys project.
+## Responsibility
 
-`Project` binds human-authored task definitions and generated state to one
-validated repository root. Application code constructs one project and uses
-task operations directly and persistence through `project.state`:
+This package owns the `.vibesys` filesystem contract for a repository-native
+project. It discovers and validates tasks, binds project state to one repository
+root, and provides access to generated run state. Applications should use one
+`Project` per root rather than assemble paths or state stores themselves.
+
+Orchestration-specific settings, resume rules, agent roles, and round-history
+interpretation belong in the owning `src/vibesys/loops/<strategy>` package or
+`src/vibesys/orchestration`, not in `vs_project`. Run manifests use a
+versioned `OrchestrationDescriptor`; this package validates its portable JSON
+envelope, while the owning orchestration validates the options and decides
+whether a resumed run may change them. Version 5 is the only supported run
+manifest format; older schemas fail explicitly.
+
+## Usage
+
+Application code uses task operations directly and persists state through
+`project.state`:
 
 ```python
-from vs_project import Project
+from vs_project.api import Project
 
 project = Project.open(".")
 task = project.select_task("latency")
@@ -36,3 +50,105 @@ The public package does not expose independently constructible layout or state
 objects, which prevents application code from binding them to different roots.
 State namespaces and immutable state value types remain public for integrations
 that consume them.
+
+## Atomic run state
+
+`Project.state_store(run_id)` opens a `LocalStateStore` in the shared portable
+run namespace, including before its manifest exists. `StateStore` is the role;
+`FakeStateStore` implements the same contract in memory. Both accept a public
+`fault_plan` of `CommitFault` values for definite and ambiguous commit failures.
+Local ambiguity faults fail before rename, after rename, or at directory
+fsync. `lease_fault_plan` applies the same faults to eligible acquire and renew
+writes. `observation_fault_plan` accepts `ObservationFault.READ` and `.SYNC`
+for read and directory fsync errors, including reads inside transactions.
+A `None` entry in either plan allows that operation to complete normally.
+Rejected lease mutations do not consume the lease plan; record faults remain
+reserved for eligible commit and quarantine mutations.
+
+The store treats serialized kernel envelopes as opaque bytes. State, request
+outbox and event cursor belong inside one payload, encoded and decoded by the
+kernel's public codec. `StoredEnvelope.revision` is an independent storage CAS
+token, starting at zero and increasing with every replacement. It does not
+replace the kernel revision inside the payload.
+
+Acquire a `StoreFence` with a host identity, supplied time and positive lease
+duration. Renewal preserves its epoch and never shrinks its expiry. An expired
+lease permits takeover with a higher epoch; previous epochs cannot commit.
+Time must use one durable shared basis across hosts, without regressions.
+
+`commit(expected_revision, envelope, fence, now)` checks ownership and revision
+under the same lock that publishes the complete record and lease document.
+`None` expected revision means absence. Outcomes are:
+
+- `Committed`: the complete candidate is durable.
+- `Conflict`: no candidate was written; reload and reconcile the revision or
+  reacquire host ownership.
+- `Unknown`: dispatch is forbidden until reload resolves whether the complete
+  candidate exists. Compare its storage revision and bytes. A later competing
+  transition requires reconciliation rather than blind replay.
+
+An injected definite failure raises `StateStoreWriteError` and writes nothing.
+Lease write errors also grant no dispatch authority. Real observation errors
+propagate. Local publication uses a stable shared `flock`, a temporary file,
+file fsync, rename, and directory fsync. Reload synchronizes the observed file
+and namespace links through the existing project root before returning,
+resolving lost durability acknowledgements. Unchanged ancestors outside the
+project require traversal permission only. The shared filesystem must support
+these operations.
+
+`quarantine(...)` performs the same fenced CAS with a `QuarantinedEnvelope`.
+It preserves unmigratable source bytes and diagnostics and atomically replaces
+the runnable record. An explicit `None` schema version preserves unknown source
+metadata without fabricating a version. `load()` returns this explicit blocked alternative;
+quarantine grants no dispatch authority.
+
+`mutate_if_fenced(fence, now, mutation)` runs one synchronous external durable
+mutation while holding the same transaction that validates the lease and
+excludes takeover. It returns `False` without invoking the mutation when the
+fence is stale. Every writer to the protected external resource must use the
+same run store for this ordering guarantee; exceptions from the mutation
+propagate after the transaction is released. The mutation must not call back
+into the store whose transaction it holds.
+
+Future shell composition must serialize every whole transition before I/O,
+retain the storage CAS token separately from kernel state, map storage ownership
+to the kernel host fence, renew and verify the shared lease, and suspend dispatch
+on conflicts, unknown outcomes, write errors or quarantine. Restart must decode
+through the authoritative kernel codec, migrate explicitly, and reconcile
+persisted request identities before replay. External executors must honor the
+epoch or provide identity-based idempotency and reconciliation; a filesystem
+lease alone cannot stop an already executing external request.
+
+## Git history
+
+`GitTracker` owns snapshot policy: which paths are framework state, how a
+checkpoint is committed, which paths are excluded. It does no I/O of its own.
+Every Git operation goes through `GitRepository`, a role interface of semantic
+operations (`head`, `is_ancestor`, `stage_all`, `commit`, `diff_patch`, ...)
+declared in `vs_project.api` with typed errors (`GitError`, `GitCommandError`,
+`StagingError`) and typed values (`RepositoryLocation`, `CommitSubject`,
+`PatchStyle`). Its module docstring is the contract: conventions, pathspec
+subset, atomicity and restart expectations, and which operations are
+CLI-only.
+
+`CliGitRepository` runs the Git CLI and is the reference implementation;
+`GitTracker(..., repository=...)` accepts any other. The contract suite in
+`tests/git_contract` runs every case against every implementation registered in
+its `conftest.py` (`IMPLEMENTATIONS`), including operation sequences compared
+with the CLI as the oracle. A new implementation is one entry there.
+
+`Pygit2GitRepository` answers the portable operations in process with libgit2
+(`pygit2`) and delegates the CLI-only ones to a wrapped `CliGitRepository`; its
+module docstring lists the exact split, the requests it hands to the CLI to keep
+Git's answer, and the known differences. It shares a repository safely with the
+real `git` the agents run (the contract suite alternates the two). Which
+implementation a `GitTracker` gets is decided in one place,
+`open_git_repository`: `VIBESYS_GIT_BACKEND=cli|pygit2` selects explicitly (an
+unknown value, or `pygit2` where the package is not installed, is a
+`GitBackendError`); unset, it is `DEFAULT_GIT_BACKEND` when `pygit2` is
+installed and the CLI implementation otherwise. `pygit2` is imported only when
+that backend is built.
+
+Repositories that are not the tracked project (cloning a source tree, probing
+whether a directory is inside a repository, remote operations in
+`GitRemoteRepository`) are outside this interface and use `run_git` directly.

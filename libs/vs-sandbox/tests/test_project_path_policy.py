@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
-from collections.abc import Iterable  # noqa: TC003  # tracked: #288
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+from tests.support import run_test_command
 
-import vs_sandbox
+import vs_sandbox.api as sandbox_api
 from vs_sandbox import host_sandbox
 from vs_sandbox.host_resources import HostResource
 from vs_sandbox.project_paths import ProjectPathPolicy, ProjectPathPolicyError
+from vs_sim.api import ProbeResult
+from vs_sim.api.testing import ScriptedProbe
+
+_WORKING_BWRAP = ScriptedProbe(lambda _argv: ProbeResult(0, ""))
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 def _workspace(tmp_path: Path) -> Path:
@@ -54,22 +61,22 @@ def _working_bwrap() -> str | None:
     probe = "/usr/bin/true" if Path("/usr/bin/true").exists() else "/bin/true"
     command.append(probe)
     try:
-        result = subprocess.run(  # noqa: S603
+        result = run_test_command(
             command,
             capture_output=True,
             check=False,
             timeout=10,
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError:
         return None
     return bwrap if result.returncode == 0 else None
 
 
 class TestProjectPathPolicy:
     def test_public_export(self) -> None:
-        assert vs_sandbox.ProjectPathPolicy is ProjectPathPolicy
-        assert vs_sandbox.ProjectPathPolicyError is ProjectPathPolicyError
-        assert vs_sandbox.SandboxUnavailableError is host_sandbox.SandboxUnavailableError
+        assert sandbox_api.ProjectPathPolicy is ProjectPathPolicy
+        assert sandbox_api.ProjectPathPolicyError is ProjectPathPolicyError
+        assert sandbox_api.SandboxUnavailableError is host_sandbox.SandboxUnavailableError
 
     def test_empty_policy_preserves_legacy_nonexistent_workspace_behavior(
         self, tmp_path: Path
@@ -223,7 +230,7 @@ class TestBubblewrapProjectPaths:
         )
         (workspace / ".state" / "local" / "host-secret").write_text("secret\n")
 
-        result = subprocess.run(  # noqa: S603
+        result = run_test_command(
             sandbox.wrap(["/bin/sh", "-c", script]),
             capture_output=True,
             check=False,
@@ -236,6 +243,136 @@ class TestBubblewrapProjectPaths:
         assert (workspace / ".state" / "run.json").read_text() == "{}\n"
         assert not (workspace / ".state" / "local" / "agent-file").exists()
         assert (workspace / "source.txt").read_text() == "editable"
+
+    @pytest.mark.skipif(_working_bwrap() is None, reason="requires working bubblewrap")
+    @pytest.mark.skipif(shutil.which("git") is None, reason="requires git")
+    def test_git_reads_work_in_a_linked_worktree_and_history_stays_read_only(
+        self, tmp_path: Path
+    ) -> None:
+        repository = tmp_path / "project"
+        workspace = tmp_path / "run" / "worktrees" / "workspace"
+        identity = ("-c", "user.name=t", "-c", "user.email=t@example.invalid")
+
+        def git(*args: str, cwd: Path) -> None:
+            run_test_command(["git", *identity, *args], cwd=cwd, check=True, capture_output=True)
+
+        repository.mkdir()
+        git("init", "-q", cwd=repository)
+        (repository / "engine.py").write_text("print(1)\n")
+        git("add", "engine.py", cwd=repository)
+        git("commit", "-q", "-m", "base", cwd=repository)
+        git("worktree", "add", "-q", str(workspace), cwd=repository)
+        (workspace / "engine.py").write_text("print(2)\n")
+        env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path)}
+        sandbox = sandbox_api.build_host_sandbox(workspace, env=env, require_enforcement=True)
+        assert isinstance(sandbox, host_sandbox.HostSandbox)
+
+        script = "git diff --name-only && git log --format=%s && ! git commit -qam escaped"
+        result = run_test_command(
+            sandbox.wrap(["/bin/sh", "-c", script]),
+            capture_output=True,
+            check=False,
+            text=True,
+            cwd=workspace,
+            env=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.split() == ["engine.py", "base"]
+
+    @pytest.mark.skipif(shutil.which("git") is None, reason="requires git")
+    def test_linked_worktree_binds_its_gitdir_and_only_the_shared_entries_git_reads(
+        self, tmp_path: Path
+    ) -> None:
+        repository = tmp_path / "project"
+        workspace = tmp_path / "run" / "worktrees" / "workspace"
+        identity = ("-c", "user.name=t", "-c", "user.email=t@example.invalid")
+
+        def git(*args: str, cwd: Path) -> None:
+            run_test_command(["git", *identity, *args], cwd=cwd, check=True, capture_output=True)
+
+        repository.mkdir()
+        git("init", "-q", cwd=repository)
+        (repository / "engine.py").write_text("print(1)\n")
+        git("add", "engine.py", cwd=repository)
+        git("commit", "-q", "-m", "base", cwd=repository)
+        git("worktree", "add", "-q", str(workspace), cwd=repository)
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / ".git").write_text("not a pointer\n")
+
+        common = (repository / ".git").resolve()
+        (common / "hooks").mkdir(exist_ok=True)
+        (common / "logs").mkdir(exist_ok=True)
+        other = tmp_path / "run" / "worktrees" / "other"
+        git("worktree", "add", "-q", str(other), cwd=repository)
+
+        paths = sandbox_api.linked_worktree_git_paths(workspace)
+
+        assert paths[0] == common / "worktrees" / "workspace"
+        assert common / "objects" in paths
+        assert common / "refs" in paths
+        # Nothing else of the shared repository: other worktrees, reflogs, hooks,
+        # and config (it can hold a credential-bearing remote URL; see #2101).
+        withheld = {common, common / "worktrees", common / "worktrees" / "other"}
+        withheld |= {common / "hooks", common / "logs", common / "config"}
+        assert not withheld & set(paths)
+        assert sandbox_api.linked_worktree_git_paths(repository) == ()
+        assert sandbox_api.linked_worktree_git_paths(plain) == ()
+
+    @pytest.mark.skipif(shutil.which("git") is None, reason="requires git")
+    def test_linked_worktree_git_paths_never_exposes_the_shared_config(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for #2101: ``config`` can hold a credential-bearing remote URL.
+
+        ``rev-parse``, ``status`` and ``diff`` (exercised by the sibling test above
+        and by ``test_git_reads_work_in_a_linked_worktree_and_history_stays_read_only``)
+        need no repository-level config at all, so it is withheld outright rather than
+        filtered section by section: that way no future ``credential.*``, ``url.*`` or
+        ``http.*`` setting can leak just because it was not yet on a strip-list.
+        """
+        repository = tmp_path / "project"
+        workspace = tmp_path / "run" / "worktrees" / "workspace"
+        identity = ("-c", "user.name=t", "-c", "user.email=t@example.invalid")
+
+        def git(*args: str, cwd: Path) -> None:
+            run_test_command(["git", *identity, *args], cwd=cwd, check=True, capture_output=True)
+
+        repository.mkdir()
+        git("init", "-q", cwd=repository)
+        (repository / "engine.py").write_text("print(1)\n")
+        git("add", "engine.py", cwd=repository)
+        git("commit", "-q", "-m", "base", cwd=repository)
+        # A fake value standing in for a real credential; it never leaves this test.
+        embedded_marker = "sshh-do-not-leak-9f3c2b"
+        git(
+            "remote",
+            "add",
+            "origin",
+            f"https://user:{embedded_marker}@example.invalid/repo.git",
+            cwd=repository,
+        )
+        common = (repository / ".git").resolve()
+        config = common / "config"
+        with config.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "[credential]\n"
+                f"\thelper = store --file=/secrets/{embedded_marker}\n"
+                "[http]\n"
+                f"\textraHeader = Authorization: Bearer {embedded_marker}\n"
+                f'[url "https://{embedded_marker}@github.com/"]\n'
+                "\tinsteadOf = https://github.com/\n"
+            )
+        git("worktree", "add", "-q", str(workspace), cwd=repository)
+        assert embedded_marker in config.read_text(encoding="utf-8")
+
+        paths = sandbox_api.linked_worktree_git_paths(workspace)
+
+        assert config not in paths
+        for path in paths:
+            if path.is_file():
+                assert embedded_marker not in path.read_text(encoding="utf-8", errors="ignore")
 
     def test_builder_passes_validated_policy_to_linux_backend(
         self,
@@ -250,15 +387,13 @@ class TestBubblewrapProjectPaths:
             "which",
             lambda *_args, **_kwargs: "/usr/bin/bwrap",
         )
-        # The builder probes that bwrap can actually unshare a user namespace;
-        # this test supplies a path rather than a working binary.
-        monkeypatch.setattr(host_sandbox, "_bwrap_confines", lambda _path: True)
 
         sandbox = host_sandbox.build(
             workspace,
             env={},
             project_path_policy=policy,
             require_enforcement=True,
+            probe=_WORKING_BWRAP,
         )
 
         assert isinstance(sandbox, host_sandbox.HostSandbox)
@@ -268,9 +403,9 @@ class TestBubblewrapProjectPaths:
 class TestSeatbeltProjectPaths:
     def test_specific_denies_follow_workspace_allows_for_files_and_directories(
         self,
-        tmp_path: Path,
+        sandbox_tmp_path: Path,
     ) -> None:
-        workspace = _workspace(tmp_path)
+        workspace = _workspace(sandbox_tmp_path)
         sandbox = host_sandbox.SeatbeltSandbox(
             workspace=workspace,
             sandbox_exec_path="/usr/bin/sandbox-exec",
@@ -356,13 +491,13 @@ class TestHostResourceAgentPathRejection:
         monkeypatch.setattr(
             host_sandbox.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/bwrap"
         )
-        monkeypatch.setattr(host_sandbox, "_bwrap_confines", lambda _path: True)
 
         sandbox = host_sandbox.build(
             workspace,
             env={},
             resources=(resource,),
             require_enforcement=True,
+            probe=_WORKING_BWRAP,
         )
 
         assert isinstance(sandbox, host_sandbox.HostSandbox)
@@ -468,10 +603,11 @@ class TestWorkspaceSandboxEnv:
         monkeypatch.setattr(
             host_sandbox.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/bwrap"
         )
-        monkeypatch.setattr(host_sandbox, "_bwrap_confines", lambda _path: True)
         env = {"HOME": "/home/agent", "PATH": "/usr/bin"}
 
-        sandbox = host_sandbox.build(workspace, env=env, require_enforcement=True)
+        sandbox = host_sandbox.build(
+            workspace, env=env, require_enforcement=True, probe=_WORKING_BWRAP
+        )
 
         assert isinstance(sandbox, host_sandbox.HostSandbox)
         assert sandbox.env == env
@@ -519,8 +655,9 @@ class TestBuildSelectsDocker:
         monkeypatch.setattr(
             host_sandbox.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/bwrap"
         )
-        monkeypatch.setattr(host_sandbox, "_bwrap_confines", lambda _path: True)
 
-        sandbox = host_sandbox.build(workspace, env={}, require_enforcement=True)
+        sandbox = host_sandbox.build(
+            workspace, env={}, require_enforcement=True, probe=_WORKING_BWRAP
+        )
 
         assert isinstance(sandbox, host_sandbox.HostSandbox)

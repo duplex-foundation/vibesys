@@ -1,0 +1,375 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import agentshim
+import pytest
+
+# test-isolation: these tests exercise the launcher's own internals, which the facade deliberately hides
+from vs_agent import host_resource_declarations
+from vs_agent.api import declare_provider_state_resources
+from vs_agent.api.testing import fake_profiles
+from vs_sandbox.api import HostResource, HostResourceAccess
+
+_SHIPPED = ("claude", "codex", "gemini", "opencode")
+
+# Stand-in profiles for the tests whose subject is VibeSys's declaration table
+# rather than any CLI's declared state layout. agentshim registers real
+# profiles for all four (and for providers VibeSys does not ship), but a test
+# of the table should fail when the table changes, not when a library release
+# moves one CLI's state directory. `TestShippedProfileState` covers the real
+# profiles.
+_FAKE_PROFILES = {
+    "claude": fake_profiles.profile(
+        "claude",
+        state_dirs=(".claude", ".claude.json", ".config/claude"),
+        darwin_state_dirs=(
+            "Library/Application Support/claude",
+            "Library/Caches/claude",
+        ),
+        state_root_env="CLAUDE_CONFIG_DIR",
+    ),
+    "codex": fake_profiles.profile(
+        "codex",
+        state_dirs=(".codex", ".config/codex"),
+        darwin_state_dirs=(
+            "Library/Application Support/codex",
+            "Library/Application Support/com.openai.codex",
+            "Library/Caches/codex",
+        ),
+        state_root_env="CODEX_HOME",
+        auth_files=(".codex/auth.json",),
+        resume_state_paths=(".codex/sessions",),
+    ),
+    "gemini": fake_profiles.profile("gemini", state_dirs=(".gemini", ".config/gemini")),
+    "opencode": fake_profiles.profile(
+        "opencode",
+        state_dirs=(".local/share/opencode", ".config/opencode"),
+    ),
+}
+
+
+class TestInstallRoot:
+    """Agent packages may need binaries from sibling installation paths."""
+
+    def test_node_package_imports_whole_package_tree(self) -> None:
+        launcher = Path(
+            "/home/u/.nvm/versions/node/v24/lib/node_modules/@openai/codex/bin/codex.js"
+        )
+        root = Path("/home/u/.nvm/versions/node/v24/lib")
+        runtime_paths = {
+            resource.path
+            for resource in host_resource_declarations.declare_agent_host_resources(
+                {}, binary_path=str(launcher), provider="codex"
+            )
+            if resource.purpose == "agent runtime"
+        }
+
+        assert root in runtime_paths
+        platform_bin = Path(
+            "/home/u/.nvm/versions/node/v24/lib/node_modules/@openai/"
+            "codex/node_modules/@openai/codex-linux-x64/bin/codex"
+        )
+        assert platform_bin.is_relative_to(root)
+
+    def test_plain_binary_imports_its_directory(self) -> None:
+        resources = host_resource_declarations.declare_agent_host_resources(
+            {}, binary_path="/opt/tool/bin/agent", provider="codex"
+        )
+        assert HostResource(Path("/opt/tool/bin"), purpose="agent runtime") in resources
+
+
+class TestInterpreterAliasRoots:
+    """A venv reached through an alias directory must import that alias."""
+
+    def test_alias_directory_between_venv_and_install_is_declared(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        install = tmp_path / "cpython-3.14.7"
+        (install / "bin").mkdir(parents=True)
+        real = install / "bin" / "python3.14"
+        real.write_text("#!/bin/false\n")
+        alias = tmp_path / "cpython-3.14"
+        alias.symlink_to(install)
+        venv_bin = tmp_path / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (venv_bin / "python").symlink_to(alias / "bin" / "python3.14")
+        (venv_bin / "python3").symlink_to("python")
+        monkeypatch.setattr(host_resource_declarations.sys, "executable", str(venv_bin / "python3"))
+
+        runtime_roots = {
+            resource.path
+            for resource in host_resource_declarations.declare_agent_host_resources(
+                {"HOME": str(tmp_path)}, binary_path=None, provider="codex"
+            )
+            if resource.purpose == "Python runtime"
+        }
+
+        # The alias, not the resolved install: sys.base_prefix already covers
+        # the resolved path, and only the alias name dangles in the sandbox.
+        assert alias in runtime_roots
+
+    def test_no_alias_declares_nothing_extra(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        real = tmp_path / "usr" / "bin" / "python3.14"
+        real.parent.mkdir(parents=True)
+        real.write_text("#!/bin/false\n")
+        monkeypatch.setattr(host_resource_declarations.sys, "executable", str(real))
+
+        runtime_roots = {
+            resource.path
+            for resource in host_resource_declarations.declare_agent_host_resources(
+                {"HOME": str(tmp_path)}, binary_path=None, provider="codex"
+            )
+            if resource.purpose == "Python runtime"
+        }
+        assert real.parent not in runtime_roots
+
+
+def test_defaults_declare_path_rust_and_shell_resources(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    tool_bin = home / "tools" / "bin"
+    cargo_bin = home / ".cargo" / "bin"
+    rustup_home = home / ".rustup"
+    bash_profile = home / ".bash_profile"
+
+    declarations = host_resource_declarations.declare_agent_host_resources(
+        {"HOME": str(home), "PATH": f"{tool_bin}:/usr/bin"},
+        binary_path=None,
+        provider="codex",
+    )
+    resources = {resource.path: resource.access for resource in declarations}
+
+    assert resources[tool_bin] is HostResourceAccess.READ_ONLY
+    assert resources[cargo_bin] is HostResourceAccess.READ_ONLY
+    assert resources[rustup_home] is HostResourceAccess.READ_ONLY
+    assert resources[bash_profile] is HostResourceAccess.READ_ONLY
+    assert home not in resources
+
+
+def _writable_state(
+    tmp_path: Path,
+    provider: str,
+    env: dict[str, str] | None = None,
+) -> set[str]:
+    declarations = host_resource_declarations.declare_agent_host_resources(
+        {"HOME": str(tmp_path), **(env or {})},
+        binary_path=None,
+        provider=provider,
+    )
+    return {
+        resource.path.relative_to(tmp_path).as_posix()
+        for resource in declarations
+        if resource.access is HostResourceAccess.READ_WRITE
+        and resource.path.is_relative_to(tmp_path)
+    }
+
+
+def _fake_codex_state(
+    tmp_path: Path, env: dict[str, str] | None = None
+) -> tuple[HostResource, ...]:
+    """Declare Codex state through the public API using an inert profile value."""
+    return declare_provider_state_resources(
+        {"HOME": str(tmp_path), **(env or {})},
+        profile=_FAKE_PROFILES["codex"],
+    )
+
+
+@pytest.fixture
+def _fake_profiles_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer every profile lookup from the fakes above, not from agentshim."""
+    fake_profiles.install(monkeypatch, _FAKE_PROFILES)
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected", "forbidden"),
+    [
+        ("codex", ".codex/sessions", ".claude"),
+        ("claude", ".claude", ".gemini"),
+        ("gemini", ".gemini", ".config/opencode"),
+        ("opencode", ".config/opencode", ".codex/auth.json"),
+    ],
+)
+@pytest.mark.usefixtures("_fake_profiles_installed")
+def test_provider_state_is_scoped_to_selected_agent(
+    tmp_path: Path,
+    provider: str,
+    expected: str,
+    forbidden: str,
+) -> None:
+    writable = _writable_state(tmp_path, provider)
+
+    assert expected in writable
+    assert forbidden not in writable
+
+
+def test_codex_state_is_declared_as_leaf_files_not_the_whole_home(
+    tmp_path: Path,
+) -> None:
+    declarations = _fake_codex_state(tmp_path)
+    by_path = {
+        resource.path.relative_to(tmp_path).as_posix(): resource.access for resource in declarations
+    }
+
+    # A Codex checkout may live under $CODEX_HOME/worktrees, so the directory
+    # itself must never be granted (#185). Authentication is immutable input;
+    # sessions persist so a later turn can resume the rollout.
+    assert by_path == {
+        ".codex/auth.json": HostResourceAccess.READ_WRITE,
+        ".codex/sessions": HostResourceAccess.READ_WRITE,
+        ".config/codex": HostResourceAccess.READ_WRITE,
+    }
+    assert ".codex/config.toml" not in by_path
+
+
+def test_codex_home_relocates_the_state_leaves(tmp_path: Path) -> None:
+    relocated = tmp_path / "relocated-codex"
+
+    declarations = _fake_codex_state(tmp_path, {"CODEX_HOME": str(relocated)})
+    by_path = {
+        resource.path.relative_to(tmp_path).as_posix(): resource.access for resource in declarations
+    }
+
+    assert by_path["relocated-codex/auth.json"] is HostResourceAccess.READ_WRITE
+    assert by_path["relocated-codex/sessions"] is HostResourceAccess.READ_WRITE
+    assert "relocated-codex/config.toml" not in by_path
+    assert ".codex/auth.json" not in by_path
+    # $CODEX_HOME does not move the XDG config directory.
+    assert by_path[".config/codex"] is HostResourceAccess.READ_WRITE
+
+
+@pytest.mark.parametrize("name", ["codex", "claude", "newcli"])
+def test_narrowing_follows_the_profile_fact_not_the_provider_name(
+    tmp_path: Path, name: str
+) -> None:
+    """Any provider that declares resume state paths is narrowed to them, and
+    one that declares none is granted whole, whatever it is called."""
+    narrowed = fake_profiles.profile(
+        name,
+        state_dirs=(".state",),
+        auth_files=(".state/auth.json",),
+        resume_state_paths=(".state/history",),
+    )
+    whole = fake_profiles.profile(name, state_dirs=(".state",), auth_files=(".state/auth.json",))
+    env = {"HOME": str(tmp_path)}
+
+    def granted(profile: agentshim.ProviderProfile) -> set[str]:
+        return {
+            r.path.relative_to(tmp_path).as_posix()
+            for r in declare_provider_state_resources(env, profile=profile)
+        }
+
+    assert granted(narrowed) == {".state/auth.json", ".state/history"}
+    assert granted(whole) == {".state"}
+
+
+@pytest.mark.usefixtures("_fake_profiles_installed")
+def test_claude_config_dir_relocates_the_state_root(tmp_path: Path) -> None:
+    """A second provider with a state root variable gets the same generic rule.
+
+    Claude declares no narrowed leaves, so its whole relocated directory is
+    granted, unlike Codex's leaf-only grant.
+    """
+    relocated = tmp_path / "relocated-claude"
+
+    writable = _writable_state(tmp_path, "claude", {"CLAUDE_CONFIG_DIR": str(relocated)})
+
+    assert "relocated-claude" in writable
+    assert ".claude" not in writable
+    # $CLAUDE_CONFIG_DIR only relocates the first state directory.
+    assert ".claude.json" in writable
+    assert ".config/claude" in writable
+
+
+def test_a_provider_agentshim_does_not_register_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unregistered-provider"):
+        _writable_state(tmp_path, "unregistered-provider")
+
+
+class TestShippedProfileState:
+    """The real agentshim profiles, run through the declaration table.
+
+    Nothing here is monkeypatched: these pin that what the four shipped
+    providers actually declare still satisfies what VibeSys derives from it, so
+    a library release that renames or relocates a state directory fails here
+    rather than confining an agent away from its own credentials.
+    """
+
+    @staticmethod
+    def _declarations(tmp_path: Path, provider: str) -> tuple[HostResource, ...]:
+        return tuple(
+            resource
+            for resource in host_resource_declarations.declare_agent_host_resources(
+                {"HOME": str(tmp_path)}, binary_path=None, provider=provider
+            )
+            if resource.purpose.startswith(f"{provider} agent ")
+        )
+
+    @pytest.mark.parametrize("provider", _SHIPPED)
+    def test_every_declared_state_directory_is_granted(self, tmp_path: Path, provider: str) -> None:
+        declarations = self._declarations(tmp_path, provider)
+        granted = {resource.path for resource in declarations}
+
+        if provider != "codex":
+            assert all(
+                resource.access is HostResourceAccess.READ_WRITE for resource in declarations
+            ), declarations
+        for state_dir in agentshim.get_provider(provider).profile.state_dirs:
+            root = tmp_path / state_dir
+            assert any(path == root or path.is_relative_to(root) for path in granted), state_dir
+
+    def test_codex_state_stays_on_the_named_leaves(self, tmp_path: Path) -> None:
+        granted = {resource.path for resource in self._declarations(tmp_path, "codex")}
+        codex_home = tmp_path / ".codex"
+
+        # A Codex checkout may live under $CODEX_HOME/worktrees, so the profile
+        # naming the directory must still not widen the grant to it (#185).
+        assert codex_home not in granted
+        assert {path.name for path in granted if path.is_relative_to(codex_home)} == {
+            "auth.json",
+            "sessions",
+        }
+        by_name = {
+            resource.path.name: resource.access
+            for resource in self._declarations(tmp_path, "codex")
+        }
+        assert by_name["auth.json"] is HostResourceAccess.READ_WRITE
+        assert by_name["sessions"] is HostResourceAccess.READ_WRITE
+        assert "config.toml" not in by_name
+
+
+class TestTaskAgentHostResources:
+    """Only evaluator inputs are imported; no task widens to the Docker socket."""
+
+    def test_nothing_is_declared_without_evaluator_inputs(self) -> None:
+        assert (
+            host_resource_declarations.task_agent_host_resources(
+                cli_sandboxed=False, evaluator_package_root=None
+            )
+            == ()
+        )
+
+    def test_container_backend_owns_its_own_exposure(self, tmp_path: Path) -> None:
+        assert (
+            host_resource_declarations.task_agent_host_resources(
+                cli_sandboxed=True, evaluator_package_root=tmp_path / "evaluator"
+            )
+            == ()
+        )
+
+    def test_evaluator_package_is_read_only(self, tmp_path: Path) -> None:
+        package_root = tmp_path / "evaluator"
+        tools_root = tmp_path / "operator-tools" / "request-factory" / "digest"
+        declarations = host_resource_declarations.task_agent_host_resources(
+            cli_sandboxed=False,
+            evaluator_package_root=package_root,
+            evaluator_tool_roots=(tools_root,),
+        )
+
+        # Read-only: the evaluator is trusted, integrity-checked input no role
+        # may edit.
+        assert {resource.path: resource.access for resource in declarations} == {
+            package_root: HostResourceAccess.READ_ONLY,
+            tools_root: HostResourceAccess.READ_ONLY,
+        }

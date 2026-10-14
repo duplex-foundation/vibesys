@@ -3,11 +3,11 @@ import {
   type ActiveAgentExecution,
   type ExecutionStatus,
   executionStatusFor,
-} from '@vibesys/core-state';
+} from '@vibesys/run-state';
+import {agentRuntimeLabel} from '../agent-runtime-label.js';
 import type {SessionState} from '../session-model.js';
 import {visibleActiveExecutions} from '../session-model.js';
-import {agentRuntimeLabel} from './agent-runtime-label.js';
-import type {Theme} from './theme.js';
+import type {Theme} from '../theme.js';
 
 /** The one braille spinner every in-flight indicator animates. */
 export const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];

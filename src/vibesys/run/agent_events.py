@@ -1,0 +1,310 @@
+"""Translate agent callbacks into presentation-neutral core events."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
+from pydantic import JsonValue, TypeAdapter, ValidationError
+from pydantic_core import to_jsonable_python
+
+from vibesys.events import (
+    AgentOutputChannel,
+    AgentOutputChunkData,
+    AgentStatusData,
+    CoreEvent,
+    CoreEventType,
+    JsonResultPayload,
+    ProviderSwitchedData,
+    QuotaAbandonedData,
+    QuotaPausedData,
+    QuotaResumedData,
+    RateLimitUpdateData,
+    TodoItemData,
+    TodoUpdateData,
+    ToolCallData,
+    ToolResultData,
+    ToolResultPayload,
+    UsageUpdateData,
+    make_core_event,
+)
+from vs_sim.api import Clock, utc_datetime
+
+if TYPE_CHECKING:
+    from vs_agent.api import (
+        AgentQuotaError,
+        AgentRateLimit,
+        Attribution,
+        ProviderSwitch,
+        QuotaPlan,
+        QuotaResumeReason,
+    )
+
+EventSink = Callable[[CoreEvent], object]
+_JSON_VALUE: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
+
+
+def _json_safe(args: dict[str, Any]) -> dict[str, Any]:
+    """Coerce tool arguments to a JSON-serializable dictionary."""
+    return to_jsonable_python(args, fallback=repr)
+
+
+def _classify_tool_result(content: str) -> ToolResultPayload | None:
+    """Preserve JSON-shaped tool results alongside their raw text.
+
+    The content is whatever the tool printed, so it is parsed by pydantic's
+    parser, which reports deep nesting as a ``ValueError``; ``json.loads``
+    raised ``RecursionError`` out of the agent's callback.
+    """
+    try:
+        value = _JSON_VALUE.validate_json(content)
+    except ValidationError:
+        return None
+    if isinstance(value, (dict, list)):
+        return JsonResultPayload(value=value)
+    return None
+
+
+class CoreAgentEventSink:
+    """Map one run's public agent callbacks to typed core events.
+
+    The injected sink owns delivery, persistence, and lifecycle. This adapter
+    only translates one callback into one event and retains no subscribers or
+    process-global state.
+    """
+
+    def __init__(self, sink: EventSink, clock: Clock) -> None:
+        """Send every translated event to ``sink``, stamped by epoch ``clock``."""
+        self._sink = sink
+        self._clock = clock
+
+    def _emit(
+        self,
+        event_type: CoreEventType,
+        data: AgentOutputChunkData
+        | ToolCallData
+        | ToolResultData
+        | TodoUpdateData
+        | UsageUpdateData
+        | RateLimitUpdateData
+        | QuotaPausedData
+        | QuotaResumedData
+        | QuotaAbandonedData
+        | ProviderSwitchedData,
+        *,
+        agent_kind: str | None,
+        round_label: str | None,
+        invocation_id: str | None,
+    ) -> None:
+        self._sink(
+            make_core_event(
+                event_type,
+                timestamp=utc_datetime(self._clock),
+                data=data,
+                agent_kind=agent_kind,
+                round_label=round_label,
+                execution_id=invocation_id,
+            )
+        )
+
+    def agent_output(  # noqa: PLR0913  # lint-waiver: LW-011214 [PLR0913]; This implements AgentEventSink's public named-argument contract exactly.
+        self,
+        content: str,
+        *,
+        channel: AgentOutputChannel = "assistant",
+        status: AgentStatusData | None = None,
+        agent_kind: str | None = None,
+        round_label: str | None = None,
+        invocation_id: str | None = None,
+    ) -> None:
+        """Emit a non-empty agent output chunk with routing metadata."""
+        if not content:
+            return
+        self._emit(
+            CoreEventType.AGENT_OUTPUT_CHUNK,
+            AgentOutputChunkData(channel=channel, content=content, status=status),
+            agent_kind=agent_kind,
+            round_label=round_label,
+            invocation_id=invocation_id,
+        )
+
+    def tool_call(  # noqa: PLR0913  # lint-waiver: LW-011215 [PLR0913]; This implements AgentEventSink's public named-argument contract exactly.
+        self,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        call_id: str | None = None,
+        status: AgentStatusData | None = None,
+        agent_kind: str | None = None,
+        round_label: str | None = None,
+        invocation_id: str | None = None,
+    ) -> None:
+        """Emit a tool call with JSON-safe arguments and routing metadata."""
+        self._emit(
+            CoreEventType.TOOL_CALL,
+            ToolCallData(tool=tool, call_id=call_id, args=_json_safe(args), status=status),
+            agent_kind=agent_kind,
+            round_label=round_label,
+            invocation_id=invocation_id,
+        )
+
+    def tool_result(  # noqa: PLR0913  # lint-waiver: LW-011216 [PLR0913]; This implements AgentEventSink's public named-argument contract exactly.
+        self,
+        tool: str,
+        content: str,
+        *,
+        call_id: str | None = None,
+        is_error: bool = False,
+        payload: ToolResultPayload | None = None,
+        agent_kind: str | None = None,
+        round_label: str | None = None,
+        invocation_id: str | None = None,
+    ) -> None:
+        """Emit a tool result, classifying JSON content without a payload."""
+        resolved_payload = payload if payload is not None else _classify_tool_result(content)
+        self._emit(
+            CoreEventType.TOOL_RESULT,
+            ToolResultData(
+                tool=tool,
+                call_id=call_id,
+                content=content,
+                is_error=is_error,
+                payload=resolved_payload,
+            ),
+            agent_kind=agent_kind,
+            round_label=round_label,
+            invocation_id=invocation_id,
+        )
+
+    def todo_update(
+        self,
+        todos: list[TodoItemData],
+        *,
+        agent_kind: str | None = None,
+        round_label: str | None = None,
+        invocation_id: str | None = None,
+    ) -> None:
+        """Emit a non-empty todo update with routing metadata."""
+        if not todos:
+            return
+        self._emit(
+            CoreEventType.TODO_UPDATE,
+            TodoUpdateData(todos=todos),
+            agent_kind=agent_kind,
+            round_label=round_label,
+            invocation_id=invocation_id,
+        )
+
+    def usage_update(  # noqa: PLR0913  # lint-waiver: LW-011217 [PLR0913]; This implements AgentEventSink's public named-argument contract exactly.
+        self,
+        input_tokens: int,
+        *,
+        context_window: int | None = None,
+        model: str | None = None,
+        agent_kind: str | None = None,
+        round_label: str | None = None,
+        invocation_id: str | None = None,
+    ) -> None:
+        """Emit token usage and optional model context metadata."""
+        self._emit(
+            CoreEventType.USAGE_UPDATE,
+            UsageUpdateData(
+                input_tokens=input_tokens,
+                context_window=context_window,
+                model=model,
+            ),
+            agent_kind=agent_kind,
+            round_label=round_label,
+            invocation_id=invocation_id,
+        )
+
+    def rate_limit_update(
+        self,
+        rate_limit: AgentRateLimit,
+        *,
+        agent_kind: str | None = None,
+        round_label: str | None = None,
+        invocation_id: str | None = None,
+    ) -> None:
+        """Emit one provider-reported rate-limit window with its resolved exhaustion."""
+        self._emit(
+            CoreEventType.RATE_LIMIT_UPDATE,
+            RateLimitUpdateData(
+                provider=rate_limit.provider,
+                window=rate_limit.window,
+                limit=rate_limit.limit,
+                used_fraction=rate_limit.used_fraction,
+                resets_at=rate_limit.resets_at,
+                window_minutes=rate_limit.window_minutes,
+                exhausted=rate_limit.is_exhausted,
+            ),
+            agent_kind=agent_kind,
+            round_label=round_label,
+            invocation_id=invocation_id,
+        )
+
+    def quota_paused(self, error: AgentQuotaError, plan: QuotaPlan, where: Attribution) -> None:
+        """Emit that a turn stopped on a provider capacity limit and the run paused."""
+        self._attributed(
+            CoreEventType.QUOTA_PAUSED,
+            QuotaPausedData.model_validate(
+                {
+                    "provider": error.provider,
+                    "condition": error.condition.value,
+                    "detail": error.detail,
+                    "resets_at": error.resets_at,
+                    "resumes_at": plan.resumes_at,
+                    "policy": plan.policy,
+                    "fallback_provider": plan.fallback_provider,
+                    "fallback_model": plan.fallback_model,
+                }
+            ),
+            where,
+        )
+
+    def quota_resumed(self, provider: str, reason: QuotaResumeReason, where: Attribution) -> None:
+        """Emit that the paused turn is being sent again on the same provider."""
+        self._attributed(
+            CoreEventType.QUOTA_RESUMED, QuotaResumedData(provider=provider, reason=reason), where
+        )
+
+    def quota_abandoned(self, error: AgentQuotaError, reason: str, where: Attribution) -> None:
+        """Emit that the turn ended with the quota error."""
+        self._attributed(
+            CoreEventType.QUOTA_ABANDONED,
+            QuotaAbandonedData(
+                provider=error.provider,
+                condition=error.condition.value,
+                detail=error.detail,
+                reason=reason,
+            ),
+            where,
+        )
+
+    def provider_switched(self, switch: ProviderSwitch, where: Attribution) -> None:
+        """Emit that sessions opened from now on run on the fallback provider."""
+        self._attributed(
+            CoreEventType.PROVIDER_SWITCHED,
+            ProviderSwitchedData(
+                from_provider=switch.from_provider,
+                to_provider=switch.to_provider,
+                to_model=switch.to_model,
+                reason=switch.reason,
+                detail=switch.detail,
+            ),
+            where,
+        )
+
+    def _attributed(
+        self,
+        event_type: CoreEventType,
+        data: QuotaPausedData | QuotaResumedData | QuotaAbandonedData | ProviderSwitchedData,
+        where: Attribution,
+    ) -> None:
+        self._emit(
+            event_type,
+            data,
+            agent_kind=where.agent_kind,
+            round_label=where.round_label,
+            invocation_id=where.invocation_id,
+        )

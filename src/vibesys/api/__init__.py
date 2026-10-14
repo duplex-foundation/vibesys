@@ -1,0 +1,181 @@
+"""The public surface of VibeSys core: the only module other packages import.
+
+Everything else under `vibesys.*` is private to core. `server.*` and
+`entrypoints` talk to core only through this package: the package root is the
+policy-neutral run/observe contract, while explicitly named submodules expose
+built-in policy projections and configuration. `vibesys.api.request` is the
+surface for assembling a `RunRequest`.
+
+Most symbols here are contracts and Protocols; the rest are re-exports of
+core-owned types that consumers legitimately need, so they never import their
+private home modules.
+"""
+
+from __future__ import annotations
+
+from vibesys.api.auxiliary import (
+    AuxiliaryAgentLaunch,
+    AuxiliaryAgents,
+    AuxiliaryReadableInput,
+    ManagedAgent,
+    RunReady,
+)
+from vibesys.api.contracts import (
+    Config,
+    ConfigurationDiagnostic,
+    ConfigurationError,
+    CoreEvent,
+    EventStatus,
+    IterationKind,
+    IterationMetric,
+    IterationProjection,
+    IterationStatus,
+    IterationSummary,
+    IterationSupport,
+    IterationTree,
+    IterationUnavailable,
+    IterationUnavailableReason,
+    OrchestrationDescriptor,
+    PluginProjection,
+    ProfilerKind,
+    ResumeRef,
+    RunFailure,
+    RunFailureKind,
+    RunRequest,
+    RunResult,
+    RunStatus,
+    RunView,
+)
+from vibesys.api.domains import domain_modalities
+from vibesys.api.entry import load_config
+from vibesys.api.runs import RunHandle, Runs
+from vibesys.api.session import RunControl, RunSession, create_session
+from vibesys.api.store import (
+    RunDocument,
+    RunRecord,
+    RunRecordFacts,
+    RunRecordReadError,
+    RunStore,
+    WorkspaceChange,
+    WorkspaceChangeKind,
+    open_run_store,
+)
+from vibesys.composition import agent_spec_from_config
+from vibesys.constants import KNOWN_COMPUTE_BACKENDS, ComputeBackend, DomainName
+from vibesys.events import (
+    AgentExecutionStartedData,
+    AgentOutputChannel,
+    AgentOutputChunkData,
+    AgentStatusData,
+    CommandResultPayload,
+    CoreEventType,
+    FrameworkWarningData,
+    GateFinishedData,
+    GateStartedData,
+    JsonResultPayload,
+    ProviderSwitchedData,
+    QuotaAbandonedData,
+    QuotaPausedData,
+    QuotaResumedData,
+    RateLimitUpdateData,
+    RunConfiguredData,
+    RunFailedData,
+    TodoItemData,
+    TodoUpdateData,
+    ToolCallData,
+    ToolResultData,
+    ToolResultPayload,
+    WinnerSelectedData,
+    WorkspaceSnapshotData,
+)
+from vibesys.plugin_catalog import OrchestrationRegistry
+from vibesys.repository import RepositoryVisibility
+from vibesys.run import CoreAgentEventSink
+from vs_agent.api import AgentBackend, AgentSpec
+from vs_project.api import RunLogText, read_latest_run_log
+from vs_runtime.api import boot_trace
+from vs_runtime.api.infrastructure import RunStopped
+
+__all__ = [
+    "KNOWN_COMPUTE_BACKENDS",
+    "AgentBackend",
+    "AgentExecutionStartedData",
+    "AgentOutputChannel",
+    "AgentOutputChunkData",
+    "AgentSpec",
+    "AgentStatusData",
+    "AuxiliaryAgentLaunch",
+    "AuxiliaryAgents",
+    "AuxiliaryReadableInput",
+    "CommandResultPayload",
+    "ComputeBackend",
+    "Config",
+    "ConfigurationDiagnostic",
+    "ConfigurationError",
+    "CoreAgentEventSink",
+    "CoreEvent",
+    "CoreEventType",
+    "DomainName",
+    "EventStatus",
+    "FrameworkWarningData",
+    "GateFinishedData",
+    "GateStartedData",
+    "IterationKind",
+    "IterationMetric",
+    "IterationProjection",
+    "IterationStatus",
+    "IterationSummary",
+    "IterationSupport",
+    "IterationTree",
+    "IterationUnavailable",
+    "IterationUnavailableReason",
+    "JsonResultPayload",
+    "ManagedAgent",
+    "OrchestrationDescriptor",
+    "OrchestrationRegistry",
+    "PluginProjection",
+    "ProfilerKind",
+    "ProviderSwitchedData",
+    "QuotaAbandonedData",
+    "QuotaPausedData",
+    "QuotaResumedData",
+    "RateLimitUpdateData",
+    "RepositoryVisibility",
+    "ResumeRef",
+    "RunConfiguredData",
+    "RunControl",
+    "RunDocument",
+    "RunFailedData",
+    "RunFailure",
+    "RunFailureKind",
+    "RunHandle",
+    "RunLogText",
+    "RunReady",
+    "RunRecord",
+    "RunRecordFacts",
+    "RunRecordReadError",
+    "RunRequest",
+    "RunResult",
+    "RunSession",
+    "RunStatus",
+    "RunStopped",
+    "RunStore",
+    "RunView",
+    "Runs",
+    "TodoItemData",
+    "TodoUpdateData",
+    "ToolCallData",
+    "ToolResultData",
+    "ToolResultPayload",
+    "WinnerSelectedData",
+    "WorkspaceChange",
+    "WorkspaceChangeKind",
+    "WorkspaceSnapshotData",
+    "agent_spec_from_config",
+    "boot_trace",
+    "create_session",
+    "domain_modalities",
+    "load_config",
+    "open_run_store",
+    "read_latest_run_log",
+]

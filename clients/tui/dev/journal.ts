@@ -38,7 +38,7 @@
 
 import {readFileSync} from 'node:fs';
 import {gunzipSync} from 'node:zlib';
-import type {RunEvent} from '@vibesys/backend-client';
+import type {RunEvent} from '@vibesys/contracts';
 
 /**
  * One recorded journal line.
@@ -201,9 +201,8 @@ export function canonicalJournalEvents(records: RunEventRecord[]): RunEventRecor
           summary: initialActivitySummary(agentKind),
           tool: null,
         },
-        // A legacy journal records no driver, provider, or model anywhere, and
+        // A legacy journal records no provider or model anywhere, and
         // the adapter invents none. The client renders each as absent.
-        driver: null,
         provider: null,
         model: null,
       };

@@ -1,10 +1,25 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
-import type {ErrorBannerState, SessionState} from '../session-model.js';
+import type {ErrorBannerState, ErrorTitleKind, SessionState} from '../session-model.js';
+import type {Theme} from '../theme.js';
 import {fillLayer} from './box-fill.js';
-import type {Theme} from './theme.js';
 
 /** Enough rows to read a useful diagnostic without pushing the run off screen. */
 const ERROR_HEIGHT = 10;
+/** Border, one diagnostic row, and the footer remain useful in the compact form. */
+const MIN_ERROR_HEIGHT = 4;
+
+const ERROR_TITLES: Record<ErrorTitleKind, string> = {
+  configuration: 'Configuration failed',
+  invocation: 'Invocation failed',
+  phase: 'Phase failed',
+  run: 'Run failed',
+  protocol: 'Protocol error',
+  request: 'Request failed',
+  transport: 'Connection lost',
+  input: 'Input error',
+  run_interruption: 'Run interrupted',
+  quota_pause: 'Paused on provider quota',
+};
 
 function context(banner: ErrorBannerState): string {
   return [banner.agentKind, banner.roundLabel]
@@ -44,7 +59,7 @@ export class ErrorBannerView {
       visible: false,
     });
     // The surface the diagnostic reads on, on its own layer so the banner keeps
-    // its rounded frame (tui-conventions.md).
+    // its rounded frame (tui/conventions.md).
     this.#fill = fillLayer(this.output, 'error-banner-fill', theme.canvas);
     this.#scroll = new ScrollBoxRenderable(renderer, {
       id: 'error-banner-scroll',
@@ -68,26 +83,29 @@ export class ErrorBannerView {
     this.#scroll.scrollBy(delta, 'viewport');
   }
 
-  render(state: SessionState): void {
+  /** Renders the banner and returns the rows allocated to it in this paint. */
+  render(state: SessionState, maxHeight: number): number {
     const banner = state.errorBanner;
     if (banner === null) {
       this.output.visible = false;
       this.#rendered = null;
-      return;
+      return 0;
     }
     this.output.visible = true;
-    if (banner === this.#rendered) return;
+    const height = Math.max(MIN_ERROR_HEIGHT, Math.min(ERROR_HEIGHT, maxHeight));
+    this.output.height = height;
+    if (banner === this.#rendered) return height;
     this.#rendered = banner;
     this.#clear();
     this.output.borderColor = banner.severity === 'fatal' ? this.#theme.error : this.#theme.warning;
-    this.output.height = ERROR_HEIGHT;
     this.#renderContent(banner);
+    return height;
   }
 
   #renderContent(banner: ErrorBannerState): void {
     const where = context(banner);
     const count = banner.count > 1 ? ` · ${banner.count} reports` : '';
-    this.output.title = ` ${banner.title}${where ? ` · ${where}` : ''}${count} `;
+    this.output.title = ` ${ERROR_TITLES[banner.titleKind]}${where ? ` · ${where}` : ''}${count} `;
     this.output.add(this.#scroll);
     this.#scroll.add(
       new TextRenderable(this.renderer, {

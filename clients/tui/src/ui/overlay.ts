@@ -1,7 +1,20 @@
 import {BoxRenderable, type CliRenderer, ScrollBoxRenderable, TextRenderable} from '@opentui/core';
-import {focusedPane, type RightPane, type SessionState} from '../session-model.js';
+import {
+  type DiffLineTone,
+  diffHunkDisplayLine,
+  diffViewerLines,
+  diffViewerTitle,
+} from '../diff-viewer.js';
+import {
+  type DiffViewerState,
+  focusedPane,
+  type RightPane,
+  type SessionState,
+} from '../session-model.js';
+import {scrim, type Theme} from '../theme.js';
 import {applyPaneFocus} from './focus.js';
-import {scrim, type Theme} from './theme.js';
+import {fitModalRows, type ModalViewport} from './modal-geometry.js';
+import {rightPaneContent, rightPaneTitle} from './right-pane.js';
 
 type OverlayKind = NonNullable<SessionState['overlay']>['kind'];
 
@@ -12,12 +25,29 @@ const TITLE: Record<OverlayKind, string> = {
 };
 
 const HINT = 'Esc to close · PgUp/PgDn: scroll';
+const DIFF_HINT = '←→: file · ↑↓: hunk · PgUp/PgDn: scroll · Esc: close';
 
 /**
- * The share of the screen the box takes. It is applied in whole rows and
- * columns rather than as a Yoga percentage: a fractional box edge rounds the
- * hint back onto the scroll viewport's last row, which hides the final line of
- * content.
+ * Add and remove carry the two verdict colours; hunk headers take the accent
+ * so `↑↓` lands somewhere visible; git's own headers recede as chrome; and
+ * the viewer's notices (truncation, a failed query, a missing repository)
+ * take the warning tone because each one says the patch on screen is not the
+ * whole story.
+ */
+function diffToneColor(theme: Theme, tone: DiffLineTone): string {
+  if (tone === 'add') return theme.success;
+  if (tone === 'remove') return theme.error;
+  if (tone === 'hunk') return theme.info;
+  if (tone === 'meta') return theme.textSubtle;
+  if (tone === 'notice') return theme.warning;
+  return theme.textPrimary;
+}
+
+/**
+ * The share of the terminal width and root-owned modal rows the box takes. It
+ * is applied in whole rows and columns rather than as a Yoga percentage: a
+ * fractional box edge rounds the hint back onto the scroll viewport's last
+ * row, which hides the final line of content.
  */
 const WIDTH_SHARE = 0.7;
 const LEFT_SHARE = 0.15;
@@ -53,6 +83,9 @@ export class OverlayView {
   #renderedKind: OverlayKind | null = null;
   #renderedContent = '';
   #renderedPane: RightPane | null = null;
+  #renderedExperiments: SessionState['experimentLog'] = null;
+  #renderedDesignLog: SessionState['designLog'] = null;
+  #renderedDiff: DiffViewerState | null = null;
 
   constructor(
     private readonly renderer: CliRenderer,
@@ -80,7 +113,7 @@ export class OverlayView {
       paddingLeft: 1,
       paddingRight: 1,
       border: true,
-      // Square with an outer fill, the overlay exception (tui-conventions.md):
+      // Square with an outer fill, the overlay exception (tui/conventions.md):
       // the fill is what makes this modal opaque over whatever it covers, ring
       // included, and a fill that reaches the ring needs a square corner.
       borderStyle: 'single',
@@ -133,6 +166,9 @@ export class OverlayView {
     this.#renderedKind = null;
     this.#renderedContent = '';
     this.#renderedPane = null;
+    this.#renderedExperiments = null;
+    this.#renderedDesignLog = null;
+    this.#renderedDiff = null;
   }
 
   /**
@@ -142,12 +178,23 @@ export class OverlayView {
    * asks `focusedPane` the same question rather than appearing as a `Command`
    * box with none of the focus treatment on the one thing taking keystrokes.
    */
-  render(state: SessionState, pane: RightPane | null = null): void {
+  render(state: SessionState, pane: RightPane | null, viewport: ModalViewport): void {
+    // The diff viewer is the innermost layer this box can carry, so it wins
+    // over both an ordinary overlay and the narrow-terminal pane fallback,
+    // exactly as its keybinding block precedes theirs.
+    if (state.diffViewer !== null) {
+      this.#renderDiff(state.diffViewer, viewport);
+      return;
+    }
+    this.#renderedDiff = null;
+    this.#hint.content = HINT;
     if (pane !== null) {
-      this.#renderPane(state, pane);
+      this.#renderPane(state, pane, viewport);
       return;
     }
     this.#renderedPane = null;
+    this.#renderedExperiments = null;
+    this.#renderedDesignLog = null;
     const overlay = state.overlay;
     if (overlay === null) {
       this.output.visible = false;
@@ -159,7 +206,7 @@ export class OverlayView {
       return;
     }
     this.output.visible = true;
-    this.#applyGeometry();
+    this.#applyGeometry(viewport);
     if (this.#renderedKind === overlay.kind && this.#renderedContent === overlay.content) return;
     this.#renderedKind = overlay.kind;
     this.#renderedContent = overlay.content;
@@ -172,28 +219,89 @@ export class OverlayView {
     );
   }
 
-  #renderPane(state: SessionState, pane: RightPane): void {
+  #renderPane(state: SessionState, pane: RightPane, viewport: ModalViewport): void {
     this.output.visible = true;
-    this.#applyGeometry();
+    this.#applyGeometry(viewport);
     // Outside the cache below: focus moves without the content changing.
-    applyPaneFocus(this.output, this.#theme, pane.title, focusedPane(state) === 'performance');
+    applyPaneFocus(
+      this.output,
+      this.#theme,
+      rightPaneTitle(pane),
+      focusedPane(state) === 'performance',
+    );
     // `applyPaneFocus` also stamps the pane frame, which is rounded. This box
     // is an overlay in both of its roles, so it keeps the outer fill and with
-    // it the square corner (tui-conventions.md), and takes only the title and
+    // it the square corner (tui/conventions.md), and takes only the title and
     // the border colour from the pane treatment. Frame weight was never one of
     // the focus channels anyway; `PANE_BORDER` says why.
     this.output.borderStyle = 'single';
-    if (pane === this.#renderedPane) return;
+    if (
+      pane === this.#renderedPane &&
+      state.experimentLog === this.#renderedExperiments &&
+      state.designLog === this.#renderedDesignLog
+    ) {
+      return;
+    }
     this.#renderedPane = pane;
+    this.#renderedExperiments = state.experimentLog;
+    this.#renderedDesignLog = state.designLog;
     // The next ordinary overlay repaints its own title and border rather than
     // inheriting the pane's.
     this.#renderedKind = null;
     this.#renderedContent = '';
     this.#clear();
+    const content = rightPaneContent(state, pane);
     if (pane.error !== null) this.#body(pane.error, this.#theme.conversation.failure.content);
-    else if (pane.pending && pane.content === '') {
+    else if (pane.pending && content === null) {
       this.#body('Loading...', this.#theme.textSubtle);
-    } else this.#body(pane.content, this.#theme.textPrimary);
+    } else this.#body(content ?? '', this.#theme.textPrimary);
+  }
+
+  /**
+   * The per-round diff viewer. Unlike the other modes, the body is one
+   * renderable per row, unwrapped: a patch line's row index is then its line
+   * index, which is what lets hunk navigation scroll straight to the `@@`
+   * header `diffHunkDisplayLine` names. Rebuilt only when the file on screen
+   * or its patch slot changes; a hunk move reuses the rows and just scrolls.
+   */
+  #renderDiff(viewer: DiffViewerState, viewport: ModalViewport): void {
+    this.output.visible = true;
+    this.#applyGeometry(viewport);
+    const previous = this.#renderedDiff;
+    if (previous === viewer) return;
+    this.#renderedDiff = viewer;
+    // The next ordinary overlay or pane repaints its own chrome and content
+    // rather than inheriting the diff's.
+    this.#renderedKind = null;
+    this.#renderedContent = '';
+    this.#renderedPane = null;
+    this.#hint.content = DIFF_HINT;
+    this.output.borderColor = this.#theme.info;
+    this.output.title = ` ${diffViewerTitle(viewer)} `;
+    if (previous === null || !sameDiffBody(previous, viewer)) {
+      this.#clear();
+      for (const line of diffViewerLines(viewer)) {
+        this.#scroll.add(
+          new TextRenderable(this.renderer, {
+            content: line.text,
+            fg: diffToneColor(this.#theme, line.tone),
+            width: '100%',
+            height: 1,
+            flexShrink: 0,
+            wrapMode: 'none',
+            truncate: true,
+          }),
+        );
+      }
+      // A fresh body starts at the top, where the file header and git's own
+      // header lines say what the patch is, rather than at the first hunk.
+      this.#scroll.scrollTo(0);
+      return;
+    }
+    if (previous.hunk !== viewer.hunk) {
+      const target = diffHunkDisplayLine(viewer);
+      if (target !== null) this.#scroll.scrollTo(target);
+    }
   }
 
   /** One wrapped block in the scroll viewport, rebuilt per overlay or pane. */
@@ -211,17 +319,19 @@ export class OverlayView {
   }
 
   /** Whole-row, whole-column geometry, recomputed as the terminal resizes. */
-  #applyGeometry(): void {
+  #applyGeometry(viewport: ModalViewport): void {
     const columns = this.renderer.terminalWidth;
-    const rows = this.renderer.terminalHeight;
     this.output.width = Math.round(columns * WIDTH_SHARE);
     this.output.left = Math.round(columns * LEFT_SHARE);
-    const top = Math.round(rows * TOP_SHARE);
-    this.output.top = top;
-    this.output.height = Math.max(
+    const rows = fitModalRows(
+      viewport,
+      Math.round(viewport.height * TOP_SHARE),
+      Math.round(viewport.height * HEIGHT_SHARE),
       MIN_ROWS,
-      Math.min(Math.round(rows * HEIGHT_SHARE), rows - COMMAND_SURFACE_ROWS - top),
+      COMMAND_SURFACE_ROWS,
     );
+    this.output.top = rows.top;
+    this.output.height = rows.height;
   }
 
   #clear(): void {
@@ -230,4 +340,23 @@ export class OverlayView {
       child.destroyRecursively();
     }
   }
+}
+
+/**
+ * Whether two viewer states draw the same rows: the same file of the same
+ * range, holding the same patch slot. A hunk move passes, which is what lets
+ * `#renderDiff` scroll instead of rebuilding several thousand patch rows.
+ */
+function sameDiffBody(previous: DiffViewerState, next: DiffViewerState): boolean {
+  if (
+    previous.round !== next.round ||
+    previous.base !== next.base ||
+    previous.head !== next.head ||
+    previous.index !== next.index ||
+    previous.files !== next.files
+  ) {
+    return false;
+  }
+  const path = next.files[next.index]?.path;
+  return path !== undefined && previous.patches[path] === next.patches[path];
 }

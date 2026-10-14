@@ -1,11 +1,23 @@
 import {afterEach, describe, expect, it} from 'bun:test';
-import {access, chmod, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
+import {spawn} from 'node:child_process';
+import {
+  access,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {dirname, join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {launch} from './launcher.js';
 
 let tempDir: string | undefined;
+let nodeLauncher: string | undefined;
 const savedPython = process.env['VIBESYS_PYTHON'];
 const savedRuntime = process.env['VIBESYS_TUI_RUNTIME'];
 const savedEntrypoint = process.env['VIBESYS_TUI_ENTRYPOINT'];
@@ -31,6 +43,7 @@ afterEach(async () => {
   delete process.env['VIBESYS_FAKE_FRONTEND_THEME_FILE'];
   if (tempDir) await rm(tempDir, {recursive: true, force: true});
   tempDir = undefined;
+  nodeLauncher = undefined;
 });
 
 describe('launcher', () => {
@@ -97,14 +110,25 @@ process.exit(0);
 
   it('reports the backend log when the backend dies before it listens', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
+    const frontendReady = join(tempDir, 'frontend-ready');
     const frontendTerminated = join(tempDir, 'frontend-terminated');
     const backend = await writeExecutable(
       'doomed-backend.mjs',
       `
+import {existsSync, watch} from 'node:fs';
+
 console.error('vibesys: configuration is unreadable');
-// Give the concurrently spawned frontend time to install its signal handler,
-// so the test observes the launcher's termination rather than an OS-level race.
-setTimeout(() => process.exit(3), 250);
+const ready = ${JSON.stringify(frontendReady)};
+const fail = () => process.exit(3);
+const watcher = watch(${JSON.stringify(tempDir)}, () => {
+  if (!existsSync(ready)) return;
+  watcher.close();
+  fail();
+});
+if (existsSync(ready)) {
+  watcher.close();
+  fail();
+}
 `,
     );
     const frontend = await writeExecutable(
@@ -115,6 +139,7 @@ process.on('SIGTERM', () => {
   writeFileSync(${JSON.stringify(frontendTerminated)}, 'terminated');
   process.exit(143);
 });
+writeFileSync(${JSON.stringify(frontendReady)}, 'ready');
 setInterval(() => undefined, 1000);
 `,
     );
@@ -138,6 +163,125 @@ setInterval(() => undefined, 1000);
     expect(errors.join('\n')).toContain('backend exited with status 3');
     expect(errors.join('\n')).toContain('configuration is unreadable');
   }, 15_000);
+
+  it('preserves the backend diagnostic ahead of a longer usage block', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
+    const frontendReady = join(tempDir, 'frontend-ready');
+    const frontendTerminated = join(tempDir, 'frontend-terminated');
+    const backend = await writeExecutable(
+      'usage-error-backend.mjs',
+      `
+import {existsSync, watch} from 'node:fs';
+
+const ready = ${JSON.stringify(frontendReady)};
+const usage = Array.from({length: 39}, (_, index) => \`usage line \${index + 1}\`);
+const fail = () => {
+  console.error('vibesys: unrecognized arguments: --zzbogus');
+  console.error(usage.join('\\n'));
+  process.exit(3);
+};
+const watcher = watch(${JSON.stringify(tempDir)}, () => {
+  if (!existsSync(ready)) return;
+  watcher.close();
+  fail();
+});
+if (existsSync(ready)) {
+  watcher.close();
+  fail();
+}
+`,
+    );
+    const frontend = await writeExecutable(
+      'waiting-frontend.mjs',
+      `
+import {writeFileSync} from 'node:fs';
+process.on('SIGTERM', () => {
+  writeFileSync(${JSON.stringify(frontendTerminated)}, 'terminated');
+  process.exit(143);
+});
+writeFileSync(${JSON.stringify(frontendReady)}, 'ready');
+setInterval(() => undefined, 1000);
+`,
+    );
+
+    const result = await runLauncherCli(['--stub-agent', '--zzbogus'], {
+      VIBESYS_PYTHON: backend,
+      VIBESYS_TUI_RUNTIME: process.execPath,
+      VIBESYS_TUI_ENTRYPOINT: frontend,
+      VIBESYS_RELEASE_SMOKE_MARKER: '',
+    });
+
+    expect(result.exitCode).toBe(3);
+    await access(frontendTerminated);
+    const lines = result.stderr.trimEnd().split(/\r?\n/);
+    expect(lines[0]).toBe('vs: backend exited with status 3');
+    expect(lines[1]).toBe('vibesys: unrecognized arguments: --zzbogus');
+    expect(lines).toHaveLength(21);
+    expect(lines[2]).toBe('usage line 21');
+    expect(lines).toContain('usage line 39');
+  }, 15_000);
+
+  it('reports configured backend spawn failures and removes each session', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
+    const frontend = await writeExecutable('unused-frontend.mjs', 'process.exit(0);');
+    const missingPython = join(tempDir, 'missing-python');
+    const nonExecutablePython = join(tempDir, 'non-executable-python');
+    await writeFile(nonExecutablePython, '#!/bin/sh\nexit 0\n');
+    await chmod(nonExecutablePython, 0o644);
+
+    for (const [name, python, errorCode] of [
+      ['missing', missingPython, 'ENOENT'],
+      ['non-executable', nonExecutablePython, 'EACCES'],
+    ] as const) {
+      const sessionRoot = join(tempDir, `${name}-sessions`);
+      await mkdir(sessionRoot);
+      const result = await runLauncherCli([], {
+        TMPDIR: sessionRoot,
+        VIBESYS_PYTHON: python,
+        VIBESYS_TUI_RUNTIME: 'node',
+        VIBESYS_TUI_ENTRYPOINT: frontend,
+        VIBESYS_RELEASE_SMOKE_MARKER: '',
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.trim().split(/\r?\n/)).toHaveLength(1);
+      expect(result.stderr).toStartWith('vs: failed to start backend: ');
+      expect(result.stderr).toContain(python);
+      expect(result.stderr).toContain(errorCode);
+      expect(result.stderr).not.toContain("Unhandled 'error' event");
+      expect(await readdir(sessionRoot)).toEqual([]);
+    }
+  });
+
+  it('reports a frontend spawn failure and removes the session', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
+    const sessionRoot = join(tempDir, 'sessions');
+    const runtimeDirectory = join(tempDir, 'runtime-directory');
+    await mkdir(sessionRoot);
+    await mkdir(runtimeDirectory);
+    const frontend = await writeExecutable('unused-frontend.mjs', 'process.exit(0);');
+    const backend = await writeExecutable(
+      'long-lived-backend.mjs',
+      'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
+    );
+
+    const result = await runLauncherCli([], {
+      TMPDIR: sessionRoot,
+      VIBESYS_PYTHON: backend,
+      VIBESYS_TUI_RUNTIME: runtimeDirectory,
+      VIBESYS_TUI_ENTRYPOINT: frontend,
+      VIBESYS_RELEASE_SMOKE_MARKER: '',
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.trim().split(/\r?\n/)).toHaveLength(1);
+    expect(result.stderr).toStartWith('vs: failed to start frontend: ');
+    expect(result.stderr).toContain(runtimeDirectory);
+    expect(result.stderr).toContain('EACCES');
+    expect(result.stderr).not.toContain("Unhandled 'error' event");
+    expect(await readdir(sessionRoot)).toEqual([]);
+    expect(await processCommandsContaining(backend)).toEqual([]);
+  });
 
   it('terminates a lingering frontend when the backend dies after it listens', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'vs-launcher-test-'));
@@ -499,9 +643,49 @@ process.exit(0);
   });
 
   it('returns the backend argument error for an explicitly empty runs directory', async () => {
+    // The Python side (rejecting an empty --runs-dir and streaming
+    // configuration_failed) is covered by tests/entrypoints/test_headless.py
+    // and tests/server/test_runtime.py. This test only needs a backend that
+    // behaves that way, so it uses a fake one instead of the developer's
+    // .venv interpreter.
     tempDir = await mkdtemp(join(tmpdir(), 'vibesys-launcher-'));
     const frontendMarker = join(tempDir, 'frontend-started');
     const failureMarker = join(tempDir, 'configuration-failure.json');
+    const backendArgs = join(tempDir, 'backend-args.json');
+    const backend = await writeExecutable(
+      'failing-backend.mjs',
+      `
+import {writeFileSync} from 'node:fs';
+import {createServer} from 'node:net';
+
+writeFileSync(${JSON.stringify(backendArgs)}, JSON.stringify(process.argv.slice(2)));
+const socketPath = process.argv[process.argv.indexOf('--control-socket') + 1];
+const server = createServer(socket => {
+  socket.once('data', data => {
+    const request = JSON.parse(data.toString().split('\\n')[0]);
+    const event = {
+      sequence: 1,
+      type: 'configuration_failed',
+      data: {
+        code: 'invalid_arguments',
+        stage: 'argument_parsing',
+        message: 'argument --runs-dir: must not be empty',
+      },
+    };
+    socket.write(JSON.stringify({
+      protocol_version: 1,
+      request_id: request.request_id,
+      timestamp: '1970-01-01T00:00:00Z',
+      type: 'event',
+      event,
+    }) + '\\n');
+    // Exit once the client has read the failure and hung up.
+    socket.once('close', () => process.exit(2));
+  });
+});
+server.listen(socketPath);
+`,
+    );
     const frontend = await writeExecutable(
       'unused-frontend.mjs',
       `
@@ -526,15 +710,8 @@ socket.on('data', chunk => {
     const newline = buffer.indexOf('\\n');
     const message = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
-    const events = message.type === 'event' ? [message.event] :
-      message.type === 'event_batch' ? message.events : [];
-    const failure = events.find(event => event.type === 'configuration_failed');
-    if (failure) {
-      writeFileSync(${JSON.stringify(failureMarker)}, JSON.stringify(failure));
-      socket.end();
-      return;
-    }
-    if (events.some(event => event.type === 'run_finished' || event.type === 'run_failed')) {
+    if (message.type === 'event' && message.event.type === 'configuration_failed') {
+      writeFileSync(${JSON.stringify(failureMarker)}, JSON.stringify(message.event));
       socket.end();
       return;
     }
@@ -559,9 +736,7 @@ async function connectWithRetry(path) {
 }
 `,
     );
-    const python = join(dirname(fileURLToPath(import.meta.url)), '../../../.venv/bin/python');
-    process.chdir(tempDir);
-    process.env['VIBESYS_PYTHON'] = python;
+    process.env['VIBESYS_PYTHON'] = backend;
     process.env['VIBESYS_TUI_RUNTIME'] = process.execPath;
     process.env['VIBESYS_TUI_ENTRYPOINT'] = frontend;
 
@@ -569,13 +744,15 @@ async function connectWithRetry(path) {
       launch(['--stub-agent', '--local', '--max-rounds', '0', '--runs-dir=']),
     ).resolves.toBe(2);
     await access(frontendMarker);
+    // The launcher forwards the explicitly empty value untouched.
+    const forwarded = JSON.parse(await readFile(backendArgs, 'utf8')) as string[];
+    expect(forwarded).toContain('--runs-dir=');
     const failure = JSON.parse(await readFile(failureMarker, 'utf8')) as {
       data: {code: string; stage: string; message: string};
     };
     expect(failure.data.code).toBe('invalid_arguments');
     expect(failure.data.stage).toBe('argument_parsing');
     expect(failure.data.message).toContain('argument --runs-dir: must not be empty');
-    await expect(access(join(tempDir, 'exp_env'))).rejects.toThrow();
   }, 15_000);
 });
 
@@ -585,4 +762,66 @@ async function writeExecutable(name: string, source: string): Promise<string> {
   await writeFile(path, `#!/usr/bin/env node\n${source}`);
   await chmod(path, 0o755);
   return path;
+}
+
+async function runLauncherCli(
+  argv: readonly string[],
+  env: Readonly<Record<string, string>>,
+): Promise<{exitCode: number; stderr: string}> {
+  const launcher = await buildNodeLauncher();
+  const child = Bun.spawn(['node', launcher, ...argv], {
+    env: {...process.env, ...env},
+    stdin: 'ignore',
+    stdout: 'ignore',
+    stderr: 'pipe',
+  });
+  const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+  return {exitCode, stderr};
+}
+
+async function buildNodeLauncher(): Promise<string> {
+  if (nodeLauncher) return nodeLauncher;
+  if (!tempDir) throw new Error('tempDir is required');
+  const result = await Bun.build({
+    entrypoints: [fileURLToPath(new URL('./launcher.ts', import.meta.url))],
+    outdir: join(tempDir, 'node-launcher'),
+    target: 'node',
+    format: 'esm',
+    naming: 'launcher.mjs',
+  });
+  if (!result.success) {
+    throw new Error(result.logs.map(log => log.message).join('\n'));
+  }
+  const output = result.outputs.find(candidate => candidate.path.endsWith('/launcher.mjs'));
+  if (!output) throw new Error('Node launcher bundle was not emitted');
+  nodeLauncher = output.path;
+  return nodeLauncher;
+}
+
+async function processCommandsContaining(marker: string): Promise<string[]> {
+  const child = spawn('ps', ['-eo', 'comm=,args='], {stdio: ['ignore', 'pipe', 'pipe']});
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', chunk => {
+    stdout += chunk;
+  });
+  child.stderr.on('data', chunk => {
+    stderr += chunk;
+  });
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', code => {
+      if (code !== 0) {
+        reject(new Error(`ps exited ${code ?? 'from a signal'}: ${stderr.trim()}`));
+        return;
+      }
+      resolve(
+        stdout
+          .split(/\r?\n/)
+          .filter(command => /^node\s/.test(command.trimStart()) && command.includes(marker)),
+      );
+    });
+  });
 }

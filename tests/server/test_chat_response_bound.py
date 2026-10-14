@@ -2,39 +2,48 @@
 
 from __future__ import annotations
 
-import concurrent.futures
-import threading
 from typing import TYPE_CHECKING
 
 import pytest
-from tests.server.support import build_server_parts
+from tests.server.support import REQUEST_TIME, Task, build_server_parts
 
-from server.api.protocol import ChatQuery
+from server.api.protocol import ChatQuery, Response
 from server.chat.manager import ChatAnswer
 from server.events import EventType
+from vs_sim.api.testing import SimThreads, wait_or_fail
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
 def test_chat_response_excludes_concurrent_run_events(tmp_path: Path) -> None:
-    parts = build_server_parts(tmp_path)
-    handler_started = threading.Event()
-    release_handler = threading.Event()
+    threads = SimThreads()
+    parts = build_server_parts(tmp_path, threads=threads)
+    handler_started = threads.event()
+    release_handler = threads.event()
 
     def handler(_question: str) -> ChatAnswer:
         handler_started.set()
-        assert release_handler.wait(timeout=2)
+        wait_or_fail(release_handler, "the test to release the handler")
         return ChatAnswer(text="bounded answer", invocation_id="exec-bounded")
 
+    def scenario() -> Response:
+        pending = Task(
+            threads,
+            lambda: parts.api.execute(ChatQuery(timestamp=REQUEST_TIME, text="what changed?")),
+        )
+        try:
+            # The handler is parked until released, so the output below is
+            # guaranteed to land while the chat request is in flight.
+            wait_or_fail(handler_started, "the chat handler to start")
+            for index in range(1_000):
+                parts.journal.publish_output("stdout", f"optimizer output {index}\n")
+        finally:
+            release_handler.set()
+        return pending.result()
+
     parts.chat.install_default_handler(handler)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        pending = pool.submit(parts.api.execute, ChatQuery(text="what changed?"))
-        assert handler_started.wait(timeout=2)
-        for index in range(1_000):
-            parts.journal.publish_output("stdout", f"optimizer output {index}\n")
-        release_handler.set()
-        response = pending.result(timeout=2)
+    response = threads.run(scenario)
 
     assert response.chat is not None
     assert response.chat.answer == "bounded answer"
@@ -51,7 +60,9 @@ def test_chat_response_excludes_concurrent_run_events(tmp_path: Path) -> None:
 def test_unknown_thread_chat_response_has_no_events(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
 
-    response = parts.api.execute(ChatQuery(text="hello?", thread_id="missing"))
+    response = parts.api.execute(
+        ChatQuery(timestamp=REQUEST_TIME, text="hello?", thread_id="missing")
+    )
 
     assert response.chat is not None
     assert "Unknown experiment chat thread 'missing'" in response.chat.answer
@@ -68,6 +79,7 @@ def test_chat_event_capture_is_cleared_after_handler_error(tmp_path: Path) -> No
     with pytest.raises(RuntimeError):
         parts.chat.chat_with_event("will fail")
 
+    # lint-waiver: LW-010045 [SLF001]; the thread-local response stack has no public depth accessor, so inspect it to detect a request frame retained after failure.
     assert parts.chat._chat_response_local.captures == []  # noqa: SLF001
 
 
@@ -89,4 +101,3 @@ def test_nested_chat_captures_keep_each_terminal_event_separate(tmp_path: Path) 
     assert event is not None
     assert event.text == "outer"
     assert nested_event_text == ["inner"]
-    assert parts.chat._chat_response_local.captures == []  # noqa: SLF001

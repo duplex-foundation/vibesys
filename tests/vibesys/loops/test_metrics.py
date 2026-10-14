@@ -1,4 +1,14 @@
-"""Tests for the metric space shared by the optimization loops."""
+"""Tests for the metric space shared by the optimization loops.
+
+Guarantees under test:
+
+* A metric space is frozen with unique axes and a validated relative noise.
+* Comparison is direction-aware and decided only outside the noise tolerance (exactly at the
+  tolerance is noise; a zero baseline or zero noise compares strictly); missing or mismatched
+  evidence is incomparable.
+* Dominance needs every axis and one material win; the frontier keeps every tradeoff and drops
+  dominated points; completeness needs a value on every configured axis.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +17,7 @@ from typing import Literal
 import pytest
 from pydantic import ValidationError
 
-from vibesys.loops.metrics import Measurement, MetricComparison, MetricSpace, Objective
+from vibesys.metrics import Measurement, MetricComparison, MetricSpace, Objective
 
 _OPS = Objective(name="ops", direction="max")
 _LATENCY = Objective(name="latency", direction="min")
@@ -39,6 +49,15 @@ def test_the_axis_supplies_the_direction_a_reading_omits() -> None:
     assert space.direction(Measurement(metric="ops", value=1.0, direction="min")) == "min"
     assert space.direction(_reading(1.0, "unknown")) is None
     assert space.direction(None) is None
+
+
+def test_signed_primary_orients_headline_values_for_ranking() -> None:
+    maximizing = MetricSpace(objectives=(_OPS,))
+    minimizing = MetricSpace(objectives=(_LATENCY,))
+
+    assert maximizing.signed_primary(12.0) == 12.0
+    assert minimizing.signed_primary(12.0) == -12.0
+    assert MetricSpace().signed_primary(12.0) == 12.0
 
 
 @pytest.mark.parametrize("direction", ["max", "min"])

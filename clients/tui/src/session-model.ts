@@ -1,45 +1,58 @@
 import type {
-  ChatOptions,
   DesignFileChange,
   DesignRound,
   Diagnostic,
   HypothesisEntry,
-  HypothesisRound,
+  IterationResult,
+  IterationSummary,
+  ProtocolResponse,
   RunEvent,
   RunSnapshot,
-} from '@vibesys/backend-client';
+} from '@vibesys/contracts';
 import {
   type ActiveAgentExecution,
   type ActiveExecutionCheckpoint,
-  type AgentPhase,
-  type ChatThread,
   type CoreDiagnostic,
-  type CoreRunStatus,
   type CoreState,
-  DEFAULT_CHAT_THREAD_ID,
   type ExecutionTodos,
   hasRunEnded,
+  type IterationNavigationState,
   initialCoreState,
+  initialIterationNavigation,
+  iterationRoots,
   latestDiagnosticChange,
-  phasesForRound,
-  type RoundState,
-  reconcileActiveExecutions,
   reduceEvent,
   reduceEventBatch,
   reduceEventPrefix,
   reduceEventRebootstrap,
+  reduceIterationResult,
+  reduceResponseEvents,
   reduceSnapshot,
   type TodoItem,
-  type TranscriptEntry,
-} from '@vibesys/core-state';
-import {agentRuntimeLabel} from './ui/agent-runtime-label.js';
-import {DEFAULT_THEME_NAME, THEME_NAMES, type ThemeName} from './ui/theme.js';
+} from '@vibesys/run-state';
+import {
+  type AgentPhase,
+  phasesForRound,
+  type RoundState,
+  roundsWithPlan,
+} from '@vibesys/run-state/rounds';
+import {DEFAULT_CHAT_THREAD_ID, type TranscriptEntry} from '@vibesys/run-state/transcript';
+import {agentRuntimeLabel} from './agent-runtime-label.js';
+import * as diagnosticProjection from './diagnostic-projection.js';
+import type {NoteRecord} from './notes-store.js';
+import * as quotaProjection from './quota-projection.js';
+import {DEFAULT_THEME_NAME, type ThemeName} from './theme.js';
 
 export interface SessionState {
   /** Pure projection of backend snapshots, events, and execution checkpoints. */
   readonly core: CoreState;
+  /** Query-derived policy navigation, separate from the event-derived core fold. */
+  readonly iterations: IterationNavigationState;
   /** False after the frontend loses a trustworthy backend event stream. */
   eventStreamAvailable: boolean;
+  /** Stable policy iteration identity selected in the navigation rail. */
+  selectedIterationId: string | null;
+  /** Numeric compatibility boundary for round-scoped transcript and agent projections. */
   selectedRound: number | null;
   selectedAgentKind: string | null;
   /** Transcript entry the arrow keys are on, so a trace is readable without a mouse. */
@@ -53,6 +66,11 @@ export interface SessionState {
    */
   roundFocus: RoundFocus;
   overlay: OverlayPanel | null;
+  /**
+   * The modal per-round diff viewer, layered over the overlay in the key
+   * ladder so its Escape closes only the viewer. Null while closed.
+   */
+  diffViewer: DiffViewerState | null;
   chatOpen: boolean;
   /** The thread the chat surfaces show and the composer submits to. */
   activeChatThreadId: string;
@@ -87,6 +105,15 @@ export interface SessionState {
   chatDockFits: boolean;
   /** Non-null while the theme list is open as a keyboard selection. */
   themePicker: ThemePicker | null;
+  /** Non-null while the command palette is open as a keyboard selection. */
+  palette: {readonly query: string; readonly selected: number} | null;
+  /**
+   * The private notepad. Unlike the other modals above, closing it does not
+   * null the state out: the operator's text has to survive `Esc` (and a
+   * later reopen, and a TUI restart against the same run) without being
+   * promoted, so `open` is its own flag rather than presence-as-open.
+   */
+  notepad: NotepadState;
   /** Root-level error state, independent of the active transcript or log view. */
   errorBanner: ErrorBannerState | null;
   /**
@@ -98,8 +125,8 @@ export interface SessionState {
   inputError: string | null;
 }
 
-export type ErrorSeverity = 'recoverable' | 'fatal';
-export type ErrorScope =
+type ErrorSeverity = 'recoverable' | 'fatal';
+type ErrorScope =
   | 'configuration'
   | 'invocation'
   | 'phase'
@@ -110,7 +137,7 @@ export type ErrorScope =
   | 'input';
 
 export interface ErrorBannerState {
-  title: string;
+  titleKind: ErrorTitleKind;
   /** Human-facing summary, shown before structured detail and hint. */
   message: string;
   detail: string | null;
@@ -125,8 +152,10 @@ export interface ErrorBannerState {
   count: number;
 }
 
-/** The agent graph on the left, or the transcript on the right. */
-export type RoundFocus = 'agents' | 'transcript';
+export type ErrorTitleKind = ErrorScope | 'run_interruption' | 'quota_pause';
+
+/** The rounds rail (a selector, reported as `agents` by `focusedPane`), the graph, or the transcript. */
+export type RoundFocus = 'rounds' | 'agents' | 'transcript';
 
 /**
  * The experiment log is open when this is non-null. Selection is held as a
@@ -145,6 +174,12 @@ export interface ExperimentLogState {
   pending: boolean;
   error: string | null;
 }
+
+/** A hypothesis row after it enters the TUI-owned session model. */
+export type ExperimentEntry = NonNullable<SessionState['experimentLog']>['entries'][number];
+
+/** A round record reached through the TUI-owned experiment entry. */
+export type ExperimentRound = NonNullable<ExperimentEntry['rounds']>[number];
 
 /** UI-only navigation state for the selected hypothesis summary. */
 export interface HypothesisDetail {
@@ -184,20 +219,28 @@ export interface HypothesisScope {
   source?: 'hypothesis' | 'round';
 }
 
-/**
- * A visualization command's output, rendered beside the transcript rather than
- * over it. Content is pre-rendered text so the pane stays agnostic about which
- * command produced it and a new command needs no new layout code.
- */
+/** A visualization command's semantic output, rendered by the active frontend. */
 export type PaneView = 'perf' | 'design';
 
-export interface RightPane {
-  view: PaneView;
-  title: string;
-  content: string;
-  pending: boolean;
-  error: string | null;
+interface RightPaneStatus {
+  readonly pending: boolean;
+  readonly error: string | null;
 }
+
+export type RightPane =
+  | (RightPaneStatus & {
+      readonly view: 'perf';
+      /** Query-owned measurements. Experiment annotations remain authoritative in `experimentLog`. */
+      readonly data: {
+        readonly performance: ProtocolResponse['performance'];
+        readonly events: readonly RunEvent[];
+      } | null;
+      readonly context: ProtocolResponse['performance_context'];
+    })
+  | (RightPaneStatus & {
+      readonly view: 'design';
+      readonly available: boolean;
+    });
 
 /**
  * Which column the pane keys act on. ``left`` is whatever holds the middle of
@@ -206,7 +249,7 @@ export interface RightPane {
  */
 export type PaneFocus = 'chat' | 'left' | 'right';
 
-export interface LayoutState {
+interface LayoutState {
   /** null means no visualization pane: the left side has the rest of the row. */
   right: RightPane | null;
   focus: PaneFocus;
@@ -223,8 +266,28 @@ export interface LayoutState {
  */
 export type PaneId = 'agents' | 'chat' | 'experiments' | 'performance' | 'todos' | 'transcript';
 
-export interface ThemePicker {
+interface ThemePicker {
   selected: ThemeName;
+}
+
+/**
+ * The private notepad's state. `open` gates the modal; `text` is the
+ * operator's freeform scratch note for the active run, kept across a close so
+ * `Esc` never loses a draft. `createdAt`/`updatedAt` are null until the first
+ * keystroke, matching a run that has never had a note written for it
+ * (`notes-store.ts#readNote` returns `null` in that case too). `persistence`
+ * records whether the controller has bound this draft to a run/project
+ * identity. A conflict keeps an early startup draft in memory while leaving
+ * an already-saved note untouched. A non-null `persistenceError` means the
+ * text is still owned in memory but its latest version is not durable yet.
+ */
+interface NotepadState {
+  open: boolean;
+  text: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  persistence: 'pending_identity' | 'ready' | 'conflict';
+  persistenceError: string | null;
 }
 
 /**
@@ -245,9 +308,10 @@ export type ChatMenuRow =
  * exactly what an operator sees.
  *
  * The client enumerates nothing: `model` rows come from the backend's
- * `query.chat_options` response verbatim.
+ * `query.chat_options` response verbatim. The reducers live in
+ * `chat-menu.ts`.
  */
-export interface ChatMenu {
+interface ChatMenu {
   kind: 'model' | 'resume';
   title: string;
   rows: ChatMenuRow[];
@@ -270,6 +334,38 @@ export interface OverlayPanel {
   content: string;
 }
 
+/**
+ * One file's patch as the diff viewer holds it. `patch: null` is the server
+ * reporting that the workspace repository could not produce text, which is a
+ * different fact from an empty patch, so the viewer explains the absence
+ * instead of rendering nothing.
+ */
+export type DiffPatchSlot =
+  | {kind: 'loading'}
+  | {kind: 'loaded'; patch: string | null; truncated: boolean}
+  | {kind: 'error'; message: string};
+
+/**
+ * The modal per-round diff viewer. One file is on screen at a time; `files`
+ * is the round's change list exactly as the design log published it, so the
+ * viewer can only ask the server for paths that list already carries. Patches
+ * load lazily as files are visited and stay cached for the life of the
+ * viewer; the reducers live in `diff-viewer.ts`.
+ */
+export interface DiffViewerState {
+  round: number;
+  /** The commit range the design log recorded for the round. */
+  base: string;
+  head: string;
+  files: readonly DesignFileChange[];
+  /** Index into `files` of the file on screen. */
+  index: number;
+  /** Index of the hunk the arrow keys are on within the file's patch. */
+  hunk: number;
+  /** Fetched patches by path; a present slot doubles as the in-flight guard. */
+  patches: Readonly<Record<string, DiffPatchSlot>>;
+}
+
 export interface ConversationEntry {
   id: string;
   kind:
@@ -283,6 +379,9 @@ export interface ConversationEntry {
     | 'status'
     | 'result';
   content: string;
+  /** TUI-owned label semantics for entries created locally by the controller. */
+  labelKind?: 'chat_commands' | 'user' | 'user_queued' | 'answer' | 'chat_failed';
+  /** Producer-provided label retained for replayed backend transcript entries. */
   label?: string;
   tone?: 'normal' | 'success' | 'failure';
   agentKind?: string;
@@ -304,18 +403,23 @@ export interface ConversationEntry {
   toolCallId?: string;
   toolArguments?: Record<string, unknown>;
   toolResult?: TranscriptEntry['toolResult'];
+  /** The server cut this event's payload at its recorded-size bound. */
+  truncated?: true;
 }
 
 export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): SessionState {
   return {
     core: initialCoreState(),
+    iterations: initialIterationNavigation(),
     eventStreamAvailable: true,
+    selectedIterationId: null,
     selectedRound: null,
     selectedAgentKind: null,
     selectedEntryId: null,
     selectedTodoIndex: null,
     roundFocus: 'transcript',
     overlay: null,
+    diffViewer: null,
     chatOpen: false,
     activeChatThreadId: DEFAULT_CHAT_THREAD_ID,
     chatConversation: [],
@@ -336,20 +440,82 @@ export function initialSessionState(themeName: ThemeName = DEFAULT_THEME_NAME): 
     // the chat from the first frame rather than after a resize.
     chatDockFits: true,
     themePicker: null,
+    palette: null,
+    notepad: {
+      open: false,
+      text: '',
+      createdAt: null,
+      updatedAt: null,
+      persistence: 'pending_identity',
+      persistenceError: null,
+    },
     errorBanner: null,
     inputError: null,
   };
 }
 
-/**
- * Rows are keyed by hypothesis identity rather than response position, so
- * selection survives refreshes even when the backend returns a different
- * order. The canonical index sorts the rows before presenting them.
- */
-export function entryKey(entry: HypothesisEntry, index: number): string {
-  return entry.identified === false
-    ? `${entry.hypothesis_id}#${entry.first_round}`
-    : entry.hypothesis_id || `#${index}`;
+export function applyIterationResult(state: SessionState, result: IterationResult): SessionState {
+  const iterations = reduceIterationResult(state.iterations, result);
+  return iterations === state.iterations ? state : {...state, iterations};
+}
+
+export interface IterationRailRow extends RoundState {
+  /** Stable policy-owned identity used by rail selection and paging-independent navigation. */
+  readonly iterationId: string;
+}
+
+/** Rows the rail renders, preferring policy navigation over round compatibility state. */
+export function iterationRailRounds(state: SessionState): readonly IterationRailRow[] {
+  if (state.iterations.revision === null) {
+    return stripRounds(state).map(round => ({...round, iterationId: iterationIdForRound(round)}));
+  }
+  const compatibility = stripRounds(state);
+  return iterationRoots(state.iterations, state.core).map(node => {
+    const roundNumber = node.kind === 'round' ? roundNumberFromIterationId(node.id) : null;
+    const liveRound = compatibility.find(round => round.number === roundNumber);
+    if (liveRound !== undefined) {
+      return {...liveRound, iterationId: node.id, iterationLabel: node.label};
+    }
+    return {
+      iterationId: node.id,
+      key:
+        roundNumber === null
+          ? {kind: 'label' as const, label: node.id}
+          : {kind: 'number' as const, number: roundNumber},
+      number: roundNumber,
+      status: roundStatusForIteration(node.status),
+      iterationLabel: node.label,
+      agentIntervals: [],
+      activeAgentStarts: {},
+    };
+  });
+}
+
+function iterationIdForRound(round: RoundState): string {
+  return round.key.kind === 'number'
+    ? `round:${round.key.number}`
+    : `round-label:${round.key.label}`;
+}
+
+function roundStatusForIteration(status: IterationSummary['status']): RoundState['status'] {
+  switch (status) {
+    case 'pending':
+      return 'planned';
+    case 'active':
+      return 'active';
+    case 'failed':
+    case 'cancelled':
+      return 'failed';
+    default:
+      return 'completed';
+  }
+}
+
+function roundNumberFromIterationId(id: string): number | null {
+  const match = /^round:(\d+)$/.exec(id);
+  if (match === null) return null;
+  const number = Number(match[1]);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
 }
 
 /**
@@ -389,10 +555,6 @@ export function chatPaneFocused(state: SessionState): boolean {
   return chatPaneVisible(state) && state.layout.focus === 'chat';
 }
 
-export function rightPaneFocused(state: SessionState): boolean {
-  return state.layout.right !== null && state.layout.focus === 'right';
-}
-
 export function setChatDockFits(state: SessionState, fits: boolean): SessionState {
   if (state.chatDockFits === fits) return state;
   const layout =
@@ -423,17 +585,10 @@ function deriveActiveChat(state: SessionState): SessionState {
   return {...state, chatConversation, chatPending};
 }
 
-/** Every thread the run knows about, the implicit default first. */
-export function chatThreads(state: SessionState): ChatThread[] {
-  return state.core.chatThreads;
-}
-
 /**
  * What the chat surfaces call one thread. Titles are backend-owned and arrive
  * through events; an untitled created thread reads as its harness and model.
- * The agent driver never appears: which driver backs a run is a deployment
- * detail, and every thread inherits the run's.
- */
+ *  */
 export function chatThreadLabel(
   state: SessionState,
   threadId: string = state.activeChatThreadId,
@@ -462,7 +617,7 @@ export function chatThreadHeading(
  * The active thread's runtime, e.g. `"Codex (GPT 5.5)"`. Null for a thread the
  * backend has not described, which is the default thread before any answer.
  */
-export function chatThreadRuntimeLabel(
+function chatThreadRuntimeLabel(
   state: SessionState,
   threadId: string = state.activeChatThreadId,
 ): string | null {
@@ -512,803 +667,6 @@ export function setChatThreadPending(
   });
 }
 
-/** `/resume`: the thread list, as an inline selection on the active thread. */
-export function openChatResumeMenu(state: SessionState): SessionState {
-  const rows: ChatMenuRow[] = state.core.chatThreads.map(thread => ({
-    kind: 'thread' as const,
-    label: chatThreadLabel(state, thread.id),
-    detail: agentRuntimeLabel(thread.provider, thread.model) ?? 'run agent',
-    threadId: thread.id,
-    active: thread.id === state.activeChatThreadId,
-  }));
-  const active = rows.findIndex(row => row.kind === 'thread' && row.active);
-  return {
-    ...state,
-    overlay: null,
-    themePicker: null,
-    chatMenu: {
-      kind: 'resume',
-      title: 'Chat threads',
-      rows,
-      selected: active === -1 ? firstSelectable(rows) : active,
-      pending: false,
-      error: null,
-      customModels: {},
-    },
-  };
-}
-
-/** `/model`: opened empty, then filled by the backend's chat options. */
-export function openChatModelMenu(state: SessionState): SessionState {
-  return {
-    ...state,
-    overlay: null,
-    themePicker: null,
-    chatMenu: {
-      kind: 'model',
-      title: 'Harness and model',
-      rows: [{kind: 'note', label: 'Loading options…'}],
-      selected: -1,
-      pending: true,
-      error: null,
-      customModels: {},
-    },
-  };
-}
-
-/**
- * Renders exactly what the backend returned: one group per provider it says is
- * valid, its models beneath, and a free-text entry per group for a model the
- * suggestion list does not carry.
- */
-export function setChatModelMenuOptions(state: SessionState, options: ChatOptions): SessionState {
-  const menu = state.chatMenu;
-  if (menu === null || menu.kind !== 'model') return state;
-  const rows: ChatMenuRow[] = [];
-  for (const group of options.providers ?? []) {
-    rows.push({kind: 'header', label: agentRuntimeLabel(group.provider, null) ?? group.provider});
-    for (const option of group.models ?? []) {
-      rows.push({
-        kind: 'model',
-        label: option.default ? `${option.model}  · run default` : option.model,
-        provider: group.provider,
-        model: option.model,
-        isDefault: option.default === true,
-      });
-    }
-    rows.push({kind: 'custom', label: 'custom model…', provider: group.provider});
-  }
-  if (rows.length === 0) rows.push({kind: 'note', label: 'This run offers no chat harness.'});
-  return {...state, chatMenu: {...menu, rows, selected: firstSelectable(rows), pending: false}};
-}
-
-export function failChatMenu(state: SessionState, message: string): SessionState {
-  const menu = state.chatMenu;
-  if (menu === null) return state;
-  return {
-    ...state,
-    chatMenu: {
-      ...menu,
-      rows: [{kind: 'note', label: message}],
-      selected: -1,
-      pending: false,
-      error: message,
-    },
-  };
-}
-
-export function moveChatMenuSelection(state: SessionState, delta: number): SessionState {
-  const menu = state.chatMenu;
-  if (menu === null || delta === 0) return state;
-  const step = delta > 0 ? 1 : -1;
-  let selected = menu.selected;
-  for (let remaining = Math.abs(delta); remaining > 0; remaining -= 1) {
-    const next = nextSelectable(menu.rows, selected, step);
-    if (next === selected) break;
-    selected = next;
-  }
-  if (selected === menu.selected) return state;
-  return {...state, chatMenu: {...menu, selected}};
-}
-
-export function closeChatMenu(state: SessionState): SessionState {
-  if (state.chatMenu === null) return state;
-  return {...state, chatMenu: null};
-}
-
-/** The row Enter acts on, or null while nothing selectable is highlighted. */
-export function selectedChatMenuRow(state: SessionState): ChatMenuRow | null {
-  const menu = state.chatMenu;
-  if (menu === null || menu.selected < 0) return null;
-  return menu.rows[menu.selected] ?? null;
-}
-
-/** Text typed into the highlighted custom entry, empty when none is. */
-export function chatMenuCustomModel(state: SessionState): string {
-  const row = selectedChatMenuRow(state);
-  if (row === null || row.kind !== 'custom') return '';
-  return state.chatMenu?.customModels[row.provider] ?? '';
-}
-
-export function setChatMenuCustomModel(state: SessionState, model: string): SessionState {
-  const menu = state.chatMenu;
-  const row = selectedChatMenuRow(state);
-  if (menu === null || row === null || row.kind !== 'custom') return state;
-  return {
-    ...state,
-    chatMenu: {...menu, customModels: {...menu.customModels, [row.provider]: model}},
-  };
-}
-
-function isSelectable(row: ChatMenuRow): boolean {
-  return row.kind === 'model' || row.kind === 'custom' || row.kind === 'thread';
-}
-
-function firstSelectable(rows: readonly ChatMenuRow[]): number {
-  const index = rows.findIndex(isSelectable);
-  return index;
-}
-
-/** The next selectable index in `step` direction, or `from` when there is none. */
-function nextSelectable(rows: readonly ChatMenuRow[], from: number, step: number): number {
-  for (let index = from + step; index >= 0 && index < rows.length; index += step) {
-    const row = rows[index];
-    if (row !== undefined && isSelectable(row)) return index;
-  }
-  return from < 0 ? firstSelectable(rows) : from;
-}
-
-export function openExperimentLog(state: SessionState): SessionState {
-  const existing = state.experimentLog;
-  return {
-    ...state,
-    overlay: null,
-    chatOpen: false,
-    hypothesisDetail: null,
-    hypothesisScope: null,
-    selectedRound: null,
-    selectedAgentKind: null,
-    experimentLog: existing ?? {entries: [], selectedId: null, pending: true, error: null},
-  };
-}
-
-export function setExperiments(state: SessionState, entries: HypothesisEntry[]): SessionState {
-  const log = state.experimentLog;
-  if (log === null) return state;
-
-  const activity = hypothesisPlanningActivity(state);
-  const indexed = orderAndIndexExperiments(entries);
-  const selection = reconcileExperimentSelection(log, indexed, activity);
-  const unownedRounds = unownedExperimentRounds(state, indexed.entries);
-  const selectedUnownedRound = reconcileUnownedRoundSelection(
-    log.selectedUnownedRound,
-    unownedRounds,
-    indexed.entries.length === 0,
-  );
-  const hypothesisDetail = reconcileHypothesisDetail(state.hypothesisDetail, indexed.entries);
-  const refreshed: SessionState = {
-    ...state,
-    hypothesisDetail,
-    experimentLog: {
-      ...log,
-      entries: indexed.entries,
-      ...selection,
-      selectedUnownedRound,
-      pending: false,
-      error: null,
-    },
-  };
-  return refreshLiveHypothesisScope(state, refreshed);
-}
-
-interface IndexedExperiments {
-  entries: HypothesisEntry[];
-  keys: string[];
-}
-
-/** Establish the canonical response order once and retain its stable row identities. */
-function orderAndIndexExperiments(entries: HypothesisEntry[]): IndexedExperiments {
-  const ordered = [...entries].sort(compareHypothesisEntries);
-  return {entries: ordered, keys: ordered.map(entryKey)};
-}
-
-type ExperimentSelection = Pick<
-  ExperimentLogState,
-  'selectedId' | 'selectedActivity' | 'selectedActivityRound'
->;
-
-/** Reconcile the selected index row, including planning work that became persistent. */
-function reconcileExperimentSelection(
-  log: ExperimentLogState,
-  indexed: IndexedExperiments,
-  activity: HypothesisPlanningActivity | null,
-): ExperimentSelection {
-  const selectedActivityRound =
-    log.selectedActivity === true
-      ? (log.selectedActivityRound ?? activity?.roundNumber ?? null)
-      : null;
-  const materializedActivity =
-    selectedActivityRound === null
-      ? undefined
-      : indexed.entries.find(entry => scopeRounds(entry).includes(selectedActivityRound));
-  // Keep the operator's row when it still exists; otherwise fall back to the
-  // active hypothesis, then to the first row.
-  const selectedId =
-    materializedActivity !== undefined
-      ? entryKeyFor(indexed.entries, materializedActivity)
-      : log.selectedId !== null && indexed.keys.includes(log.selectedId)
-        ? log.selectedId
-        : (indexed.keys[indexed.entries.findIndex(entry => entry.active === true)] ??
-          indexed.keys[0] ??
-          null);
-  return {
-    selectedId,
-    selectedActivity: materializedActivity === undefined && log.selectedActivity === true,
-    selectedActivityRound: materializedActivity === undefined ? selectedActivityRound : null,
-  };
-}
-
-/** Keep an unowned-round cursor only while that row remains in the refreshed index. */
-function reconcileUnownedRoundSelection(
-  current: number | null | undefined,
-  unownedRounds: number[],
-  hasNoHypotheses: boolean,
-): number | null {
-  if (current !== undefined && current !== null && unownedRounds.includes(current)) return current;
-  return hasNoHypotheses ? (unownedRounds[0] ?? null) : null;
-}
-
-/** Keep an open summary on the same hypothesis and fall back to its latest available round. */
-function reconcileHypothesisDetail(
-  currentDetail: HypothesisDetail | null,
-  entries: HypothesisEntry[],
-): HypothesisDetail | null {
-  const detailEntry =
-    currentDetail === null
-      ? undefined
-      : entries.find((entry, index) => entryKey(entry, index) === currentDetail.entryKey);
-  const detailRounds = detailEntry === undefined ? [] : scopeRounds(detailEntry);
-  if (currentDetail === null || detailEntry === undefined) return null;
-  return {
-    entryKey: currentDetail.entryKey,
-    selectedRound:
-      currentDetail.selectedRound !== null && detailRounds.includes(currentDetail.selectedRound)
-        ? currentDetail.selectedRound
-        : (detailRounds.at(-1) ?? null),
-  };
-}
-
-/** Re-derive an open trajectory's scope from the refreshed ownership payload. */
-function refreshLiveHypothesisScope(previous: SessionState, refreshed: SessionState): SessionState {
-  if (previous.hypothesisScope === null) return refreshed;
-  // A live scope must describe the fresh payload: a continuation round joins
-  // its hypothesis's scope, and a scope whose hypothesis vanished degrades to
-  // the round on screen rather than keeping the stale title over it.
-  const anchor = visibleRoundNumber(previous);
-  return anchor === null ? refreshed : {...refreshed, ...scopeStateForRound(refreshed, anchor)};
-}
-
-export function failExperiments(state: SessionState, error: string): SessionState {
-  const log = state.experimentLog;
-  if (log === null) return state;
-  return {...state, experimentLog: {...log, pending: false, error}};
-}
-
-export function setDesignLog(state: SessionState, rounds: DesignRound[]): SessionState {
-  return {...state, designLog: rounds};
-}
-
-/** The design entry for one round, or null before the log has loaded it. */
-export function designRoundFor(
-  state: SessionState,
-  roundNumber: number | null,
-): DesignRound | null {
-  if (roundNumber === null || state.designLog === null) return null;
-  return state.designLog.find(round => round.round === roundNumber) ?? null;
-}
-
-/**
- * The experiment log's record for one round, or null before the log has it.
- * Every stage fact about a round, including its measured delta, lives here:
- * the design log carries only the file list, so a consumer that wants an
- * outcome reads this rather than the design record.
- */
-export function hypothesisRoundFor(
-  state: SessionState,
-  roundNumber: number | null,
-): HypothesisRound | null {
-  if (roundNumber === null) return null;
-  for (const entry of state.experimentLog?.entries ?? []) {
-    const record = entry.rounds?.find(candidate => candidate.round === roundNumber);
-    if (record !== undefined) return record;
-  }
-  return null;
-}
-
-/**
- * One round as both surfaces know it: the experiment log owns every stage
- * fact, the design log owns only the file list. The join is by round number,
- * which is the identity both fetches agree on, so the two can never describe
- * the same round differently.
- */
-export interface DesignRoundView {
-  round: number;
-  files: DesignFileChange[] | null;
-  hypothesisId: string | null;
-  title: string | null;
-  /** The experiment log's row for this round, absent for a round it lost. */
-  record: HypothesisRound | null;
-}
-
-export function designRoundViews(
-  designLog: readonly DesignRound[],
-  entries: readonly HypothesisEntry[],
-): DesignRoundView[] {
-  const owners = new Map<number, {entry: HypothesisEntry; record: HypothesisRound}>();
-  for (const entry of entries) {
-    for (const record of entry.rounds ?? []) owners.set(record.round, {entry, record});
-  }
-  return designLog.map(design => {
-    const owner = owners.get(design.round) ?? null;
-    return {
-      round: design.round,
-      files: design.files ?? null,
-      hypothesisId: owner?.entry.hypothesis_id ?? null,
-      title: owner?.entry.title ?? owner?.entry.claim ?? null,
-      record: owner?.record ?? null,
-    };
-  });
-}
-
-export function moveExperimentSelection(state: SessionState, delta: number): SessionState {
-  const log = state.experimentLog;
-  if (log === null || state.hypothesisDetail !== null || state.hypothesisScope !== null)
-    return state;
-  const items = experimentIndexItems(state);
-  if (items.length === 0) return state;
-  const selected = selectedExperimentIndexItem(state);
-  const current = selected === null ? -1 : items.findIndex(item => item.key === selected.key);
-  const index = current === -1 ? 0 : Math.min(items.length - 1, Math.max(0, current + delta));
-  return selectExperimentIndexItem(state, items[index]);
-}
-
-/** Open one hypothesis summary without entering any of its round trajectories. */
-export function openHypothesisDetail(state: SessionState, requestedKey?: string): SessionState {
-  const log = state.experimentLog;
-  if (log === null || state.hypothesisScope !== null) return state;
-  const key = requestedKey ?? log.selectedId;
-  if (key === null) return state;
-  const entry = log.entries.find((candidate, index) => entryKey(candidate, index) === key);
-  if (entry === undefined) return state;
-  const rounds = scopeRounds(entry);
-  return {
-    ...state,
-    overlay: null,
-    chatOpen: false,
-    layout: {right: null, focus: 'left', zoomedPane: null},
-    experimentLog: {
-      ...log,
-      selectedId: key,
-      selectedActivity: false,
-      selectedActivityRound: null,
-      selectedUnownedRound: null,
-    },
-    hypothesisDetail: {entryKey: key, selectedRound: rounds.at(-1) ?? null},
-  };
-}
-
-/** The durable hypothesis selected for the summary view. */
-export function detailedHypothesis(state: SessionState): HypothesisEntry | null {
-  const detail = state.hypothesisDetail;
-  const entries = state.experimentLog?.entries ?? [];
-  if (detail === null) return null;
-  return entries.find((entry, index) => entryKey(entry, index) === detail.entryKey) ?? null;
-}
-
-/** Move the round cursor within the open hypothesis summary. */
-export function moveHypothesisRoundSelection(state: SessionState, delta: number): SessionState {
-  const detail = state.hypothesisDetail;
-  const entry = detailedHypothesis(state);
-  if (detail === null || entry === null || state.hypothesisScope !== null) return state;
-  const rounds = scopeRounds(entry);
-  if (rounds.length === 0) return state;
-  const current = detail.selectedRound === null ? -1 : rounds.indexOf(detail.selectedRound);
-  const index = current === -1 ? 0 : Math.min(rounds.length - 1, Math.max(0, current + delta));
-  return {...state, hypothesisDetail: {...detail, selectedRound: rounds[index] ?? null}};
-}
-
-/** Return from a hypothesis summary to the experiment index. */
-export function leaveHypothesisDetail(state: SessionState): SessionState {
-  if (state.hypothesisDetail === null || state.hypothesisScope !== null) return state;
-  return {...state, hypothesisDetail: null};
-}
-
-/** Selects the current planning work so Enter opens its live agent turns. */
-export function selectExperimentActivity(state: SessionState): SessionState {
-  const log = state.experimentLog;
-  if (
-    log === null ||
-    state.hypothesisDetail !== null ||
-    state.hypothesisScope !== null ||
-    hypothesisPlanningActivity(state) === null
-  ) {
-    return state;
-  }
-  const activity = hypothesisPlanningActivity(state);
-  return {
-    ...state,
-    experimentLog: {
-      ...log,
-      selectedActivity: true,
-      selectedActivityRound: activity?.roundNumber ?? null,
-      selectedUnownedRound: null,
-    },
-  };
-}
-
-/**
- * Advances the experiment navigation by one level: index to hypothesis
- * summary, then hypothesis summary to its selected round trajectory.
- */
-export function enterExperimentDrilldown(state: SessionState): SessionState {
-  if (state.hypothesisDetail !== null) {
-    const roundNumber = state.hypothesisDetail.selectedRound;
-    return roundNumber === null ? state : (enterExperimentRound(state, roundNumber) ?? state);
-  }
-  const activityRound = selectedPlanningActivityRound(state);
-  if (activityRound !== null) {
-    return enterUnownedExperimentRound(state, activityRound) ?? state;
-  }
-  const selectedRound =
-    state.experimentLog?.selectedUnownedRound ??
-    (selectedExperiment(state) === null ? unownedExperimentRounds(state)[0] : undefined);
-  if (selectedRound !== undefined && selectedRound !== null) {
-    return enterUnownedExperimentRound(state, selectedRound) ?? state;
-  }
-  const entry = selectedExperiment(state);
-  if (entry === null || state.hypothesisScope !== null) return state;
-  return openHypothesisDetail(state);
-}
-
-/** The live planning round when it is the selected, or only, index item. */
-function selectedPlanningActivityRound(state: SessionState): number | null {
-  const activity = hypothesisPlanningActivity(state);
-  if (activity === null) return null;
-  const log = state.experimentLog;
-  const selected = log?.selectedActivity === true;
-  const onlyItem = log?.entries.length === 0 && (log.selectedUnownedRound ?? null) === null;
-  return selected || onlyItem ? activity.roundNumber : null;
-}
-
-/** Leaves a trajectory for its hypothesis summary, preserving the round cursor. */
-export function leaveExperimentDrilldown(state: SessionState): SessionState {
-  if (state.hypothesisScope === null) return state;
-  return {...state, hypothesisScope: null, selectedRound: null, selectedAgentKind: null};
-}
-
-/**
- * The scope, its Esc target, and the log selection implied by one round.
- *
- * Round navigation deliberately covers the whole run, so the scope follows the
- * selected round: whichever hypothesis owns the round on screen is the one the
- * header, the agent map, and Esc must describe. A round no hypothesis claims
- * is scoped as itself rather than left under another hypothesis's title.
- * Derived in one place so drilldown entry, round navigation, and an
- * experiments refresh cannot disagree about what is on screen.
- */
-function scopeStateForRound(
-  state: SessionState,
-  roundNumber: number,
-): Pick<SessionState, 'hypothesisScope' | 'hypothesisDetail' | 'experimentLog'> {
-  const entries = state.experimentLog?.entries ?? [];
-  const entryIndex = entries.findIndex(candidate => scopeRounds(candidate).includes(roundNumber));
-  const entry = entries[entryIndex];
-  if (entry === undefined) {
-    return {
-      hypothesisScope: reuseScope(state.hypothesisScope, {
-        id: `round-${roundNumber}`,
-        label: `Round ${roundNumber}`,
-        title: `Round ${roundNumber}`,
-        rounds: [roundNumber],
-        source: 'round',
-      }),
-      hypothesisDetail: null,
-      experimentLog: state.experimentLog,
-    };
-  }
-  const entryKeyValue = entryKey(entry, entryIndex);
-  return {
-    hypothesisScope: reuseScope(state.hypothesisScope, {
-      id: entry.hypothesis_id,
-      label: hypothesisLabel(entry),
-      title: hypothesisTitle(entry),
-      rounds: scopeRounds(entry),
-      source: 'hypothesis',
-    }),
-    hypothesisDetail: {entryKey: entryKeyValue, selectedRound: roundNumber},
-    experimentLog:
-      state.experimentLog === null || state.experimentLog.selectedId === entryKeyValue
-        ? state.experimentLog
-        : {...state.experimentLog, selectedId: entryKeyValue},
-  };
-}
-
-/** Keeps the current scope object when the derived one says the same thing. */
-function reuseScope(current: HypothesisScope | null, derived: HypothesisScope): HypothesisScope {
-  return current !== null &&
-    current.id === derived.id &&
-    current.label === derived.label &&
-    current.title === derived.title &&
-    current.source === derived.source &&
-    current.rounds.length === derived.rounds.length &&
-    current.rounds.every((round, index) => round === derived.rounds[index])
-    ? current
-    : derived;
-}
-
-/**
- * Opens the hypothesis that owns a round number, landing on that round rather
- * than on the whole trajectory. Returns null when no hypothesis claims it, so
- * the caller can report the round rather than silently doing nothing.
- */
-export function enterExperimentRound(
-  state: SessionState,
-  roundNumber: number,
-): SessionState | null {
-  const entries = state.experimentLog?.entries ?? [];
-  if (!entries.some(candidate => scopeRounds(candidate).includes(roundNumber))) return null;
-  return {
-    ...state,
-    overlay: null,
-    chatOpen: false,
-    layout: {right: null, focus: 'left', zoomedPane: null},
-    ...scopeStateForRound(state, roundNumber),
-    selectedRound: roundNumber,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-  };
-}
-
-/**
- * Opens a recorded round that is not currently indexed by a hypothesis. This
- * is intentionally derived only from observed rounds, never from the planned
- * round count, so an empty future round is not presented as historical work.
- */
-export function enterUnownedExperimentRound(
-  state: SessionState,
-  roundNumber: number,
-): SessionState | null {
-  if (!state.core.rounds.some(round => round.number === roundNumber)) return null;
-  return {
-    ...state,
-    overlay: null,
-    chatOpen: false,
-    layout: {right: null, focus: 'left', zoomedPane: null},
-    ...scopeStateForRound(state, roundNumber),
-    selectedRound: roundNumber,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-  };
-}
-
-function entryKeyFor(entries: HypothesisEntry[], entry: HypothesisEntry): string | null {
-  const index = entries.indexOf(entry);
-  return index === -1 ? null : entryKey(entry, index);
-}
-
-function scopeRounds(entry: HypothesisEntry): number[] {
-  const listed = (entry.rounds ?? []).map(round => round.round);
-  if (listed.length > 0) return [...listed].sort((a, b) => a - b);
-  // A record can summarize a continuation before its per-round outcomes have
-  // been persisted. Its declared range is still the server's ownership claim.
-  if (entry.first_round <= 0 || entry.last_round < entry.first_round) return [];
-  return Array.from(
-    {length: Math.max(0, entry.last_round - entry.first_round + 1)},
-    (_, index) => entry.first_round + index,
-  );
-}
-
-/** Ordered round identities owned by a hypothesis, including legacy range-only records. */
-export function hypothesisRoundNumbers(entry: HypothesisEntry): number[] {
-  return scopeRounds(entry);
-}
-
-/** The claim itself, falling back to its id when the record carries no title. */
-function hypothesisTitle(entry: HypothesisEntry): string {
-  return entry.title ?? entry.hypothesis_id;
-}
-
-function hypothesisLabel(entry: HypothesisEntry): string {
-  const range =
-    entry.first_round === entry.last_round
-      ? `r${entry.first_round}`
-      : `r${entry.first_round}-${entry.last_round}`;
-  return `${hypothesisTitle(entry)} · ${range}`;
-}
-
-export function selectedExperiment(state: SessionState): HypothesisEntry | null {
-  const log = state.experimentLog;
-  if (log === null || log.selectedId === null) return null;
-  const index = log.entries.map(entryKey).indexOf(log.selectedId);
-  return index === -1 ? null : (log.entries[index] ?? null);
-}
-
-/**
- * Observed numeric rounds not represented by any hypothesis record. Events
- * without a numeric round label remain in the run transcript but cannot be
- * honestly assigned an index row.
- */
-export function unownedExperimentRounds(
-  state: SessionState,
-  entries: HypothesisEntry[] = state.experimentLog?.entries ?? [],
-): number[] {
-  const owned = new Set(entries.flatMap(scopeRounds));
-  const planningRound = hypothesisPlanningActivity(state)?.roundNumber;
-  return state.core.rounds
-    .filter(
-      round =>
-        !owned.has(round.number) && round.number !== planningRound && round.status !== 'planned',
-    )
-    .map(round => round.number)
-    .sort((left, right) => left - right);
-}
-
-/**
- * The canonical visual index. Historical work is chronological regardless of
- * server response order, and transient planning is always the newest item.
- */
-export function experimentIndexItems(state: SessionState): ExperimentIndexItem[] {
-  const history: ExperimentIndexItem[] = [];
-  for (const [index, entry] of (state.experimentLog?.entries ?? []).entries()) {
-    history.push({kind: 'hypothesis', key: entryKey(entry, index), entry});
-  }
-  for (const roundNumber of unownedExperimentRounds(state)) {
-    history.push({kind: 'round', key: `round-${roundNumber}`, roundNumber});
-  }
-  history.sort((left, right) => experimentItemRound(left) - experimentItemRound(right));
-  const activity = hypothesisPlanningActivity(state);
-  return activity === null ? history : [...history, {kind: 'activity', key: 'activity', activity}];
-}
-
-function experimentItemRound(item: ExperimentIndexItem): number {
-  if (item.kind === 'hypothesis') return item.entry.first_round;
-  if (item.kind === 'round') return item.roundNumber;
-  return item.activity.roundNumber;
-}
-
-function compareHypothesisEntries(left: HypothesisEntry, right: HypothesisEntry): number {
-  return (
-    left.first_round - right.first_round ||
-    left.last_round - right.last_round ||
-    left.hypothesis_id.localeCompare(right.hypothesis_id)
-  );
-}
-
-export function selectedExperimentIndexItem(state: SessionState): ExperimentIndexItem | null {
-  const log = state.experimentLog;
-  if (log === null) return null;
-  const items = experimentIndexItems(state);
-  if (log.selectedActivity === true) {
-    const activity = items.find(item => item.kind === 'activity');
-    if (activity !== undefined) return activity;
-  }
-  if (log.selectedUnownedRound !== undefined && log.selectedUnownedRound !== null) {
-    return (
-      items.find(item => item.kind === 'round' && item.roundNumber === log.selectedUnownedRound) ??
-      null
-    );
-  }
-  return log.selectedId === null
-    ? null
-    : (items.find(item => item.kind === 'hypothesis' && item.key === log.selectedId) ?? null);
-}
-
-function selectExperimentIndexItem(
-  state: SessionState,
-  item: ExperimentIndexItem | undefined,
-): SessionState {
-  const log = state.experimentLog;
-  if (log === null || item === undefined) return state;
-  if (item.kind === 'activity')
-    return {
-      ...state,
-      experimentLog: {
-        ...log,
-        selectedActivity: true,
-        selectedActivityRound: item.activity.roundNumber,
-        selectedUnownedRound: null,
-      },
-    };
-  if (item.kind === 'round') {
-    return {
-      ...state,
-      experimentLog: {
-        ...log,
-        selectedActivity: false,
-        selectedActivityRound: null,
-        selectedUnownedRound: item.roundNumber,
-      },
-    };
-  }
-  return {
-    ...state,
-    experimentLog: {
-      ...log,
-      selectedId: item.key,
-      selectedActivity: false,
-      selectedActivityRound: null,
-      selectedUnownedRound: null,
-    },
-  };
-}
-
-/**
- * The loop publishes these labels before it writes a hypothesis record. Keep
- * this derived from active, named phases: an old phase must never make the
- * experiment log look live, and unrelated profiler work must not be presented
- * as hypothesis planning.
- */
-export function hypothesisPlanningActivity(state: SessionState): HypothesisPlanningActivity | null {
-  if (hasRunEnded(state.core) || state.experimentLog === null) return null;
-  const phase = [...state.core.phases]
-    .reverse()
-    .find(
-      candidate =>
-        candidate.status === 'active' && planningStage(candidate.kind, candidate.roundLabel),
-    );
-  if (phase === undefined || phase.roundNumber === null) return null;
-  const roundNumber = phase.roundNumber;
-  if (state.experimentLog.entries.some(entry => scopeRounds(entry).includes(roundNumber)))
-    return null;
-  const stage = planningStage(phase.kind, phase.roundLabel);
-  if (stage === null) return null;
-  const startedAt = earliestPlanningStartedAt(state.core.phases, roundNumber);
-  return {
-    stage,
-    roundNumber,
-    ...(startedAt === undefined ? {} : {startedAt}),
-  };
-}
-
-function earliestPlanningStartedAt(phases: AgentPhase[], roundNumber: number): string | undefined {
-  const starts = phases
-    .filter(
-      phase => phase.roundNumber === roundNumber && planningStage(phase.kind, phase.roundLabel),
-    )
-    .flatMap(phase =>
-      phase.startedAt === undefined
-        ? []
-        : [[phase.startedAt, Date.parse(phase.startedAt)] as const],
-    )
-    .filter(([, timestamp]) => Number.isFinite(timestamp));
-  if (starts.length === 0) return undefined;
-  return starts.reduce((earliest, candidate) =>
-    candidate[1] < earliest[1] ? candidate : earliest,
-  )[0];
-}
-
-function planningStage(
-  agentKind: string,
-  roundLabel: string | null,
-): HypothesisPlanningActivity['stage'] | null {
-  if (roundLabel === null) return null;
-  if (agentKind === 'orchestrator' && /^round-\d+-pre$/.test(roundLabel)) return 'pre';
-  if (agentKind === 'profiler' && /^round-\d+-profiler$/.test(roundLabel)) return 'profile';
-  // A plan the framework reprompted carries `round-N-retry-K-plan`. It is the
-  // same planning stage, produced by the same role for the same round, so it
-  // must not fall out of the planning activity just because the first attempt
-  // was rejected.
-  if (agentKind === 'orchestrator' && /^round-\d+(?:-retry-\d+)?-plan$/.test(roundLabel)) {
-    return 'plan';
-  }
-  return null;
-}
-
-export const PANE_TITLES: Record<PaneView, string> = {
-  perf: 'Performance',
-  design: 'Design changes',
-};
-
 /**
  * Opens or retargets the right pane. A second visualization command replaces
  * the pane's contents rather than stacking, which is why the view is set here
@@ -1316,34 +674,61 @@ export const PANE_TITLES: Record<PaneView, string> = {
  */
 export function openPane(state: SessionState, view: PaneView): SessionState {
   const existing = state.layout.right;
+  const right: RightPane =
+    existing?.view === view
+      ? {...existing, pending: true, error: null}
+      : view === 'perf'
+        ? {view, data: null, context: null, pending: true, error: null}
+        : {view, available: true, pending: true, error: null};
   return {
     ...state,
     overlay: null,
     layout: {
-      right: {
-        view,
-        title: PANE_TITLES[view],
-        // Keep the old content while the new query is in flight only when the
-        // pane is not changing view, so the pane never shows one command's
-        // output under another command's title.
-        content: existing !== null && existing.view === view ? existing.content : '',
-        pending: true,
-        error: null,
-      },
+      // Keep the old structured projection while the same query refreshes;
+      // changing view starts empty so one visualization cannot render under
+      // another view's identity.
+      right,
       focus: 'right',
       zoomedPane: state.layout.zoomedPane,
     },
   };
 }
 
-export function setPaneContent(state: SessionState, view: PaneView, content: string): SessionState {
+export function setPerformancePane(
+  state: SessionState,
+  data: {
+    readonly performance: ProtocolResponse['performance'];
+    readonly events: readonly RunEvent[];
+  },
+  context: ProtocolResponse['performance_context'],
+): SessionState {
   const right = state.layout.right;
   // A slower response for a pane the operator has since replaced or closed
   // must not overwrite what is on screen now.
-  if (right === null || right.view !== view) return state;
+  if (right?.view !== 'perf') return state;
   return {
     ...state,
-    layout: {...state.layout, right: {...right, content, pending: false, error: null}},
+    layout: {
+      ...state.layout,
+      right: {...right, data, context, pending: false, error: null},
+    },
+  };
+}
+
+export function setDesignPane(
+  state: SessionState,
+  rounds: readonly DesignRound[],
+  available: boolean,
+): SessionState {
+  const right = state.layout.right;
+  if (right?.view !== 'design') return state;
+  return {
+    ...state,
+    ...(available ? {designLog: [...rounds]} : {}),
+    layout: {
+      ...state.layout,
+      right: {...right, available, pending: false, error: null},
+    },
   };
 }
 
@@ -1414,10 +799,18 @@ function normalizeRoundFocus(state: SessionState): SessionState {
 
 /** Escape from a round view: close whatever is layered over it, all of it. */
 export function closeOverlays(state: SessionState): SessionState {
-  if (state.layout.right === null && !state.chatOpen && state.overlay === null) return state;
+  if (
+    state.layout.right === null &&
+    !state.chatOpen &&
+    state.overlay === null &&
+    state.diffViewer === null
+  ) {
+    return state;
+  }
   return {
     ...state,
     overlay: null,
+    diffViewer: null,
     chatOpen: false,
     layout: {right: null, focus: 'left', zoomedPane: null},
   };
@@ -1454,7 +847,7 @@ export function todoListFocused(state: SessionState): boolean {
  * focus only moves to a pane this returns true for, so the keys and the agent
  * filter can never land on a pane the operator cannot see.
  */
-export function roundPaneVisible(state: SessionState, pane: RoundFocus): boolean {
+function roundPaneVisible(state: SessionState, pane: RoundFocus): boolean {
   if (experimentLogVisible(state)) return false;
   const zoomed = state.layout.zoomedPane;
   if (pane === 'agents') {
@@ -1486,7 +879,7 @@ export function focusedPane(state: SessionState): PaneId {
   if (state.layout.right !== null) {
     return state.layout.focus === 'right' ? 'performance' : 'transcript';
   }
-  return state.roundFocus;
+  return state.roundFocus === 'rounds' ? 'agents' : state.roundFocus;
 }
 
 /**
@@ -1510,7 +903,7 @@ export function togglePaneZoom(state: SessionState): SessionState {
  * Every pane the content row can be given to in the active view. The expanded
  * todo list is deliberately absent: it can hold the keys, but not the row.
  */
-export function visiblePaneIds(state: SessionState): PaneId[] {
+function visiblePaneIds(state: SessionState): PaneId[] {
   if (experimentLogVisible(state)) {
     return [
       ...(chatPaneVisible(state) ? (['chat'] as const) : []),
@@ -1529,43 +922,124 @@ function visiblePaneOrder(state: SessionState): PaneFocus[] {
   ];
 }
 
-export function setTheme(state: SessionState, themeName: ThemeName): SessionState {
-  // Applying the theme that is already active is still an answer to the
-  // picker, so the picker closes either way.
-  if (state.themeName === themeName) {
-    return state.themePicker === null ? state : {...state, themePicker: null};
-  }
-  return {...state, themeName, overlay: null, themePicker: null};
+/**
+ * Binds the notepad to its resolved identity and loads whatever that run's
+ * note already held. This may happen while the modal is open if startup
+ * identity arrived after the operator opened it. `record` is `null` for a run
+ * with no saved note, which still completes the identity binding.
+ */
+export function hydrateNotepad(state: SessionState, record: NoteRecord | null): SessionState {
+  // A failed write makes the in-memory draft newer than any readable record.
+  // Reopening the modal must never replace that unsaved owner with the last
+  // durable version.
+  if (state.notepad.persistenceError !== null) return state;
+  return {
+    ...state,
+    notepad: {
+      ...state.notepad,
+      ...(record === null
+        ? {}
+        : {
+            text: record.text,
+            createdAt: record.createdAt,
+            updatedAt: record.updatedAt,
+          }),
+      persistence: 'ready',
+    },
+  };
 }
 
-/** Opens the theme list as a selection, starting on the active theme. */
-export function openThemePicker(state: SessionState): SessionState {
-  return {...state, overlay: null, themePicker: {selected: state.themeName}};
+/** Keep a pre-identity draft in memory without granting it write ownership. */
+export function markNotepadConflict(state: SessionState): SessionState {
+  if (state.notepad.persistence === 'conflict') return state;
+  return {...state, notepad: {...state.notepad, persistence: 'conflict'}};
 }
 
 /**
- * Moves the highlighted theme. The list has ends rather than a cycle, so the
- * selection clamps instead of wrapping.
+ * Opens the notepad. Text carries over from any prior session on this run.
+ * Excludes the palette and theme picker the same way they exclude each
+ * other: all three are single keyboard-focused overlays, so only one takes
+ * the keys at a time. The docked or modal chat is a separate pane rather than
+ * an overlay in that sense (`openChat` does not null either of them either),
+ * so it is left as it was.
  */
-export function moveThemeSelection(state: SessionState, delta: number): SessionState {
-  const picker = state.themePicker;
-  if (picker === null) return state;
-  const current = THEME_NAMES.indexOf(picker.selected);
-  const index = Math.min(THEME_NAMES.length - 1, Math.max(0, current + delta));
-  const selected = THEME_NAMES[index];
-  if (selected === undefined || selected === picker.selected) return state;
-  return {...state, themePicker: {selected}};
+export function openNotepad(state: SessionState): SessionState {
+  if (state.notepad.open) return state;
+  return {
+    ...state,
+    overlay: null,
+    palette: null,
+    themePicker: null,
+    notepad: {...state.notepad, open: true},
+  };
 }
 
-/** Closes the picker, leaving the theme as it was when it opened. */
-export function closeThemePicker(state: SessionState): SessionState {
-  if (state.themePicker === null) return state;
-  return {...state, themePicker: null};
+/** Closes the notepad without discarding its text or touching promotion. */
+export function closeNotepad(state: SessionState): SessionState {
+  if (!state.notepad.open) return state;
+  return {...state, notepad: {...state.notepad, open: false}};
+}
+
+/**
+ * A promotion action explicitly resolves a conflicted startup draft. A
+ * nonblank draft has already been copied to a composer; an empty draft has no
+ * payload to preserve. Either way, a later open may hydrate the saved note
+ * that was deliberately left untouched.
+ */
+export function closeNotepadAfterPromotion(state: SessionState): SessionState {
+  if (state.notepad.persistence !== 'conflict') return closeNotepad(state);
+  return {
+    ...state,
+    notepad: {
+      open: false,
+      text: '',
+      createdAt: null,
+      updatedAt: null,
+      persistence: 'ready',
+      persistenceError: null,
+    },
+  };
+}
+
+/** Every keystroke in the notepad's editor lands here. */
+export function setNotepadText(state: SessionState, text: string, timestamp: string): SessionState {
+  if (text === state.notepad.text) return state;
+  return {
+    ...state,
+    notepad: {
+      ...state.notepad,
+      text,
+      createdAt: state.notepad.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    },
+  };
+}
+
+/** Records whether the latest in-memory notepad text reached its local sidecar. */
+export function setNotepadPersistenceError(
+  state: SessionState,
+  persistenceError: string | null,
+): SessionState {
+  if (state.notepad.persistenceError === persistenceError) return state;
+  return {...state, notepad: {...state.notepad, persistenceError}};
+}
+
+/**
+ * The text a promotion action hands to a composer: `null` for an empty (or
+ * all-whitespace) note, since promoting nothing would just pre-fill the
+ * composer with blank text and still close the notepad on the operator.
+ */
+export function notepadPromotionText(state: SessionState): string | null {
+  const trimmed = state.notepad.text.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 export function applySnapshot(state: SessionState, snapshot: RunSnapshot): SessionState {
   const core = reduceSnapshot(state.core, snapshot);
-  return core === state.core ? state : {...state, core};
+  if (core === state.core) return state;
+  const next = {...state, core};
+  const mismatch = diagnosticProjection.newRunIdentityMismatch(state.core, core);
+  return mismatch === null ? next : reportProjectedDiagnostic(next, mismatch);
 }
 
 /** Record transport health as frontend state without rewriting backend-derived facts. */
@@ -1595,16 +1069,6 @@ export function visibleActiveExecutions(state: SessionState): ActiveAgentExecuti
   );
 }
 
-/** Replace activity with the backend checkpoint without advancing the event replay cursor. */
-export function applyActiveExecutionCheckpoint(
-  state: SessionState,
-  executions: ActiveExecutionCheckpoint,
-  throughSequence?: number,
-): SessionState {
-  const core = reconcileActiveExecutions(state.core, executions, throughSequence);
-  return core === state.core ? state : {...state, core};
-}
-
 export function applyEvent(state: SessionState, event: RunEvent): SessionState {
   const core = reduceEvent(state.core, event);
   if (core === state.core) return state;
@@ -1614,8 +1078,58 @@ export function applyEvent(state: SessionState, event: RunEvent): SessionState {
     core,
     chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
   });
-  if (diagnostic !== null) next = reportProjectedDiagnostic(next, diagnostic);
-  return next;
+  if (diagnostic !== null && diagnosticProjection.isNewDiagnostic(state.core, diagnostic)) {
+    next = reportProjectedDiagnostic(next, diagnostic);
+  }
+  return projectQuota(state.core, next);
+}
+
+/**
+ * Show a new quota pause as a banner naming the operator's choices, and retire
+ * the banner when the stop settles (resumed, abandoned or switched). Only a
+ * change of the quota fact counts as news, so a fold that leaves it alone never
+ * reopens a dismissed banner.
+ */
+function projectQuota(previous: CoreState, state: SessionState): SessionState {
+  const quota = state.core.quota;
+  if (quota === previous.quota) return state;
+  const pause = quota.pause;
+  if (pause === null) {
+    return state.errorBanner?.diagnosticId === quotaProjection.QUOTA_BANNER_ID
+      ? {...state, errorBanner: null}
+      : state;
+  }
+  if (hasRunEnded(state.core)) return state;
+  return {
+    ...state,
+    errorBanner: {
+      titleKind: 'quota_pause',
+      message: quotaProjection.quotaSummary(pause),
+      detail: quotaProjection.quotaDetail(pause),
+      hint: quotaProjection.quotaChoices(pause),
+      diagnosticId: quotaProjection.QUOTA_BANNER_ID,
+      severity: 'recoverable',
+      scope: 'run',
+      agentKind: null,
+      roundLabel: null,
+      invocationId: null,
+      count: 1,
+    },
+  };
+}
+
+/**
+ * Fold the events an RPC response carried, as one UI transition.
+ *
+ * A response is a batch, so it takes the batch transition rather than one
+ * `applyEvent` per event. It does not move the stream cursor; see
+ * `reduceResponseEvents`.
+ */
+export function applyResponseEvents(
+  state: SessionState,
+  events: readonly RunEvent[],
+): SessionState {
+  return applyReducedCore(state, reduceResponseEvents(state.core, events));
 }
 
 /**
@@ -1667,28 +1181,60 @@ export function applyEventRebootstrap(
 /** The UI transition shared by both ways of folding a backend checkpoint. */
 function applyReducedCore(state: SessionState, core: CoreState): SessionState {
   if (core === state.core) return state;
+  const session = diagnosticProjection.coreOwnsDifferentRun(state.core, core)
+    ? resetRunLocalState(state)
+    : state;
   let next: SessionState = deriveActiveChat({
-    ...state,
+    ...session,
     core,
-    chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
+    chatConversations: reconcileChatConversations(session.chatConversations, core.chatTranscripts),
   });
-  if (core.status === 'failed') {
+  if (diagnosticProjection.endedWithBannerableFailure(core.status)) {
     // Warnings never banner, so a trailing warning must not mask the failure:
     // surface the last diagnostic that can.
     const finalDiagnostic = core.diagnostics.filter(d => d.severity !== 'warning').at(-1);
-    if (finalDiagnostic !== undefined) next = reportProjectedDiagnostic(next, finalDiagnostic);
+    // Only a transition into failure, or a diagnostic this fold appended, is
+    // news. A later fold of an already-failed run (a post-mortem chat batch,
+    // say) repeats the same terminal diagnostic, and re-reporting it would
+    // reopen a dismissed banner and inflate its report count; the same
+    // invariant `applyEventPrefix` keeps by projecting nothing. Reference
+    // equality is the right comparison: `reduceEventBatch` shares untouched
+    // diagnostic objects with the previous core, exactly as
+    // `latestDiagnosticChange` relies on.
+    const isNews =
+      finalDiagnostic !== undefined &&
+      (finalDiagnostic.code === 'run_identity_mismatch'
+        ? diagnosticProjection.isNewDiagnostic(state.core, finalDiagnostic)
+        : !diagnosticProjection.endedWithBannerableFailure(state.core.status) ||
+          !state.core.diagnostics.includes(finalDiagnostic));
+    if (isNews) next = reportProjectedDiagnostic(next, finalDiagnostic);
+  } else {
+    const mismatch = diagnosticProjection.newRunIdentityMismatch(state.core, core);
+    if (mismatch !== null) next = reportProjectedDiagnostic(next, mismatch);
   }
-  return next;
+  return projectQuota(state.core, next);
+}
+
+/**
+ * Clear state whose meaning is scoped to a run while retaining terminal-wide
+ * preferences and measurements. The caller installs the replacement core.
+ */
+function resetRunLocalState(state: SessionState): SessionState {
+  return {
+    ...initialSessionState(state.themeName),
+    eventStreamAvailable: state.eventStreamAvailable,
+    chatDockFits: state.chatDockFits,
+  };
 }
 
 /**
  * Fold history older than everything already loaded, lowering the floor below
  * which nothing has been read yet.
  *
- * No diagnostic is projected. A backfilled event is by construction older than
- * every event on screen, so its failure is not news: reporting it would reopen
- * the banner for something the operator has already scrolled past, or already
- * dismissed.
+ * Historical run failures are not projected: reporting one would reopen the
+ * banner for something the operator has already scrolled past or dismissed.
+ * A run-identity mismatch is a current protocol fault, so its first occurrence
+ * is still surfaced even when the offending delivery arrived as backfill.
  */
 export function applyEventPrefix(
   state: SessionState,
@@ -1697,17 +1243,19 @@ export function applyEventPrefix(
 ): SessionState {
   const core = reduceEventPrefix(state.core, events, historyAfterSequence);
   if (core === state.core) return state;
-  return deriveActiveChat({
+  const next = deriveActiveChat({
     ...state,
     core,
     chatConversations: reconcileChatConversations(state.chatConversations, core.chatTranscripts),
   });
+  const mismatch = diagnosticProjection.newRunIdentityMismatch(state.core, core);
+  return mismatch === null ? next : reportProjectedDiagnostic(next, mismatch);
 }
 
 /** Folds every thread's replayed transcript into its local conversation. */
 function reconcileChatConversations(
   conversations: Record<string, ConversationEntry[]>,
-  transcripts: Record<string, TranscriptEntry[]>,
+  transcripts: Readonly<Record<string, readonly TranscriptEntry[]>>,
 ): Record<string, ConversationEntry[]> {
   const next = {...conversations};
   for (const [threadId, transcript] of Object.entries(transcripts)) {
@@ -1716,115 +1264,51 @@ function reconcileChatConversations(
   return next;
 }
 
+/**
+ * The transcript's order is authoritative: core keeps it sequence-sorted even
+ * when a backfill prepends older exchanges, so replayed entries are emitted in
+ * transcript order rather than appended wherever the conversation happens to
+ * end. Local entries (typed questions, in-flight placeholders) have no
+ * sequence, so each keeps its place ahead of the replayed entry it preceded.
+ * A transcript entry the conversation has not seen is one of two things:
+ * before the last already-seen entry it is backfilled history, which slots in
+ * at its transcript index above the locals typed while its newer neighbour
+ * was on screen; after it, it is tail growth, which lands below the pending
+ * question that asked for it.
+ */
 function reconcileChatTranscript(
   conversation: ConversationEntry[],
-  transcript: TranscriptEntry[],
+  transcript: readonly TranscriptEntry[],
 ): ConversationEntry[] {
-  const byId = new Map(transcript.map(entry => [entry.id, entry]));
-  const present = new Set<string>();
-  const updated = conversation.map(entry => {
-    const replacement = byId.get(entry.id);
-    if (replacement === undefined) return entry;
-    present.add(entry.id);
-    return replacement;
-  });
-  for (const entry of transcript) {
-    if (!present.has(entry.id) && !conversation.some(existing => existing.id === entry.id)) {
-      updated.push(entry);
-    }
+  const replayedIds = new Set(transcript.map(entry => entry.id));
+  const conversationIds = new Set(conversation.map(entry => entry.id));
+  let lastSeen = -1;
+  for (const [index, entry] of transcript.entries()) {
+    if (conversationIds.has(entry.id)) lastSeen = index;
   }
-  return updated.slice(-500);
-}
-
-export function selectNextAgent(state: SessionState): SessionState {
-  const phases = visiblePhases(state);
-  if (phases.length === 0) return state;
-  const current = state.selectedAgentKind;
-  const index = current === null ? -1 : phases.findIndex(phase => phase.kind === current);
-  const next = phases[(index + 1 + phases.length) % phases.length];
-  return {...state, selectedAgentKind: next?.kind ?? null, roundFocus: 'agents', overlay: null};
-}
-
-export function selectPreviousAgent(state: SessionState): SessionState {
-  const phases = visiblePhases(state);
-  if (phases.length === 0) return state;
-  const current = state.selectedAgentKind;
-  const index = current === null ? 0 : phases.findIndex(phase => phase.kind === current);
-  const previous = phases[(index - 1 + phases.length) % phases.length];
-  return {
-    ...state,
-    selectedAgentKind: previous?.kind ?? null,
-    roundFocus: 'agents',
-    overlay: null,
+  const merged: ConversationEntry[] = [];
+  let at = 0;
+  // Emits conversation entries up to (not including) the copy of `stopId`,
+  // dropping copies the transcript replays: those re-emit, deduplicated, at
+  // their transcript position.
+  const flushConversationBefore = (stopId: string | null): void => {
+    for (; at < conversation.length; at += 1) {
+      const held = conversation[at];
+      if (held === undefined || held.id === stopId) break;
+      if (!replayedIds.has(held.id)) merged.push(held);
+    }
   };
-}
-
-export function selectNextRound(state: SessionState): SessionState {
-  const rounds = stripRounds(state);
-  if (rounds.length === 0) return state;
-  const visible = visibleRoundNumber(state);
-  const index = visible === null ? -1 : rounds.findIndex(round => round.number === visible);
-  const next = rounds[(index + 1 + rounds.length) % rounds.length];
-  return withSelectedRound(state, next?.number ?? null);
-}
-
-export function selectPreviousRound(state: SessionState): SessionState {
-  const rounds = stripRounds(state);
-  if (rounds.length === 0) return state;
-  const visible = visibleRoundNumber(state);
-  const index = visible === null ? 0 : rounds.findIndex(round => round.number === visible);
-  const previous = rounds[(index - 1 + rounds.length) % rounds.length];
-  return withSelectedRound(state, previous?.number ?? null);
-}
-
-export function selectRound(state: SessionState, roundNumber: number): SessionState {
-  if (!stripRounds(state).some(round => round.number === roundNumber)) return state;
-  return withSelectedRound(state, roundNumber);
-}
-
-/**
- * Lands round navigation on `roundNumber`. Round navigation covers the whole
- * run, not just the open hypothesis's slice of it, so inside a scope the scope
- * follows the round: crossing into a round another hypothesis owns re-derives
- * the scope from that owner.
- */
-function withSelectedRound(state: SessionState, roundNumber: number | null): SessionState {
-  return {
-    ...state,
-    ...(state.hypothesisScope !== null && roundNumber !== null
-      ? scopeStateForRound(state, roundNumber)
-      : {}),
-    selectedRound: roundNumber,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-    overlay: null,
-  };
-}
-
-export function clearAgentSelection(state: SessionState): SessionState {
-  return {
-    ...state,
-    selectedAgentKind: null,
-    selectedEntryId: null,
-    roundFocus: 'transcript',
-    overlay: null,
-  };
-}
-
-/**
- * Picks one agent out of the round, or clears the pick when it is already the
- * selected one, so clicking a node twice behaves the way a toggle should. The
- * transcript follows the selection, so the entry cursor starts over with it.
- */
-export function selectAgent(state: SessionState, kind: string): SessionState {
-  const selected = state.selectedAgentKind === kind ? null : kind;
-  return {
-    ...state,
-    selectedAgentKind: selected,
-    selectedEntryId: null,
-    roundFocus: 'agents',
-    overlay: null,
-  };
+  for (const [index, entry] of transcript.entries()) {
+    if (conversationIds.has(entry.id)) {
+      flushConversationBefore(entry.id);
+      if (conversation[at]?.id === entry.id) at += 1;
+    } else if (index > lastSeen) {
+      flushConversationBefore(null);
+    }
+    merged.push(entry);
+  }
+  flushConversationBefore(null);
+  return merged.slice(-500);
 }
 
 /**
@@ -1891,7 +1375,7 @@ export function selectNextTodo(state: SessionState, delta: number): SessionState
 export interface ErrorReport {
   scope: ErrorScope;
   severity?: ErrorSeverity;
-  title?: string;
+  titleKind?: ErrorTitleKind;
   diagnostic?: Diagnostic | null;
   diagnosticId?: string | null;
   detail?: string | null;
@@ -1951,7 +1435,7 @@ function errorBannerFromReport(message: string, report: ErrorReport): ErrorBanne
   const scope = diagnostic?.scope ?? report.scope;
   const severity = diagnosticSeverity(diagnostic?.severity) ?? report.severity ?? 'recoverable';
   return {
-    title: report.title ?? errorTitle(scope),
+    titleKind: report.titleKind ?? scope,
     message: diagnostic?.summary || message || 'An unknown error occurred.',
     detail: diagnostic?.detail ?? report.detail ?? null,
     hint: diagnostic?.hint ?? report.hint ?? null,
@@ -1978,7 +1462,7 @@ function mergeEquivalentError(
     detail: moreInformativeMessage(existing.detail ?? '', incoming.detail ?? '') || null,
     hint: moreInformativeMessage(existing.hint ?? '', incoming.hint ?? '') || null,
     severity: promoted,
-    title: promoted === 'fatal' ? incoming.title : existing.title,
+    titleKind: promoted === 'fatal' ? incoming.titleKind : existing.titleKind,
     scope: promoted === 'fatal' ? incoming.scope : existing.scope,
     diagnosticId: existing.diagnosticId ?? incoming.diagnosticId,
     agentKind: existing.agentKind ?? incoming.agentKind,
@@ -1995,7 +1479,7 @@ function reportProjectedDiagnostic(state: SessionState, diagnostic: CoreDiagnost
   return reportError(state, diagnostic.summary, {
     scope: diagnostic.scope,
     severity: diagnostic.severity === 'fatal' ? 'fatal' : 'recoverable',
-    title: projectedDiagnosticTitle(diagnostic.failureKind),
+    titleKind: diagnostic.failureKind,
     diagnosticId: diagnostic.id,
     detail: diagnostic.detail,
     hint: diagnostic.hint,
@@ -2003,11 +1487,6 @@ function reportProjectedDiagnostic(state: SessionState, diagnostic: CoreDiagnost
     roundLabel: diagnostic.roundLabel,
     invocationId: diagnostic.invocationId,
   });
-}
-
-function projectedDiagnosticTitle(kind: CoreDiagnostic['failureKind']): string {
-  if (kind === 'run_interruption') return 'Run interrupted';
-  return errorTitle(kind);
 }
 
 /** Keep a terminal wrapper's extra context when it repeats an invocation error. */
@@ -2032,20 +1511,6 @@ function equivalentError(left: ErrorBannerState, right: ErrorBannerState): boole
   );
 }
 
-function errorTitle(scope: ErrorScope): string {
-  const titles: Record<ErrorScope, string> = {
-    configuration: 'Configuration failed',
-    invocation: 'Invocation failed',
-    phase: 'Phase failed',
-    run: 'Run failed',
-    protocol: 'Protocol error',
-    request: 'Request failed',
-    transport: 'Connection lost',
-    input: 'Input error',
-  };
-  return titles[scope];
-}
-
 function diagnosticSeverity(
   severity: Diagnostic['severity'] | undefined,
 ): ErrorSeverity | undefined {
@@ -2062,9 +1527,11 @@ export function showLive(state: SessionState): SessionState {
   return {
     ...state,
     overlay: null,
+    diffViewer: null,
     chatOpen: false,
     hypothesisDetail: null,
     hypothesisScope: null,
+    selectedIterationId: null,
     selectedRound: null,
     selectedAgentKind: null,
     experimentLog: state.experimentLog ?? {
@@ -2091,25 +1558,6 @@ export function showDetail(
  * owns the run's lifecycle, so there is no second flag to prefix. The switch is
  * exhaustive, making a new status a compile error rather than a raw token.
  */
-export function runStatusLabel(status: CoreRunStatus): string {
-  switch (status) {
-    case 'pausing':
-      // Requested, but the call already in flight has to finish first.
-      return 'pausing…';
-    case 'connecting':
-    case 'starting':
-    case 'running':
-    case 'paused':
-    case 'completed':
-    case 'failed':
-      return status;
-    default: {
-      const unhandled: never = status;
-      return unhandled;
-    }
-  }
-}
-
 export function visibleConversation(state: SessionState): ConversationEntry[] {
   const roundNumber = visibleRoundNumber(state);
   return state.core.transcript.filter(entry => {
@@ -2134,7 +1582,7 @@ export function toggleTodos(state: SessionState): SessionState {
  * scoping rules as the conversation filter. Entries whose events carried no
  * agent or round stamp (legacy streams) match any scope rather than vanish.
  */
-export function visibleTodos(state: SessionState): TodoItem[] {
+export function visibleTodos(state: SessionState): readonly TodoItem[] {
   const roundNumber = visibleRoundNumber(state);
   const matchesRound = (phase: ExecutionTodos): boolean =>
     roundNumber === null || phase.roundNumber === roundNumber || phase.roundNumber === null;
@@ -2164,27 +1612,55 @@ export function visibleTodos(state: SessionState): TodoItem[] {
 }
 
 export function visibleRoundNumber(state: SessionState): number | null {
+  if (state.selectedIterationId !== null) {
+    const selected = iterationRailRounds(state).find(
+      row => row.iterationId === state.selectedIterationId,
+    );
+    if (selected !== undefined) return selected.number;
+  }
   const scope = state.hypothesisScope;
   if (scope !== null && state.selectedRound === null) {
     // Opening a hypothesis lands on one of its rounds rather than on nothing.
     // Leaving the round unset used to mean "the whole trajectory", which drew an
     // empty agent strip and an empty transcript for any run whose events are not
     // all round-stamped: a blank view where a round was asked for.
-    const rounds = state.core.rounds.filter(round => scope.rounds.includes(round.number));
+    const rounds = state.core.rounds.filter(
+      round => round.number !== null && scope.rounds.includes(round.number),
+    );
     const active = [...rounds].reverse().find(round => round.status === 'active');
     return active?.number ?? rounds.at(-1)?.number ?? scope.rounds.at(-1) ?? null;
   }
   if (state.selectedRound !== null) return state.selectedRound;
-  const rounds = stripRounds(state);
+  const rounds = stripRounds(state).filter(round => round.number !== null);
   const active = [...rounds].reverse().find(round => round.status === 'active');
   return active?.number ?? rounds.at(-1)?.number ?? null;
 }
 
+/** Stable identity currently represented by the rail cursor. */
+export function visibleIterationId(state: SessionState): string | null {
+  const rows = iterationRailRounds(state);
+  if (
+    state.selectedIterationId !== null &&
+    rows.some(row => row.iterationId === state.selectedIterationId)
+  ) {
+    return state.selectedIterationId;
+  }
+  const roundNumber = visibleRoundNumber(state);
+  if (roundNumber !== null) {
+    const round = rows.find(row => row.number === roundNumber);
+    if (round !== undefined) return round.iterationId;
+  }
+  const active = [...rows].reverse().find(row => row.status === 'active');
+  return active?.iterationId ?? rows.at(-1)?.iterationId ?? null;
+}
+
 /** The rounds owned by the hypothesis on screen, or every round outside one. */
-export function scopedRounds(state: SessionState): RoundState[] {
+export function scopedRounds(state: SessionState): readonly RoundState[] {
   const scope = state.hypothesisScope;
   if (scope === null) return state.core.rounds;
-  return state.core.rounds.filter(round => scope.rounds.includes(round.number));
+  return state.core.rounds.filter(
+    round => round.number !== null && scope.rounds.includes(round.number),
+  );
 }
 
 /**
@@ -2195,17 +1671,6 @@ export function scopedRounds(state: SessionState): RoundState[] {
  * what has happened carry ``planned`` and open an empty view, which is the
  * honest thing to show for a round that has not run.
  */
-export function stripRounds(state: SessionState): RoundState[] {
-  const highest = Math.max(
-    state.core.maxRounds ?? 0,
-    ...state.core.rounds.map(round => round.number),
-    0,
-  );
-  if (highest === 0) return state.core.rounds;
-  const known = new Map(state.core.rounds.map(round => [round.number, round]));
-  const rounds: RoundState[] = [];
-  for (let number = 1; number <= highest; number += 1) {
-    rounds.push(known.get(number) ?? {number, status: 'planned'});
-  }
-  return rounds;
+export function stripRounds(state: SessionState): readonly RoundState[] {
+  return roundsWithPlan(state.core.rounds, state.core.maxRounds);
 }

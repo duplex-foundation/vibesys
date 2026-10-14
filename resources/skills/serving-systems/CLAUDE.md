@@ -176,7 +176,13 @@ rg "register.*backend" $SERVE_REPOS/vllm/vllm/v1/attention/backends/
 
 Tell the reader to export `SERVE_REPOS=$(git rev-parse --show-toplevel)/resources/skills/serving-systems/repos` or substitute inline.
 
-The `repos/` directory is **excluded** from agent materialization (see `src/vibesys/agents/cli_common.py::materialize_skills`); reference paths into it are advisory grep recipes, not runtime imports.
+The `repos/` directory is **excluded** from agent materialization (see `libs/vs-agent/src/vs_agent/cli_common.py::materialize_skills`); reference paths into it are advisory grep recipes, not runtime imports.
+
+`resources/skills/serving-systems/` is intentionally outside the code-citation gate in
+`scripts/check_doc_citations.py`. Its source locations can refer to reference-repo revisions that
+are not materialized in the checkout, so a repository-local existence check would reject valid
+research notes. Keep those locations as advisory paths and only add this subtree to the gate with
+an explicit external-checkout resolution policy.
 
 ## What not to include
 

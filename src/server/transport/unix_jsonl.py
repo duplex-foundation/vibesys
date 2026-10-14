@@ -2,77 +2,171 @@
 
 from __future__ import annotations
 
-import json
-import os
-import socket
-import socketserver
-import threading
-import time
+import errno
+import logging
+import sys
 from contextlib import suppress
-from pathlib import Path  # noqa: TC003  # tracked: #288
+from functools import partial
 from typing import TYPE_CHECKING
-
-from pydantic import BaseModel, TypeAdapter
 
 from server.api.protocol import (
     EventBatchMessage,
     ProtocolErrorMessage,
-    ProtocolRequest,
     Response,
     SubscribedMessage,
     SubscribeRequest,
 )
 from server.transport.subscriptions import SubscriptionTracker
-from vibesys.unix_socket import validate_socket_path
+from vs_sim.api import OsThreads, UnixNetwork
 
 if TYPE_CHECKING:
-    from server.api.service import RunApi, SubscriptionBootstrap
+    from collections.abc import Iterator
+    from pathlib import Path
 
-_REQUEST_ADAPTER = TypeAdapter(ProtocolRequest)
+    from pydantic import BaseModel
+
+    from server.api.service import RunApi, SubscriptionBootstrap
+    from server.transport.subscriptions import StreamDelivery
+    from vs_sim.api import Connection, Event, Listener, Network, Threads, Worker
 
 # Polling slack on the teardown path. After the last client hangs up, the
-# server exits only once the stream loop notices the closed peer, the
-# ``RECONNECT_SETTLE_SECONDS`` window elapses, and ``serve_forever`` observes
-# ``shutdown``. The sum must stay under the launcher's 2s backend exit grace,
-# or a deliberate quit is reported as a hung backend and SIGTERMed. Both polls
-# were 1.0s and 0.5s (the ``socketserver`` default), which with the settle
-# window overran that grace.
+# server exits only once the stream loop notices the closed peer and the
+# ``RECONNECT_SETTLE_SECONDS`` window elapses. The sum must stay under the
+# launcher's 2s backend exit grace, or a deliberate quit is reported as a hung
+# backend and SIGTERMed.
 _DISCONNECT_POLL_SECONDS = 0.1
-_SHUTDOWN_POLL_SECONDS = 0.1
+# Pause between idle checks of a stream whose cursor has not moved.
+_IDLE_BACKOFF_SECONDS = 0.05
+# Pause before retrying `accept()` after a transient failure (e.g. the process
+# or system file-descriptor table is exhausted), so a sustained shortage does
+# not spin the accept loop instead of giving fds a chance to free up.
+_ACCEPT_RETRY_BACKOFF_SECONDS = 0.1
+MAX_SOCKET_PATH_BYTES = 103 if sys.platform == "darwin" else 107
+_RECV_BYTES = 65536
+MAX_REQUEST_LINE_BYTES = 1024 * 1024
+"""The longest request line a session buffers; the WebSocket gateway's inbound frame cap."""
+
+_LOG = logging.getLogger(__name__)
 
 
-class _RequestHandler(socketserver.StreamRequestHandler):
-    server: _JsonlUnixServer
+class SocketPathTooLongError(OSError):
+    """A server transport path does not fit in ``sockaddr_un.sun_path``."""
+
+    def __init__(self, path: Path, limit: int) -> None:
+        """Describe the encoded path and platform byte limit."""
+        encoded = len(str(path).encode())
+        super().__init__(
+            errno.ENAMETOOLONG,
+            f"Unix socket path is {encoded} bytes, over this platform's "
+            f"{limit}-byte limit: {path}. Choose a shorter directory.",
+        )
+        self.path = path
+        self.limit = limit
+
+
+def validate_socket_path(path: Path) -> Path:
+    """Return a bindable transport path or raise a precise path error."""
+    if len(str(path).encode()) > MAX_SOCKET_PATH_BYTES:
+        raise SocketPathTooLongError(path, MAX_SOCKET_PATH_BYTES)
+    return path
+
+
+class RequestLineTooLongError(ValueError):
+    """A request line ran past ``MAX_REQUEST_LINE_BYTES`` without its newline."""
+
+    diagnostic_code = "request_too_large"
+
+    def __init__(self) -> None:
+        """Name the bound the line exceeded."""
+        super().__init__(
+            f"a request line is longer than {MAX_REQUEST_LINE_BYTES} bytes; "
+            "the rest of it was discarded"
+        )
+
+
+class _PeerGoneError(Exception):
+    """The client's end of the connection is gone; nothing more can reach it."""
+
+
+class _ClientSession:
+    """One client connection: read JSONL requests, answer each, or stream events."""
+
+    def __init__(
+        self,
+        connection: Connection,
+        api: RunApi,
+        subscriptions: SubscriptionTracker,
+        threads: Threads,
+    ) -> None:
+        self._connection = connection
+        self._api = api
+        self._subscriptions = subscriptions
+        self._threads = threads
 
     def handle(self) -> None:
-        api = self.server.api
-        for line in self.rfile:
-            request_id = "unknown"
+        """Serve requests until the client hangs up, or until its subscription ends."""
+        api = self._api
+        for line in self._lines():
+            request = (
+                api.failure("unknown", "", RequestLineTooLongError())
+                if line is None
+                else api.decode_request(line)
+            )
+            if isinstance(request, Response):
+                self._write_message(request)
+                continue
             try:
-                raw = json.loads(line)
-                request_id = str(raw.get("request_id", request_id))
-                request = _REQUEST_ADAPTER.validate_python(raw)
                 if isinstance(request, SubscribeRequest):
-                    with self.server.subscriptions.track():
+                    with self._subscriptions.track() as delivery:
                         try:
-                            self._stream(request)
-                        except (BrokenPipeError, ConnectionResetError):
+                            self._stream(request, delivery)
+                        except _PeerGoneError:
                             pass
-                        except Exception as exc:  # noqa: BLE001  # tracked: #288
-                            self._write_stream_error(request.request_id, exc)
+                        except Exception as exc:  # noqa: BLE001  # lint-waiver: LW-010252 [BLE001]; arbitrary event serialization failures are returned as protocol stream errors.
+                            self._write_stream_error(request.request_id, request.client_id, exc)
                     return
                 response = api.execute(request)
-            except Exception as exc:  # noqa: BLE001  # tracked: #288
-                response = Response.from_exception(
-                    request_id,
-                    exc,
-                    operation="Request",
-                )
-            self.wfile.write(response.model_dump_json().encode() + b"\n")
-            self.wfile.flush()
+            except Exception as exc:  # noqa: BLE001  # lint-waiver: LW-010253 [BLE001]; the socket boundary converts request failures into typed protocol responses.
+                response = api.failure(request.request_id, request.client_id, exc)
+            self._write_message(response)
 
-    def _stream(self, request: SubscribeRequest) -> None:
-        api = self.server.api
+    def _lines(self) -> Iterator[bytes | None]:
+        """Yield each newline-terminated request, then any unterminated rest at end of stream.
+
+        A line that grows past ``MAX_REQUEST_LINE_BYTES`` yields ``None`` once,
+        and its remaining bytes up to the next newline are dropped unbuffered,
+        so a client cannot make a session hold an unbounded line. A read error
+        ends the stream like an end of file: either way the client can send
+        nothing more.
+        """
+        pending = b""
+        discarding = False
+        while True:
+            try:
+                chunk = self._connection.recv(_RECV_BYTES)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                if pending and not discarding:
+                    yield pending
+                return
+            if discarding:
+                newline = chunk.find(b"\n")
+                if newline < 0:
+                    continue
+                discarding = False
+                chunk = chunk[newline + 1 :]
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            for line in lines:
+                yield line + b"\n" if len(line) < MAX_REQUEST_LINE_BYTES else None
+            if len(pending) >= MAX_REQUEST_LINE_BYTES:
+                pending = b""
+                discarding = True
+                yield None
+
+    def _stream(self, request: SubscribeRequest, delivery: StreamDelivery) -> None:
+        api = self._api
         try:
             bootstrap = api.subscription_bootstrap(
                 request.after_sequence, request.tail, store_id=request.store_id
@@ -88,6 +182,7 @@ class _RequestHandler(socketserver.StreamRequestHandler):
             self._write_message(
                 SubscribedMessage(
                     request_id=request.request_id,
+                    client_id=request.client_id,
                     run_id=api.snapshot().run_id,
                     latest_sequence=api.latest_sequence,
                 )
@@ -96,22 +191,29 @@ class _RequestHandler(socketserver.StreamRequestHandler):
         self._write_message(
             SubscribedMessage(
                 request_id=request.request_id,
+                client_id=request.client_id,
                 run_id=bootstrap.run_id,
                 latest_sequence=bootstrap.through_sequence,
             )
         )
         cursor, reported_floor, store_id = self._write_bootstrap(request, bootstrap)
+        delivery.delivered(cursor)
+        hung_up = self._threads.event()
+        self._threads.spawn(
+            partial(self._watch_for_hangup, hung_up), name="vibesys-server-jsonl-hangup"
+        )
         while True:
             if not api.wait_for_change(cursor, timeout=_DISCONNECT_POLL_SECONDS):
-                if self._client_disconnected():
+                if hung_up.is_set():
                     return
-                time.sleep(0.05)
+                self._threads.sleep(_IDLE_BACKOFF_SECONDS)
                 continue
             if request.tail is not None and api.latest_sequence - cursor > request.tail:
                 # More live output landed in one wait than the tail bound was
                 # willing to replay. Bootstrap again at a fresh tail rather
                 # than deliver a window the bound was meant to exclude.
-                cursor, reported_floor, store_id = self._rebootstrap(request)
+                cursor, reported_floor, store_id = self._rebootstrap(request, cursor, store_id)
+                delivery.delivered(cursor)
                 continue
             # ``wait_for_change`` only tells us that the stream changed. Take
             # one watermark-consistent snapshot before writing so a resumed
@@ -124,7 +226,8 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 # after it is a continuation of what the client folded, however
                 # the two logs compare in length. Bootstrap against the store
                 # that is live now; the client re-folds from the batch's id.
-                cursor, reported_floor, store_id = self._rebootstrap(request)
+                cursor, reported_floor, store_id = self._rebootstrap(request, cursor, store_id)
+                delivery.delivered(cursor)
                 continue
             self._write_message(
                 EventBatchMessage(
@@ -136,21 +239,45 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 )
             )
             cursor = checkpoint.through_sequence
+            delivery.delivered(cursor)
 
-    def _rebootstrap(self, request: SubscribeRequest) -> tuple[int, int, str]:
-        """Restart this subscription's replay against the journal's live state."""
-        api = self.server.api
+    def _watch_for_hangup(self, hung_up: Event) -> None:
+        """Read and discard what the client sends after subscribing; set ``hung_up`` at its end.
+
+        A subscription owns its connection and reads no further requests. The
+        bytes still have to be read: a peer that closed with bytes unread is
+        not yet at end of stream, so an idle stream that only checked for end
+        of stream would never see the hangup, and an idle run writes nothing
+        that could fail instead.
+        """
+        try:
+            while self._connection.recv(_RECV_BYTES):
+                pass
+        except OSError:
+            pass
+        hung_up.set()
+
+    def _rebootstrap(
+        self, request: SubscribeRequest, cursor: int, store_id: str
+    ) -> tuple[int, int, str]:
+        """Restart this subscription's replay against the journal's live state.
+
+        The replay resumes from what this stream delivered (``cursor`` in
+        ``store_id``), not from the subscribe request: a swapped store makes the
+        cursor stale whether or not the request named its store.
+        """
         return self._write_bootstrap(
             request,
-            api.subscription_bootstrap(
-                request.after_sequence, request.tail, store_id=request.store_id
-            ),
+            self._api.subscription_bootstrap(cursor, request.tail, store_id=store_id),
+            rebootstrap=True,
         )
 
     def _write_bootstrap(
         self,
         request: SubscribeRequest,
         bootstrap: SubscriptionBootstrap,
+        *,
+        rebootstrap: bool = False,
     ) -> tuple[int, int, str]:
         """Send one tail-bounded replay batch; return the cursor, floor, and store.
 
@@ -166,95 +293,144 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 active_executions=bootstrap.active_executions,
                 history_after_sequence=reported_floor,
                 store_id=bootstrap.store_id,
+                rebootstrap=rebootstrap,
             )
         )
         return bootstrap.through_sequence, reported_floor, bootstrap.store_id
 
-    def _write_stream_error(self, request_id: str, error: Exception) -> None:
+    def _write_stream_error(self, request_id: str, client_id: str, error: Exception) -> None:
         """Report a replay or stream failure without hiding a live connection."""
         protocol_error = ProtocolErrorMessage.from_exception(
-            error,
-            operation="Event stream",
-            code="stream_failed",
-            request_id=request_id,
-        )
-        with suppress(BrokenPipeError, ConnectionResetError):
+            error, operation="Event stream", code="stream_failed", request_id=request_id
+        ).model_copy(update={"client_id": client_id})
+        with suppress(_PeerGoneError):
             self._write_message(protocol_error)
-
-    def _client_disconnected(self) -> bool:
-        try:
-            return self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
-        except BlockingIOError:
-            return False
-        except OSError:
-            return True
 
     def _write_message(self, message: BaseModel) -> None:
         payload = message.model_dump_json()
-        self.wfile.write(payload.encode() + b"\n")
-        self.wfile.flush()
-
-
-class _JsonlUnixServer(socketserver.ThreadingUnixStreamServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-    def __init__(  # noqa: ANN204  # tracked: #288
-        self,
-        path: Path,
-        api: RunApi,
-        subscriptions: SubscriptionTracker,
-    ):
-        self.api = api
-        self.subscriptions = subscriptions
-        super().__init__(str(path), _RequestHandler)
+        try:
+            self._connection.send(payload.encode() + b"\n")
+        except OSError as exc:
+            raise _PeerGoneError from exc
 
 
 class UnixJsonlServer:
-    """Own a private Unix socket serving one or more concurrent clients."""
+    """Own a private Unix socket serving one or more concurrent clients.
 
-    def __init__(self, path: Path, api: RunApi):  # noqa: ANN204, D107  # tracked: #288
+    Each client is served on its own worker. A client that hangs up at any
+    point, including between its request and the response, ends only its own
+    session; the server neither reports it nor stops serving the others.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        api: RunApi,
+        subscriptions: SubscriptionTracker | None = None,
+        threads: Threads | None = None,
+        network: Network | None = None,
+    ) -> None:
+        """Create a Unix server, optionally sharing subscription accounting.
+
+        ``threads`` runs the accept loop and each client, and paces idle
+        streams; ``network`` binds the socket. Both default to the operating
+        system's.
+        """
         self.path = path
         self.api = api
-        self._server: _JsonlUnixServer | None = None
-        self._thread: threading.Thread | None = None
-        self._subscriptions = SubscriptionTracker()
+        self._threads = threads or OsThreads()
+        self._subscriptions = subscriptions or SubscriptionTracker()
+        self._network = network or UnixNetwork()
+        self._listener: Listener | None = None
+        self._acceptor: Worker | None = None
+        self._guard = self._threads.lock()
+        self._open: set[Connection] = set()
+        self._closing = False
 
-    def start(self) -> None:  # noqa: D102  # tracked: #288
+    def start(self) -> None:
+        """Create the private Unix socket and start serving clients."""
         validate_socket_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.unlink(missing_ok=True)
-        self._server = _JsonlUnixServer(self.path, self.api, self._subscriptions)
-        os.chmod(self.path, 0o600)  # noqa: PTH101  # tracked: #288
-        self._thread = threading.Thread(
-            target=self._server.serve_forever,
-            kwargs={"poll_interval": _SHUTDOWN_POLL_SECONDS},
-            name="vibesys-server-jsonl",
-            daemon=True,
-        )
-        self._thread.start()
+        listener = self._network.listen(str(self.path))
+        try:
+            # The socket is a file only on a filesystem network; any other has nothing to restrict.
+            with suppress(FileNotFoundError):
+                self.path.chmod(0o600)
+            self._acceptor = self._threads.spawn(
+                partial(self._accept_loop, listener), name="vibesys-server-jsonl", daemon=True
+            )
+        except BaseException:
+            listener.close()
+            raise
+        self._listener = listener
+
+    def _accept_loop(self, listener: Listener) -> None:
+        while True:
+            try:
+                connection = listener.accept()
+            except OSError as exc:
+                with self._guard:
+                    closing = self._closing
+                if closing:
+                    return  # the listener was closed deliberately
+                # A transient failure, e.g. EMFILE/ENFILE while the process or
+                # system file-descriptor table is exhausted. The listener is
+                # still open: log it and keep accepting once the pressure
+                # eases, rather than permanently killing the accept loop.
+                _LOG.warning("accept() failed (errno=%s): %s; retrying", exc.errno, exc)
+                self._threads.sleep(_ACCEPT_RETRY_BACKOFF_SECONDS)
+                continue
+            with self._guard:
+                if self._closing:
+                    connection.close()
+                    return
+                self._open.add(connection)
+            self._threads.spawn(
+                partial(self._serve, connection), name="vibesys-server-jsonl-client", daemon=True
+            )
+
+    def _serve(self, connection: Connection) -> None:
+        try:
+            _ClientSession(connection, self.api, self._subscriptions, self._threads).handle()
+        except _PeerGoneError:
+            pass
+        finally:
+            with self._guard:
+                self._open.discard(connection)
+            connection.close()
 
     def wait_for_subscriber(self, timeout: float) -> bool:
         """Wait until a presentation client has established its event stream."""
         return self._subscriptions.wait_for_subscriber(timeout)
 
+    def wait_until_delivered(self, sequence: int, timeout: float) -> bool:
+        """Wait, bounded, until every open stream wrote through ``sequence``."""
+        return self._subscriptions.wait_until_delivered(sequence, timeout)
+
     def wait_for_subscriber_disconnect(self) -> None:
         """Keep terminal events queryable until the last active subscriber exits."""
         self._subscriptions.wait_for_none_active()
 
-    def close(self) -> None:  # noqa: D102  # tracked: #288
-        if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-            self._thread = None
-        self.path.unlink(missing_ok=True)
+    def close(self) -> None:
+        """Stop accepting, hang up on every client, and remove the socket path."""
+        listener, self._listener = self._listener, None
+        acceptor, self._acceptor = self._acceptor, None
+        with self._guard:
+            self._closing = True
+            open_connections, self._open = self._open, set()
+        if listener is not None:
+            listener.close()
+        if acceptor is not None:
+            acceptor.join(timeout=2)
+        for connection in open_connections:
+            connection.close()
 
-    def __enter__(self) -> UnixJsonlServer:  # noqa: D105  # tracked: #288
+    def __enter__(self) -> UnixJsonlServer:
+        """Start the server and return it as a context manager."""
         self.start()
         return self
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:  # noqa: D105  # tracked: #288
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        """Close the server when leaving its context."""
         self.close()

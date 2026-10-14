@@ -1,43 +1,45 @@
+"""Fixtures shared by the tests under ``tests/``.
+
+Nothing here imports the product. pytest imports this file in the xdist controller
+as well as in every worker, and the controller runs no test: a top-level ``vibesys``
+import made it build the whole model graph (seconds, several times that under
+coverage) for nothing. A fixture that needs the product lives in the test module that
+uses it.
+"""
+
+import os
 import shutil
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-
-from vibesys.input_manifest import (
-    MANIFEST_NAME,
-    InputBundle,
-    load_input_bundle,
-    load_project_task,
+from filelock import FileLock
+from tests.support.distribution_build import (
+    BuiltDistributions,
+    BuiltWheel,
+    build_distribution,
+    copy_private_packaging_source,
+    reissue_private_packaging_source,
 )
-from vibesys.render import HeadlessRenderer, output_sink
-from vs_project import Project, ProjectNotInitializedError
 
 
-@pytest.fixture(autouse=True)
-def isolated_vibesys_state_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Keep machine-local project state inside each test's temporary directory."""
-    monkeypatch.setenv(
-        "VIBESYS_STATE_HOME",
-        str(tmp_path.parent / f".vibesys-state-{tmp_path.name}"),
-    )
-
-
-@pytest.fixture(autouse=True)
-def headless_renderer() -> Iterator[HeadlessRenderer]:
-    """Compose a headless renderer for every test, mirroring production.
-
-    In production the headless entrypoint installs this subscriber. Tests get
-    the same presentation composition so direct output-sink emissions remain
-    observable to ``capsys`` assertions.
-    """
-    renderer = HeadlessRenderer()
-    unsubscribe = output_sink().subscribe(renderer.handle)
-    try:
-        yield renderer
-    finally:
-        unsubscribe()
+@pytest.fixture
+def isolated_github_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Make GitHub authentication independent of developer credentials."""
+    home = tmp_path / "home"
+    github_config = tmp_path / "gh-config"
+    home.mkdir()
+    github_config.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GH_CONFIG_DIR", str(github_config))
+    for variable in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ):
+        monkeypatch.delenv(variable, raising=False)
 
 
 @pytest.fixture
@@ -66,19 +68,38 @@ def repo_root() -> Path:
 
 
 @pytest.fixture(scope="session")
-def example_input_bundles(repo_root: Path) -> tuple[InputBundle, ...]:
-    manifests = sorted((repo_root / "examples").glob(f"**/{MANIFEST_NAME}"))
-    bundles: list[InputBundle] = []
-    for manifest in manifests:
-        try:
-            project = Project.discover(manifest)
-        except ProjectNotInitializedError:
-            bundles.append(load_input_bundle(manifest.parent))
-            continue
-        task = next(
-            task for task in project.discover_tasks() if task.manifest_path == manifest.resolve()
-        )
-        bundles.append(load_project_task(project, task))
+def built_distributions(
+    tmp_path_factory: pytest.TempPathFactory, repo_root: Path
+) -> BuiltDistributions:
+    """One sdist and one wheel of the current checkout, built once per run in private scratch.
 
-    assert bundles, f"No example input bundles found under {repo_root / 'examples'}"
-    return tuple(bundles)
+    A build takes tens of seconds of CPU, and every packaging check only inspects the result,
+    so they all share this one. Under xdist the workers share it too: the first to ask builds
+    it while holding a file lock in the run's common temp directory, and the others reuse it,
+    whichever ``--dist`` mode scheduled their tests.
+    """
+    base = tmp_path_factory.getbasetemp()
+    scratch = (base.parent if os.environ.get("PYTEST_XDIST_WORKER") else base) / "built"
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    dist = scratch / "dist"
+    with FileLock(str(scratch.parent / "built.lock")):
+        if not dist.is_dir():
+            staging = scratch.parent / "built-staging"
+            staging.mkdir()
+            source = copy_private_packaging_source(repo_root, staging / "checkout")
+            build_distribution(source, staging / "dist", artifact="all")
+            staging.rename(scratch)
+    # The snapshot's capability is process-local, so each worker re-issues it over the
+    # finished copy instead of sharing the first builder's object.
+    source = reissue_private_packaging_source(scratch / "checkout")
+    return BuiltDistributions(
+        source=source,
+        sdist=next(dist.glob("vibesys-*.tar.gz")),
+        wheel=next(dist.glob("vibesys-*.whl")),
+    )
+
+
+@pytest.fixture(scope="session")
+def built_wheel(built_distributions: BuiltDistributions) -> BuiltWheel:
+    """The shared build's wheel, with the snapshot it came from."""
+    return BuiltWheel(source=built_distributions.source, wheel=built_distributions.wheel)

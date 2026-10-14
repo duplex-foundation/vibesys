@@ -41,12 +41,14 @@ externally managed sandbox, so those paths never build a sandbox here.
 Operator controls (read from the agent's environment):
 
 ``VIBESYS_AGENT_SANDBOX``
-    Set to ``0``/``false``/``off``/``no`` to disable host confinement (e.g. for
-    debugging, or on a host whose toolchain layout the default allowlist does
-    not cover). Disabling is logged loudly. On Linux it also selects the
-    mechanism: ``auto`` (default) and ``bwrap`` require bubblewrap, while
-    ``landlock`` opts in to the weaker :class:`LandlockSandbox`. An
-    unrecognized value is rejected rather than treated as the default.
+    ``0``/``false``/``off``/``no`` request no host confinement. They take
+    effect only when the caller does not set ``require_enforcement``; VibeSys
+    runs on the host always do, so there they raise
+    :class:`SandboxUnavailableError`. Disabling is logged loudly. On Linux the
+    variable also selects the mechanism: ``auto`` (default) and ``bwrap``
+    require bubblewrap, while ``landlock`` opts in to the weaker
+    :class:`LandlockSandbox`. An unrecognized value is rejected rather than
+    treated as the default.
 
 Resource discovery and policy are deliberately outside this module. The caller
 passes declarations through the public resource SDK; this consumer only
@@ -57,20 +59,29 @@ from __future__ import annotations
 
 import enum
 import os
+import posixpath
 import shutil
-import subprocess
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Mapping  # noqa: TC003  # tracked: #288
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from vs_sandbox import landlock
 from vs_sandbox.host_resource_importer import prepare_host_resource_imports
-from vs_sandbox.host_resources import HostResource  # noqa: TC001  # tracked: #288
+from vs_sandbox.linked_worktree import linked_worktree_git_paths
 from vs_sandbox.project_paths import ProjectPathPolicy
+from vs_sim.api import SubprocessProbe
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Mapping
+
+    from vs_sandbox.host_resources import HostResource
+    from vs_sim.api import CommandProbe
 DISABLE_ENV = "VIBESYS_AGENT_SANDBOX"
+#: Set to ``none`` in the environment a sandbox is built with to withhold the
+#: host's accelerator device nodes, as when GPU work runs only in Slurm jobs.
+GPU_DEVICES_ENV = "VIBESYS_AGENT_SANDBOX_GPUS"
 
 _DISABLED_VALUES = frozenset({"0", "false", "off", "no"})
 
@@ -105,6 +116,7 @@ class _BuildOptions:
     log: Callable[[str], None]
     project_path_policy: ProjectPathPolicy
     require_enforcement: bool
+    probe: CommandProbe
 
 
 # Read-only system/toolchain roots exposed inside the Linux namespace. Bound
@@ -135,8 +147,8 @@ _SYSTEM_READ_ROOTS: tuple[str, ...] = (
 _LINUX_SCRATCH_WRITE_ROOTS: tuple[str, ...] = (
     "/dev",
     "/proc",
-    "/tmp",  # noqa: S108  # tracked: #288
-    "/var/tmp",  # noqa: S108  # tracked: #288
+    "/tmp",  # noqa: S108  # lint-waiver: LW-010105 [S108]; the Landlock backend must grant the host scratch tree because it cannot provide a private tmp mount.
+    "/var/tmp",  # noqa: S108  # lint-waiver: LW-010106 [S108]; the Landlock backend must grant the host scratch tree because it cannot provide a private tmp mount.
 )
 
 
@@ -160,6 +172,15 @@ _MACOS_SYSTEM_READ_ROOTS: tuple[str, ...] = (
     "/dev",
     "/Applications",  # some agent CLIs ship here
 )
+
+
+_PRIVATE_TMP = "/tmp"  # noqa: S108  # lint-waiver: LW-010107 [S108]; bubblewrap creates this private namespace tmpfs for the sandbox.
+_TEMP_ENV_NAMES = ("TMPDIR", "TMP", "TEMP")
+
+
+def system_read_roots() -> tuple[str, ...]:
+    """Return the system directories a confined job sees on this host, read-only."""
+    return _MACOS_SYSTEM_READ_ROOTS if sys.platform == "darwin" else _SYSTEM_READ_ROOTS
 
 
 def _is_disabled(env: dict[str, str]) -> bool:
@@ -239,6 +260,24 @@ class HostSandbox(WorkspaceSandbox):
     bwrap_path: str = field(kw_only=True)
     system_read_roots: tuple[str, ...] = _SYSTEM_READ_ROOTS
     gpu_device_nodes: tuple[Path, ...] = field(default_factory=tuple)
+    #: Absolute scratch directories the host's own startup files point
+    #: ``TMPDIR``/``TMP``/``TEMP`` at (see :func:`_host_temp_dirs`). Each gets a
+    #: private writable tmpfs in the namespace, next to ``/tmp``.
+    temp_dirs: tuple[str, ...] = ()
+
+    def _temp_dir_mounts(self) -> list[str]:
+        """Return the ``--tmpfs`` arguments for the host's scratch paths.
+
+        A login shell inside the job re-runs the host's startup files, which may
+        reset TMPDIR to a host scratch path (``/raid/tmp``) after the ``--setenv``
+        below. Whatever the shell picks must be writable, so every such path is
+        also a private tmpfs; the variables then work whoever sets them.
+        """
+        mounts: list[str] = []
+        for temp_dir in self.temp_dirs:
+            if temp_dir != _PRIVATE_TMP:
+                mounts += ["--tmpfs", temp_dir]
+        return mounts
 
     def wrap(self, argv: list[str], cwd: Path | str | None = None) -> list[str]:
         """Return *argv* wrapped so it runs inside the confinement namespace.
@@ -264,8 +303,15 @@ class HostSandbox(WorkspaceSandbox):
             "--dev",
             "/dev",
             "--tmpfs",
-            "/tmp",  # noqa: S108  # tracked: #288
+            _PRIVATE_TMP,
         ]
+        cmd += self._temp_dir_mounts()
+        # The inherited TMPDIR names a host path (a node-local scratch disk, say)
+        # that does not exist in the namespace, so tools that need scratch space
+        # (Nsight Compute, compilers) fail. Point every convention at the
+        # private tmpfs; it vanishes with the namespace when the job ends.
+        for name in _TEMP_ENV_NAMES:
+            cmd += ["--setenv", name, _PRIVATE_TMP]
         # Leaf config mounts such as ~/.codex/auth.json need their destination
         # parents to exist in bubblewrap's otherwise-empty /home tree. These
         # directories are ephemeral inside the namespace; only the explicitly
@@ -273,7 +319,7 @@ class HostSandbox(WorkspaceSandbox):
         parent_dirs = {
             parent
             for path in (*self.read_paths, *self.write_paths)
-            if path.is_file()
+            if not path.is_dir()
             for parent in path.parents
             if parent != Path("/")
         }
@@ -405,12 +451,13 @@ class LandlockSandbox(WorkspaceSandbox):
         for root in write_roots:
             resolved = root.resolve()
             if resolved == workspace or resolved in workspace.parents:
-                raise SandboxUnavailableError(  # noqa: TRY003  # tracked: #288
+                message = (
                     f"project {workspace} sits inside {resolved}, which the Landlock "
                     "backend must grant write access to. Landlock rules cannot subtract, "
                     "so the project would be effectively unconfined. Move the project "
-                    "outside that tree, or use bubblewrap or --docker."
+                    "outside that tree, or use bubblewrap or the default Docker environment."
                 )
+                raise SandboxUnavailableError(message)
         return landlock.policy_for(
             read_paths=(
                 *(Path(root) for root in self.system_read_roots),
@@ -468,7 +515,7 @@ class SeatbeltSandbox(WorkspaceSandbox):
 
     This is a weaker guarantee than the Linux bubblewrap backend, which hides the
     entire host outside the project: on macOS, reads of unrelated host files
-    outside the denied ancestor trees are still permitted. Use ``--docker`` on macOS
+    outside the denied ancestor trees are still permitted. Use the default Docker run environment on macOS
     if full read-confinement is required.
     """
 
@@ -586,7 +633,8 @@ def _resource_paths(
 ) -> tuple[list[Path], list[Path]]:
     """Prepare SDK declarations for an OS-specific import backend."""
     imports = prepare_host_resource_imports(workspace, resources, log=log)
-    return list(imports.read_paths), list(imports.write_paths)
+    read_paths = [*imports.read_paths, *linked_worktree_git_paths(workspace)]
+    return read_paths, list(imports.write_paths)
 
 
 def _reject_agent_path_remap(resources: Iterable[HostResource]) -> None:
@@ -604,15 +652,16 @@ def _reject_agent_path_remap(resources: Iterable[HostResource]) -> None:
             continue
         host_path = str(resource.path)
         if resource.agent_path != host_path:
-            raise ValueError(  # noqa: TRY003  # tracked: #288
+            message = (
                 f"resource {resource.purpose!r} at {host_path} declares "
                 f"agent_path={resource.agent_path!r}, but host backends "
                 "(bubblewrap, Landlock, Seatbelt) cannot remap paths; set "
                 "agent_path to the host path or leave it unset."
             )
+            raise ValueError(message)
 
 
-def build(  # noqa: PLR0913
+def build(  # noqa: PLR0913  # lint-waiver: LW-010194 [PLR0913]; Preserve build's named-argument contract because callers pass these independent settings directly.
     workspace: Path | str,
     *,
     env: dict[str, str],
@@ -621,6 +670,7 @@ def build(  # noqa: PLR0913
     project_path_policy: ProjectPathPolicy | None = None,
     require_enforcement: bool = False,
     docker: WorkspaceSandbox | None = None,
+    probe: CommandProbe | None = None,
 ) -> WorkspaceSandbox | None:
     """Build a host confinement policy for *workspace*, or ``None`` if not enforced.
 
@@ -632,6 +682,9 @@ def build(  # noqa: PLR0913
     *break* a run that used to work, it only ever adds a boundary. Set
     ``require_enforcement`` to fail closed with :class:`SandboxUnavailableError`
     instead. Omitting both new policy arguments preserves the legacy behavior.
+
+    Pass *probe* to replace the real dry run that checks ``bwrap`` can create a
+    namespace on this host.
 
     Pass *docker* — an already constructed
     :class:`~vs_sandbox.docker_sandbox.DockerSandbox` — to select container
@@ -662,6 +715,7 @@ def build(  # noqa: PLR0913
         log=_log,
         project_path_policy=policy,
         require_enforcement=require_enforcement,
+        probe=probe or SubprocessProbe(),
     )
 
     if _is_disabled(env):
@@ -678,7 +732,7 @@ def build(  # noqa: PLR0913
 
     message = (
         f"[hostsandbox] no host confinement backend for {sys.platform!r}; agent "
-        "runs unconfined. Use --docker for an externally sandboxed run."
+        "runs unconfined. Use the default Docker run environment for an externally sandboxed run."
     )
     return _unavailable(message, require_enforcement=require_enforcement, log=_log)
 
@@ -713,7 +767,35 @@ def _requested_linux_backend(env: dict[str, str]) -> LinuxBackend:
         ) from None
 
 
-def _bwrap_confines(bwrap: str) -> bool:
+def _absolute_temp_dirs(values: Iterable[str]) -> list[str]:
+    """Return the normalised absolute, non-root paths among *values*, in order."""
+    dirs: list[str] = []
+    for value in values:
+        path = posixpath.normpath(value.strip()) if value.strip() else ""
+        if path.startswith("/") and path != "/" and path not in dirs:
+            dirs.append(path)
+    return dirs
+
+
+def _host_temp_dirs(env: Mapping[str, str], probe: CommandProbe) -> tuple[str, ...]:
+    """Return the scratch directories this host's shells will name in ``TMPDIR`` and kin.
+
+    Two sources: the environment :func:`build` was given, and a login shell's,
+    because site files such as ``/etc/profile.d/*.sh`` set these only for login
+    shells and a job's ``bash -lc`` re-runs them. The login probe is one short
+    ``bash`` start; if it cannot run, the environment's values still apply.
+    """
+    values = [env.get(name, "") for name in _TEMP_ENV_NAMES]
+    result = probe.run(
+        ["bash", "-lc", "printf '%s\\n' " + " ".join(f'"${name}"' for name in _TEMP_ENV_NAMES)],
+        timeout_seconds=10,
+    )
+    if result is not None and result.returncode == 0:
+        values += result.stdout.splitlines()[-len(_TEMP_ENV_NAMES) :]
+    return tuple(_absolute_temp_dirs(values))
+
+
+def _bwrap_confines(bwrap: str, probe: CommandProbe) -> bool:
     """Return whether *bwrap* can actually create a namespace on this host.
 
     A present-but-blocked ``bwrap`` is a real configuration: Ubuntu's
@@ -722,16 +804,10 @@ def _bwrap_confines(bwrap: str) -> bool:
     unpacked elsewhere exits non-zero at launch. Probing here turns that into
     one clear startup error instead of an agent that dies every round.
     """
-    try:
-        result = subprocess.run(  # noqa: S603  # tracked: #288
-            [bwrap, "--ro-bind", "/", "/", "--unshare-user", "--", "/bin/true"],
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
+    result = probe.run(
+        [bwrap, "--ro-bind", "/", "/", "--unshare-user", "--", "/bin/true"], timeout_seconds=10
+    )
+    return result is not None and result.returncode == 0
 
 
 def _build_linux(
@@ -743,14 +819,17 @@ def _build_linux(
 
     if requested is not LinuxBackend.LANDLOCK:
         bwrap = shutil.which("bwrap", path=options.env.get("PATH")) or shutil.which("bwrap")
-        if bwrap and _bwrap_confines(bwrap):
+        if bwrap and _bwrap_confines(bwrap, options.probe):
             return HostSandbox(
                 bwrap_path=bwrap,
                 workspace=workspace,
                 read_paths=tuple(read_paths),
                 write_paths=tuple(write_paths),
                 project_path_policy=options.project_path_policy,
-                gpu_device_nodes=tuple(_gpu_device_nodes()),
+                gpu_device_nodes=(
+                    () if options.env.get(GPU_DEVICES_ENV) == "none" else tuple(_gpu_device_nodes())
+                ),
+                temp_dirs=_host_temp_dirs(options.env, options.probe),
                 build_env=options.env,
             )
         reason = (
@@ -760,7 +839,7 @@ def _build_linux(
         )
         message = (
             f"[hostsandbox] {reason}; agent runs unconfined. Install bubblewrap, "
-            f"use --docker for an externally sandboxed run, or set "
+            f"use the default Docker run environment for an externally sandboxed run, or set "
             f"{DISABLE_ENV}={LinuxBackend.LANDLOCK} to accept the weaker "
             f"Landlock backend (it cannot enforce read-only or hidden project paths)."
         )
@@ -811,7 +890,7 @@ def _build_macos(
     if not sandbox_exec:
         message = (
             "[hostsandbox] 'sandbox-exec' not found; agent runs unconfined. "
-            "Use --docker for an externally sandboxed run."
+            "Use the default Docker run environment for an externally sandboxed run."
         )
         return _unavailable(
             message,

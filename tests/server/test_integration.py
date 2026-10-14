@@ -3,20 +3,40 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, cast
+import uuid
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, cast
 
 import pytest
-from tests.server.support import build_server_parts
+from tests.server.support import (
+    REQUEST_TIME,
+    ServerParts,
+    agent_descriptor,
+    auxiliary_agent_providers,
+    build_server_parts,
+    run_record,
+)
 
 from server.api.protocol import ChatQuery, ChatThreadCreateQuery
-from server.chat.factory import ChatAgentResources
 from server.diagnostics import DiagnosticScope, DiagnosticSeverity
-from server.events import EventStatus, EventType
-from server.integration import _CORE_FAILURE_CONTEXTS
+from server.events import (
+    EventStatus,
+    EventType,
+    RunStartedData,
+    RunStatusChangedData,
+)
+from server.host_api import RunStatus
+from server.integration import (
+    _CORE_FAILURE_CONTEXTS,
+    _EVENT_DATA_ADAPTER,
+)
 from server.journal import DIAGNOSTIC_FAILURE_EVENTS
-from vibesys.agents.session_key import AgentSessionKey, SessionScope
-from vibesys.run.events import (
+from server.run_attachment import AgentSelection
+from vibesys.api import RunReady
+from vibesys.events import (
+    AgentExecutionActivityData,
     AgentExecutionFinishedData,
+    AgentExecutionStartedData,
     AgentOutputChunkData,
     CoreEventType,
     FrameworkSource,
@@ -25,91 +45,149 @@ from vibesys.run.events import (
     GateKind,
     InvocationFinishedData,
     PhaseData,
+    QuotaPausedData,
+    RateLimitUpdateData,
     ToolCallData,
 )
-from vibesys.run.events import (
+from vibesys.events import (
     EventStatus as CoreEventStatus,
 )
-from vibesys.run.integration import (
-    AgentSelection,
-    RunAttachment,
-)
-from vs_project import AgentRunConfiguration, Project, RunEnvironmentRecord
+from vibesys.events import RunStartedData as CoreRunStartedData
+from vs_project.api import Project, RunEnvironmentRecord
+from vs_project.api.testing import run_execution_record
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-
-class _ChatClient:
-    """Record chat invocations and return a deterministic answer."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-
-    def invoke_text(self, **kwargs: Any) -> str:  # noqa: ANN401
-        self.calls.append(kwargs)
-        return "It improved in round 2."
-
-    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
-        """Report no conversation, so every turn carries the full prompt."""
-        del session_key
-        return None
-
-    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
-        """Report no conversation, matching ``provider_session_id``."""
-        del session_key
-        return None
+    from server.chat.factory import ChatAgentBuildRequest
+    from vibesys.api import AuxiliaryAgentLaunch, ManagedAgent, RunSession
 
 
 def _project_run(root: Path) -> tuple[Project, str]:
     root.mkdir()
     (root / "OBJECTIVE.md").write_text("Make the queue fast.\n", encoding="utf-8")
     project = Project.open(root)
-    project.state.create_project("queue")
+    project.state.create_project("queue", now=datetime(2026, 1, 1, tzinfo=UTC))
     manifest = project.state.new_run_manifest(
         "queue",
         run_id="queue-run",
         branch="vibesys/queue-run",
         vibesys_version="0.2.0-test",
-        configuration=AgentRunConfiguration(
-            outer_loop="agent",
-            run_environment=RunEnvironmentRecord(name="local"),
-            inner_loop="single-agent",
-            interface="inprocess",
-            agent_backend="cli",
-            compute_backend="cpu",
-            profiler="none",
-            max_rounds=3,
-            max_retries_per_round=1,
-            judge_every=1,
-            official_eval_every=1,
-            memory_layout="files",
-        ),
+        run_environment=RunEnvironmentRecord(name="docker"),
+        execution=run_execution_record(),
+        orchestration=agent_descriptor(),
         trusted_input_baseline="0" * 40,
+        now=datetime(2026, 1, 1, tzinfo=UTC),
     )
     project.state.create_run(manifest)
     return project, manifest.run_id
 
 
-def test_core_events_project_to_wire_journal_and_execution_activity(tmp_path):  # noqa: ANN001, ANN201
-    parts = build_server_parts(tmp_path)
-    handle = parts.integration.invocations.start(
-        "implementer", "round-1", "work", driver="agentshim", provider="codex"
+def _execution_started_data(
+    kind: str,
+    user_prompt: str,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> AgentExecutionStartedData:
+    """Build the payload a real invocation boundary produces."""
+    return AgentExecutionStartedData(
+        stage=kind,
+        user_prompt=user_prompt,
+        activity=AgentExecutionActivityData(mode="thinking", summary="Working"),
+        provider=provider,
+        model=model,
     )
-    assert handle.execution_id is not None
 
-    parts.integration.events.emit(
+
+def _emit_execution_started(
+    parts: ServerParts,
+    round_label: str,
+    data: AgentExecutionStartedData,
+) -> str:
+    """Emit the core start event a real invocation boundary would produce."""
+    execution_id = uuid.uuid4().hex
+    parts.core_events.emit(
+        CoreEventType.AGENT_EXECUTION_STARTED,
+        status=CoreEventStatus.ACTIVE,
+        agent_kind=data.stage,
+        round_label=round_label,
+        execution_id=execution_id,
+        data=data,
+    )
+    return execution_id
+
+
+class _FakeAuxiliaryAgents:
+    """Track the scope while the injected chat builder owns construction."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def create_auxiliary_agent(self, launch: AuxiliaryAgentLaunch) -> ManagedAgent:
+        del launch
+        message = "the injected chat builder must own agent construction"
+        raise AssertionError(message)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeRunSession:
+    def __init__(self, auxiliary: _FakeAuxiliaryAgents) -> None:
+        self.auxiliary = auxiliary
+
+    def open_auxiliary_agents(self) -> _FakeAuxiliaryAgents:
+        return self.auxiliary
+
+
+def _attach_test_run(
+    parts: ServerParts,
+    project: Project,
+    run_id: str,
+    defaults: AgentSelection,
+    log_dir: Path,
+) -> _FakeAuxiliaryAgents:
+    """Publish the narrow public run-readiness contract."""
+    auxiliary = _FakeAuxiliaryAgents()
+    parts.integration.handle_run_ready(
+        cast("RunSession", _FakeRunSession(auxiliary)),
+        RunReady(
+            record=run_record(project, run_id),
+            log_directory=log_dir,
+            frontend_state_directory=project.state.local_namespace(
+                run_id, "server"
+            ).external_directory(),
+            agent_provider=defaults.provider,
+            agent_model=defaults.model,
+            agent_providers=auxiliary_agent_providers(),
+            role_models=defaults.role_models,
+        ),
+    )
+
+    return auxiliary
+
+
+def test_core_events_project_to_wire_journal_and_execution_activity(tmp_path: Path) -> None:
+    parts = build_server_parts(tmp_path)
+    execution_id = _emit_execution_started(
+        parts,
+        "round-1",
+        _execution_started_data("implementer", "work", provider="codex"),
+    )
+
+    parts.core_events.emit(
         CoreEventType.TOOL_CALL,
         agent_kind="implementer",
         round_label="round-1",
-        execution_id=handle.execution_id,
+        execution_id=execution_id,
         data=ToolCallData(tool="Bash", args={}),
     )
-    parts.integration.events.emit(
+    parts.core_events.emit(
         CoreEventType.AGENT_OUTPUT_CHUNK,
         agent_kind="implementer",
         round_label="round-1",
-        execution_id=handle.execution_id,
+        execution_id=execution_id,
         data=AgentOutputChunkData(channel="assistant", content="working"),
     )
 
@@ -124,23 +202,58 @@ def test_core_events_project_to_wire_journal_and_execution_activity(tmp_path):  
     assert (tmp_path / "core-events.jsonl").is_file()
 
 
-def test_framework_events_bypass_execution_stamping_and_lift_warnings(tmp_path):  # noqa: ANN001, ANN201
+def test_a_rate_limit_report_reaches_the_wire_journal_under_the_active_execution(
+    tmp_path: Path,
+) -> None:
     parts = build_server_parts(tmp_path)
-    parts.integration.invocations.start("implementer", "round-1", "work")
+    _emit_execution_started(parts, "round-1", _execution_started_data("implementer", "work"))
+
+    parts.core_events.emit(
+        CoreEventType.RATE_LIMIT_UPDATE,
+        data=RateLimitUpdateData(provider="claude", window="five_hour", exhausted=True),
+    )
+
+    update = next(e for e in parts.journal.read() if e.type is EventType.RATE_LIMIT_UPDATE)
+    assert update.agent_kind == "implementer"
+    assert update.data is not None
+    assert update.data.kind == "rate_limit_update"
+    assert update.data.exhausted is True
+
+
+def test_a_quota_pause_reaches_the_wire_journal_under_the_active_execution(
+    tmp_path: Path,
+) -> None:
+    parts = build_server_parts(tmp_path)
+    _emit_execution_started(parts, "round-1", _execution_started_data("implementer", "work"))
+
+    parts.core_events.emit(
+        CoreEventType.QUOTA_PAUSED,
+        data=QuotaPausedData(provider="claude", condition="quota_exhausted", detail="limit"),
+    )
+
+    paused = next(e for e in parts.journal.read() if e.type is EventType.QUOTA_PAUSED)
+    assert paused.agent_kind == "implementer"
+    assert paused.data is not None
+    assert paused.data.kind == "quota_paused"
+
+
+def test_framework_events_bypass_execution_stamping_and_lift_warnings(tmp_path: Path) -> None:
+    parts = build_server_parts(tmp_path)
+    _emit_execution_started(parts, "round-1", _execution_started_data("implementer", "work"))
 
     # All three events arrive without an agent_kind while an implementer
     # execution is active. Only the presentation event may inherit it.
-    parts.integration.events.emit(
+    parts.core_events.emit(
         CoreEventType.AGENT_OUTPUT_CHUNK,
         data=AgentOutputChunkData(channel="assistant", content="working"),
     )
-    parts.integration.events.emit(
+    parts.core_events.emit(
         CoreEventType.GATE_FINISHED,
         status=CoreEventStatus.FAILED,
         round_label="round-1",
         data=GateFinishedData(gate=GateKind.ACCURACY, output_tail="mismatch"),
     )
-    parts.integration.events.emit(
+    parts.core_events.emit(
         CoreEventType.FRAMEWORK_WARNING,
         data=FrameworkWarningData(
             summary="profiler failed",
@@ -167,27 +280,29 @@ def test_framework_events_bypass_execution_stamping_and_lift_warnings(tmp_path):
     assert warning.diagnostic.source == "loop"
 
 
-def test_failed_core_events_project_with_synthesized_diagnostics(tmp_path):  # noqa: ANN001, ANN201
+def test_failed_core_events_project_with_synthesized_diagnostics(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
-    handle = parts.integration.invocations.start("implementer", "round-1", "work")
+    execution_id = _emit_execution_started(
+        parts, "round-1", _execution_started_data("implementer", "work")
+    )
 
-    parts.integration.events.emit(
+    parts.core_events.emit(
         CoreEventType.AGENT_EXECUTION_FINISHED,
         status=CoreEventStatus.FAILED,
         agent_kind="implementer",
         round_label="round-1",
-        execution_id=handle.execution_id,
+        execution_id=execution_id,
         data=AgentExecutionFinishedData(error="RuntimeError: boom"),
     )
-    parts.integration.events.emit(
+    parts.core_events.emit(
         CoreEventType.PHASE_FINISHED,
         status=CoreEventStatus.FAILED,
         agent_kind="implementer",
         round_label="round-1",
-        execution_id=handle.execution_id,
+        execution_id=execution_id,
         data=PhaseData(phase="implementer"),
     )
-    parts.integration.events.emit(
+    parts.core_events.emit(
         CoreEventType.RUN_FAILED,
         "RuntimeError: boom",
         status=CoreEventStatus.FAILED,
@@ -220,9 +335,11 @@ def test_failed_core_events_project_with_synthesized_diagnostics(tmp_path):  # n
     assert terminal.diagnostic.severity is DiagnosticSeverity.FATAL
 
 
-def test_execution_failure_cascade_folds_to_one_diagnostic_per_execution(tmp_path):  # noqa: ANN001, ANN201
+def test_execution_failure_cascade_folds_to_one_diagnostic_per_execution(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
-    first = parts.integration.invocations.start("implementer", "round-1", "work")
+    first_id = _emit_execution_started(
+        parts, "round-1", _execution_started_data("implementer", "work")
+    )
     for event_type, data in (
         (
             CoreEventType.AGENT_EXECUTION_FINISHED,
@@ -231,31 +348,31 @@ def test_execution_failure_cascade_folds_to_one_diagnostic_per_execution(tmp_pat
         (CoreEventType.INVOCATION_FINISHED, InvocationFinishedData(error="RuntimeError: boom")),
         (CoreEventType.PHASE_FINISHED, PhaseData(phase="implementer")),
     ):
-        parts.integration.events.emit(
+        parts.core_events.emit(
             event_type,
             status=CoreEventStatus.FAILED,
             agent_kind="implementer",
             round_label="round-1",
-            execution_id=first.execution_id,
+            execution_id=first_id,
             data=data,
         )
 
     # A second execution failing must not inherit the first's cached diagnostic.
-    second = parts.integration.invocations.start("judge", "round-1", "review")
-    parts.integration.events.emit(
+    second_id = _emit_execution_started(
+        parts, "round-1", _execution_started_data("judge", "review")
+    )
+    parts.core_events.emit(
         CoreEventType.AGENT_EXECUTION_FINISHED,
         status=CoreEventStatus.FAILED,
         agent_kind="judge",
         round_label="round-1",
-        execution_id=second.execution_id,
+        execution_id=second_id,
         data=AgentExecutionFinishedData(error="ValueError: nope"),
     )
 
     events = parts.journal.read()
     first_diagnostics = [
-        e.diagnostic
-        for e in events
-        if e.execution_id == first.execution_id and e.diagnostic is not None
+        e.diagnostic for e in events if e.execution_id == first_id and e.diagnostic is not None
     ]
     # The journal folds the legacy invocation lifecycle onto the canonical one,
     # so the surviving cascade is the agent-execution and phase failures; both
@@ -265,7 +382,11 @@ def test_execution_failure_cascade_folds_to_one_diagnostic_per_execution(tmp_pat
     assert len(ids) == 1
     assert all(d.summary == "RuntimeError: boom" for d in first_diagnostics)
 
-    second_event = next(e for e in events if e.execution_id == second.execution_id)
+    second_event = next(
+        e
+        for e in events
+        if e.execution_id == second_id and e.type is EventType.AGENT_EXECUTION_FINISHED
+    )
     assert second_event.diagnostic is not None
     assert second_event.diagnostic.id not in ids
     assert second_event.diagnostic.summary == "ValueError: nope"
@@ -277,149 +398,431 @@ def test_core_failure_synthesis_covers_the_journal_failure_invariant() -> None:
     assert set(_CORE_FAILURE_CONTEXTS) == DIAGNOSTIC_FAILURE_EVENTS
 
 
-def test_invocation_adapter_applies_steering_without_emitting_duplicate_lifecycle(
+def test_track_started_does_not_double_track_a_repeated_start_event(
     tmp_path: Path,
 ) -> None:
+    """`ExecutionTracker.track_started` is idempotent for a repeated start event.
+
+    Core now mints the execution id and emits `AGENT_EXECUTION_STARTED`
+    itself, at the entry to an agent turn; `project_event` projects it
+    onto both the wire journal and `ExecutionTracker`. Redelivering the same
+    start event (e.g. from an at-least-once subscriber) must not double-track
+    the execution or double-emit the wire event.
+    """
     parts = build_server_parts(tmp_path)
-    parts.controller.steer("measure latency first")
 
-    handle = parts.integration.invocations.start("implementer", "round-1", "work")
+    execution_id = _emit_execution_started(
+        parts, "round-1", _execution_started_data("implementer", "work")
+    )
 
-    assert "measure latency first" in handle.user_prompt
-    assert not any(
-        event.type is EventType.AGENT_EXECUTION_STARTED for event in parts.journal.read()
+    assert len(parts.api.snapshot().active_executions) == 1
+    assert (
+        sum(event.type is EventType.AGENT_EXECUTION_STARTED for event in parts.journal.read()) == 1
+    )
+
+    # Redelivering the identical start event must not double-track.
+    parts.core_events.emit(
+        CoreEventType.AGENT_EXECUTION_STARTED,
+        status=CoreEventStatus.ACTIVE,
+        agent_kind="implementer",
+        round_label="round-1",
+        execution_id=execution_id,
+        data=AgentExecutionStartedData(
+            stage="implementer",
+            user_prompt="work",
+            activity=AgentExecutionActivityData(mode="thinking", summary="Working"),
+        ),
     )
     assert len(parts.api.snapshot().active_executions) == 1
-    parts.integration.invocations.finish(
-        "implementer", "round-1", result="done", execution_id=handle.execution_id
+
+    parts.core_events.emit(
+        CoreEventType.AGENT_EXECUTION_FINISHED,
+        status=CoreEventStatus.COMPLETED,
+        agent_kind="implementer",
+        round_label="round-1",
+        execution_id=execution_id,
+        data=AgentExecutionFinishedData(result="done"),
     )
     assert parts.api.snapshot().active_executions == []
 
 
-def test_attach_run_installs_chat_with_isolated_session_state(tmp_path):  # noqa: ANN001, ANN201
+def test_attach_run_installs_chat_with_isolated_session_state(tmp_path: Path) -> None:
     project, run_id = _project_run(tmp_path / "project")
-    client = _ChatClient()
+    messages: list[str] = []
     closed: list[str] = []
 
-    def build_agent(
-        _attachment: RunAttachment,
-        selection: AgentSelection,
-        thread_id: str | None,
-        shared_state_dir: Path,
-    ) -> ChatAgentResources:
-        assert selection == AgentSelection(driver="agentshim", provider="codex", model="gpt-test")
-        assert thread_id is None
-        return ChatAgentResources(
-            client=client,
-            close=lambda: closed.append("closed"),
-            log=lambda _message: None,
-            flush_logs=lambda: None,
-            environment=dict,
-            progress=lambda: None,
-            agent_shared_state_dir=str(shared_state_dir),
-        )
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            messages.append(message)
+            assert invocation_id
+            return "It improved in round 2."
+
+        def close(self) -> None:
+            closed.append("closed")
+
+    def build_agent(request: ChatAgentBuildRequest) -> FakeManagedAgent:
+        assert request.selection == AgentSelection(provider="codex", model="gpt-test")
+        assert request.instance_id is None
+        return FakeManagedAgent()
 
     parts = build_server_parts(chat_agent_builder=build_agent)
-    detach = parts.integration.attach_run(
-        RunAttachment(
-            project=project,
-            run_id=run_id,
-            workspace=project.root,
-            log_dir=project.state.log_directory(run_id),
-            agent_backend="cli",
-            agent_defaults=AgentSelection(driver="agentshim", provider="codex", model="gpt-test"),
-            agent_runtime=cast("Any", None),
-        )
+    auxiliary = _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
     )
-    assert detach is not None
-
-    response = parts.api.execute(ChatQuery(text="what improved?"))
+    response = parts.api.execute(ChatQuery(timestamp=REQUEST_TIME, text="what improved?"))
 
     assert response.chat is not None
     assert response.chat.answer == "It improved in round 2."
-    assert client.calls[0]["reuse_session"] is True
-    assert client.calls[0]["session_key"] == AgentSessionKey(SessionScope.CHAT, "default")
-    assert client.calls[0]["user_prompt"] == "what improved?"
+    assert messages == ["what improved?"]
     transcript = project.state.log_directory(run_id).parent / "server/chat/conversation.jsonl"
     assert json.loads(transcript.read_text()) == {
         "question": "what improved?",
         "answer": "It improved in round 2.",
     }
     assert not (project.root / ".vibesys/server").exists()
-    assert str(transcript.parent) in client.calls[0]["system_prompt"]
-    detach()
+    parts.integration.close()
     assert closed == ["closed"]
+    assert auxiliary.closed
 
 
-def test_non_cli_run_rejects_new_chat_threads(tmp_path):  # noqa: ANN001, ANN201
+def test_chat_thread_rejects_an_unsupported_provider(tmp_path: Path) -> None:
     project, run_id = _project_run(tmp_path / "project")
-    client = _ChatClient()
 
-    def build_agent(
-        _attachment: RunAttachment,
-        _selection: AgentSelection,
-        _thread_id: str | None,
-        shared_state_dir: Path,
-    ) -> ChatAgentResources:
-        return ChatAgentResources(
-            client=client,
-            close=lambda: None,
-            log=lambda _message: None,
-            flush_logs=lambda: None,
-            environment=dict,
-            progress=lambda: None,
-            agent_shared_state_dir=str(shared_state_dir),
-        )
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            del message
+            del invocation_id
+            return "answer"
+
+        def close(self) -> None:
+            pass
+
+    def build_agent(request: ChatAgentBuildRequest) -> FakeManagedAgent:
+        del request
+        return FakeManagedAgent()
 
     parts = build_server_parts(chat_agent_builder=build_agent)
-    parts.integration.attach_run(
-        RunAttachment(
-            project=project,
-            run_id=run_id,
-            workspace=project.root,
-            log_dir=project.state.log_directory(run_id),
-            agent_backend="stub",
-            agent_defaults=AgentSelection(driver="agentshim", provider="codex", model="gpt-test"),
-            agent_runtime=cast("Any", None),
+    auxiliary = _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
+    )
+
+    with pytest.raises(ValueError, match="is not supported"):
+        parts.api.execute(
+            ChatThreadCreateQuery(
+                timestamp=REQUEST_TIME, provider="not-a-provider", model="gpt-test"
+            )
+        )
+    parts.integration.close()
+    assert auxiliary.closed
+
+
+def test_chat_thread_uses_snapshotted_provider_support_and_free_text_model(
+    tmp_path: Path,
+) -> None:
+    project, run_id = _project_run(tmp_path / "project")
+    selections: list[AgentSelection] = []
+
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            del message, invocation_id
+            return "answer"
+
+        def close(self) -> None:
+            pass
+
+    def build_agent(request: ChatAgentBuildRequest) -> FakeManagedAgent:
+        selections.append(request.selection)
+        return FakeManagedAgent()
+
+    parts = build_server_parts(chat_agent_builder=build_agent)
+    auxiliary = _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
+    )
+
+    response = parts.api.execute(
+        ChatThreadCreateQuery(
+            timestamp=REQUEST_TIME,
+            provider="claude",
+            model="future-free-text-model",
         )
     )
 
-    with pytest.raises(ValueError, match="require the CLI agent backend"):
-        parts.api.execute(ChatThreadCreateQuery(provider="codex", model="gpt-test"))
+    assert response.chat_thread is not None
+    assert selections[-1] == AgentSelection(
+        provider="claude",
+        model="future-free-text-model",
+    )
+    parts.integration.close()
+    assert auxiliary.closed
 
 
-def test_close_is_idempotent_and_stops_event_projection(tmp_path):  # noqa: ANN001, ANN201
+def test_chat_thread_transcript_stays_in_the_project_chat_namespace(tmp_path: Path) -> None:
+    project, run_id = _project_run(tmp_path / "project")
+
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            assert message == "what changed?"
+            assert invocation_id
+            return "The benchmark improved."
+
+        def close(self) -> None:
+            pass
+
+    parts = build_server_parts(chat_agent_builder=lambda _request: FakeManagedAgent())
+    auxiliary = _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
+    )
+
+    created = parts.api.execute(ChatThreadCreateQuery(timestamp=REQUEST_TIME))
+    assert created.chat_thread is not None
+    parts.api.execute(
+        ChatQuery(
+            timestamp=REQUEST_TIME, text="what changed?", thread_id=created.chat_thread.thread_id
+        )
+    )
+
+    chat_namespace = project.state.local_namespace(run_id, "server").external_directory("chat")
+    transcript = chat_namespace / "threads" / created.chat_thread.thread_id / "conversation.jsonl"
+    assert transcript.resolve().is_relative_to(chat_namespace.resolve())
+    assert json.loads(transcript.read_text()) == {
+        "question": "what changed?",
+        "answer": "The benchmark improved.",
+    }
+    parts.integration.close()
+    assert auxiliary.closed
+
+
+def test_chat_thread_rejects_a_symlinked_transcript_parent(tmp_path: Path) -> None:
+    project, run_id = _project_run(tmp_path / "project")
+    chat_namespace = project.state.local_namespace(run_id, "server").external_directory("chat")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (chat_namespace / "threads").symlink_to(outside, target_is_directory=True)
+    built_agents = 0
+
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            del message, invocation_id
+            return "answer"
+
+        def close(self) -> None:
+            pass
+
+    def build_agent(_request: ChatAgentBuildRequest) -> FakeManagedAgent:
+        nonlocal built_agents
+        built_agents += 1
+        return FakeManagedAgent()
+
+    parts = build_server_parts(chat_agent_builder=build_agent)
+    auxiliary = _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
+    )
+
+    with pytest.raises(ValueError, match="symlink"):
+        parts.api.execute(ChatThreadCreateQuery(timestamp=REQUEST_TIME))
+
+    assert built_agents == 1
+    assert list(outside.iterdir()) == []
+    parts.integration.close()
+    assert auxiliary.closed
+
+
+def test_chat_thread_first_write_does_not_follow_a_late_transcript_parent_symlink(
+    tmp_path: Path,
+) -> None:
+    project, run_id = _project_run(tmp_path / "project")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            del message, invocation_id
+            return "answer"
+
+        def close(self) -> None:
+            pass
+
+    parts = build_server_parts(chat_agent_builder=lambda _request: FakeManagedAgent())
+    auxiliary = _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
+    )
+    created = parts.api.execute(ChatThreadCreateQuery(timestamp=REQUEST_TIME))
+    assert created.chat_thread is not None
+    chat_namespace = project.state.local_namespace(run_id, "server").external_directory("chat")
+    threads = chat_namespace / "threads"
+    assert not threads.exists()
+    threads.symlink_to(outside, target_is_directory=True)
+
+    response = parts.api.execute(
+        ChatQuery(
+            timestamp=REQUEST_TIME, text="what changed?", thread_id=created.chat_thread.thread_id
+        )
+    )
+
+    assert response.chat is not None
+    assert response.chat.answer == "answer"
+    assert list(outside.rglob("*")) == []
+    parts.integration.close()
+    assert auxiliary.closed
+
+
+def test_new_chat_thread_retains_the_attached_project_namespace_after_replacement(
+    tmp_path: Path,
+) -> None:
+    project, run_id = _project_run(tmp_path / "project")
+
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            del message, invocation_id
+            return "answer"
+
+        def close(self) -> None:
+            pass
+
+    parts = build_server_parts(chat_agent_builder=lambda _request: FakeManagedAgent())
+    auxiliary = _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
+    )
+    server_namespace = project.state.local_namespace(run_id, "server").external_directory()
+    retained_namespace = tmp_path / "retained-server-namespace"
+    server_namespace.rename(retained_namespace)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    server_namespace.symlink_to(outside, target_is_directory=True)
+
+    created = parts.api.execute(ChatThreadCreateQuery(timestamp=REQUEST_TIME))
+    assert created.chat_thread is not None
+    response = parts.api.execute(
+        ChatQuery(
+            timestamp=REQUEST_TIME, text="what changed?", thread_id=created.chat_thread.thread_id
+        )
+    )
+
+    assert response.chat is not None
+    assert response.chat.answer == "answer"
+    assert list(outside.rglob("*")) == []
+    transcript = (
+        retained_namespace
+        / "chat"
+        / "threads"
+        / created.chat_thread.thread_id
+        / "conversation.jsonl"
+    )
+    assert json.loads(transcript.read_text(encoding="utf-8")) == {
+        "question": "what changed?",
+        "answer": "answer",
+    }
+    parts.integration.close()
+    assert auxiliary.closed
+
+
+def test_chat_thread_append_does_not_follow_a_transcript_file_symlink(tmp_path: Path) -> None:
+    project, run_id = _project_run(tmp_path / "project")
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("outside\n", encoding="utf-8")
+
+    class FakeManagedAgent:
+        def turn(self, message: str, *, invocation_id: str | None = None) -> str:
+            del message, invocation_id
+            return "answer"
+
+        def close(self) -> None:
+            pass
+
+    parts = build_server_parts(chat_agent_builder=lambda _request: FakeManagedAgent())
+    auxiliary = _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
+    )
+    created = parts.api.execute(ChatThreadCreateQuery(timestamp=REQUEST_TIME))
+    assert created.chat_thread is not None
+    chat_namespace = project.state.local_namespace(run_id, "server").external_directory("chat")
+    state_dir = chat_namespace / "threads" / created.chat_thread.thread_id
+    state_dir.mkdir(parents=True)
+    (state_dir / "conversation.jsonl").symlink_to(outside)
+
+    response = parts.api.execute(
+        ChatQuery(
+            timestamp=REQUEST_TIME, text="what changed?", thread_id=created.chat_thread.thread_id
+        )
+    )
+
+    assert response.chat is not None
+    assert response.chat.answer == "answer"
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+    parts.integration.close()
+    assert auxiliary.closed
+
+
+def test_close_is_idempotent(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     parts.integration.close()
     parts.integration.close()
 
-    parts.integration.events.emit(
-        CoreEventType.AGENT_OUTPUT_CHUNK,
-        data=AgentOutputChunkData(channel="assistant", content="after close"),
-    )
 
-    assert not any(event.type is EventType.AGENT_OUTPUT_CHUNK for event in parts.journal.read())
-
-
-def test_run_started_expected_roles_round_trip_through_the_wire_bridge() -> None:
-    """The core payload bridges to the wire model with and without the field."""
-    from server.events import RunStartedData  # noqa: PLC0415
-    from server.integration import _EVENT_DATA_ADAPTER  # noqa: PLC0415
-    from vibesys.run.events import RunStartedData as CoreRunStartedData  # noqa: PLC0415
+def test_run_started_identity_round_trip_through_the_wire_bridge() -> None:
+    """The core run identity and input reach the wire model."""
 
     advertised = CoreRunStartedData(
         outer_loop="plain",
         input="objective",
-        max_rounds=3,
-        expected_roles=("implementer", "judge", "perf_eval"),
     )
     wire = _EVENT_DATA_ADAPTER.validate_python(advertised.model_dump(mode="python"))
     assert isinstance(wire, RunStartedData)
-    assert wire.expected_roles == ("implementer", "judge", "perf_eval")
+    assert wire.outer_loop == "plain"
+    assert wire.input == "objective"
 
-    # A recording that predates the field must still validate, as empty.
-    legacy = _EVENT_DATA_ADAPTER.validate_python(
-        {"kind": "run_started", "outer_loop": "plain", "input": "objective", "max_rounds": 3}
+
+def test_a_run_is_starting_until_its_session_reports_it_ready(tmp_path: Path) -> None:
+    project, run_id = _project_run(tmp_path / "project")
+    parts = build_server_parts()
+    parts.integration.attach(project.state.log_directory(run_id), run_id=run_id)
+    assert parts.controller.run_status() is RunStatus.STARTING
+
+    _attach_test_run(
+        parts,
+        project,
+        run_id,
+        AgentSelection(provider="codex", model="gpt-test"),
+        project.state.log_directory(run_id),
     )
-    assert isinstance(legacy, RunStartedData)
-    assert legacy.expected_roles == ()
+
+    assert parts.controller.run_status() is RunStatus.RUNNING
+    statuses = [
+        (event.data.previous, event.data.status)
+        for event in parts.journal.read()
+        if isinstance(event.data, RunStatusChangedData)
+    ]
+    assert statuses == [(RunStatus.STARTING, RunStatus.RUNNING)]
+    parts.integration.close()

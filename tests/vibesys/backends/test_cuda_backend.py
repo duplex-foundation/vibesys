@@ -2,19 +2,29 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from tests.support.docker import capture_docker_start_argv, recording_docker_cli
 
-from vibesys.backends import SandboxKind
-from vibesys.backends.cuda import CudaBackend
-from vs_sandbox import DockerSandbox, HostResource, HostResourceAccess
+from vs_sandbox.api import (
+    CudaAcceleratorUnavailableError,
+    CudaBackend,
+    DockerSandbox,
+    GpuInfo,
+    HostResource,
+    HostResourceAccess,
+    SandboxKind,
+)
+from vs_sandbox.api.testing import FakeGpuTelemetry
+from vs_sim.api.testing import ManualClock
 
 
 def test_cpu_only_control_plane_docker_skips_gpu_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend = CudaBackend(tmp_path)
+    docker = recording_docker_cli()
+    backend = CudaBackend(tmp_path, docker=docker, clock=ManualClock())
     pick_device = MagicMock()
-    monkeypatch.setattr(backend, "_pick_device", pick_device)
+    monkeypatch.setattr("vs_sandbox.cuda_backend.pick_gpu", pick_device)
 
     sandbox = backend.make_sandbox(
         SandboxKind.DOCKER,
@@ -25,12 +35,14 @@ def test_cpu_only_control_plane_docker_skips_gpu_runtime(
 
     pick_device.assert_not_called()
     assert isinstance(sandbox, DockerSandbox)
-    assert sandbox._gpus is None  # noqa: SLF001  # tracked: #288
     assert backend.selected_device is None
+    assert "--gpus" not in capture_docker_start_argv(sandbox, docker)
 
 
-def test_ephemeral_setup_sandbox_is_not_tracked_for_reselection(tmp_path: Path) -> None:
-    backend = CudaBackend(tmp_path)
+def test_ephemeral_setup_sandbox_is_not_restarted_on_reselection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = CudaBackend(tmp_path, clock=ManualClock())
 
     sandbox = backend.make_sandbox(
         SandboxKind.DOCKER,
@@ -41,11 +53,25 @@ def test_ephemeral_setup_sandbox_is_not_tracked_for_reselection(tmp_path: Path) 
     )
 
     assert isinstance(sandbox, DockerSandbox)
-    assert backend._sandboxes == []  # noqa: SLF001
+    start = MagicMock()
+    stop = MagicMock()
+    monkeypatch.setattr(sandbox, "start", start)
+    monkeypatch.setattr(sandbox, "stop", stop)
+    monitor = MagicMock()
+    monkeypatch.setattr(
+        "vs_sandbox.cuda_backend.pick_gpu",
+        lambda _gpus: GpuInfo(1, "GPU-bbbb", "H100", 0, 100, 0),
+    )
+    monkeypatch.setattr("vs_sandbox.cuda_backend.GpuContentionMonitor", lambda **_kwargs: monitor)
+    backend.reselect_device()
+    start.assert_not_called()
+    stop.assert_not_called()
+    monitor.start.assert_called_once()
 
 
 def test_docker_forwards_resources_to_the_sandbox(tmp_path: Path) -> None:
-    backend = CudaBackend(tmp_path)
+    docker = recording_docker_cli()
+    backend = CudaBackend(tmp_path, docker=docker, clock=ManualClock())
     resource = HostResource(tmp_path / "history", HostResourceAccess.READ_ONLY, "history")
 
     sandbox = backend.make_sandbox(
@@ -57,4 +83,29 @@ def test_docker_forwards_resources_to_the_sandbox(tmp_path: Path) -> None:
     )
 
     assert isinstance(sandbox, DockerSandbox)
-    assert resource in sandbox._resources  # noqa: SLF001  # tracked: #288
+    command = capture_docker_start_argv(sandbox, docker)
+    assert f"{resource.path}:{resource.agent_path or resource.path}:ro" in command
+
+
+def test_ensure_accelerator_available_rejects_a_host_with_no_gpu(tmp_path: Path) -> None:
+    backend = CudaBackend(tmp_path, gpu_telemetry=FakeGpuTelemetry(gpus=[]), clock=ManualClock())
+
+    with pytest.raises(CudaAcceleratorUnavailableError, match="NVIDIA GPU"):
+        backend.ensure_accelerator_available()
+
+
+def test_ensure_accelerator_available_accepts_a_host_with_a_gpu(tmp_path: Path) -> None:
+    gpu = GpuInfo(0, "GPU-aaaa", "H100", 0, 100, 0)
+    backend = CudaBackend(tmp_path, gpu_telemetry=FakeGpuTelemetry(gpus=[gpu]), clock=ManualClock())
+
+    backend.ensure_accelerator_available()  # must not raise
+
+
+def test_ensure_accelerator_available_trusts_a_pinned_cuda_visible_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A user who pinned a GPU index is trusted, matching device-selection's own exception."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    backend = CudaBackend(tmp_path, gpu_telemetry=FakeGpuTelemetry(gpus=[]), clock=ManualClock())
+
+    backend.ensure_accelerator_available()  # must not raise

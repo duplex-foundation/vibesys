@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
-from pathlib import Path  # noqa: TC003  # tracked: #288
+from typing import TYPE_CHECKING
 
 from vibesys.domains.base import DOMAIN_ROLES, DomainDefinition, DomainRole
-from vibesys.prompts import render_string
+from vibesys.prompts import PROMPTS_DIR, render_template
+from vs_prompts.api import TemplateRenderer
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _coerce_role(role: DomainRole | str) -> DomainRole:
     try:
         return role if isinstance(role, DomainRole) else DomainRole(role)
     except ValueError as exc:
-        raise ValueError(  # noqa: TRY003  # tracked: #288
-            f"Unknown domain role {role!r}. Choose from: "
-            f"{', '.join(domain_role.value for domain_role in DOMAIN_ROLES)}."
-        ) from exc
+        message = f"Unknown domain role {role!r}. Choose from: {', '.join(domain_role.value for domain_role in DOMAIN_ROLES)}."
+        raise ValueError(message) from exc
 
 
 def _load_role_file(domain_dir: Path, role: DomainRole) -> str | None:
@@ -36,25 +38,36 @@ def render_domain_section(
     variable set for every role (``modality``, ``interface``, ``reference_path``,
     ``benchmark_command``, ``accuracy_command``, ``runtime_notes``,
     ``profile_execution``, and ``workspace_sources``; built by
-    ``_domain_render_context`` in ``loop.py``)
+    ``domain_prompt_sections`` in ``core_wiring``)
     so authors can branch on the run from any file.
-    ``single_agent`` falls back to ``implementer`` + ``judge`` when the
-    directory has no explicit ``single_agent.md`` file. Leading and trailing
-    blank lines are stripped — the base template owns the spacing around the
-    ``{{ domain_<role> }}`` injection point.
+    ``single_agent`` falls back to the rendered ``implementer`` and ``judge``
+    sections, blank-line separated, when the directory has no explicit
+    ``single_agent.md`` file. Leading and trailing
+    blank lines are stripped — the slot template owns the spacing around the
+    section.
     """
     role_name = _coerce_role(role)
-    domain_dir = domain.prompt_dir
-    raw = _load_role_file(domain_dir, role_name)
+    raw = _load_role_file(domain.prompt_dir, role_name)
     if raw is None and role_name is DomainRole.SINGLE_AGENT:
-        raw = "\n\n".join(
-            text
-            for text in (
-                _load_role_file(domain_dir, DomainRole.IMPLEMENTER),
-                _load_role_file(domain_dir, DomainRole.JUDGE),
-            )
-            if text
+        return render_template(
+            "_domain/single_agent_fallback.j2",
+            template_dir=PROMPTS_DIR / "shared",
+            sections=tuple(
+                render_domain_section(domain, fallback, **context)
+                for fallback in (DomainRole.IMPLEMENTER, DomainRole.JUDGE)
+            ),
         )
     if not raw:
         return ""
-    return render_string(raw, **context).strip("\n")
+    # The pack renders from its own directory, so a role file can include its pack's partials.
+    return TemplateRenderer(domain.prompt_dir).render_string(raw, **context).strip("\n")
+
+
+def render_domain_sections(domain: DomainDefinition, **context: object) -> dict[DomainRole, str]:
+    """Every role's rendered section of ``domain``: ``""`` for a role the pack does not address.
+
+    The mapping always holds all of `DOMAIN_ROLES`, so a prompt template can index it by
+    role without a guard. ``context`` is the uniform variable set `render_domain_section`
+    documents.
+    """
+    return {role: render_domain_section(domain, role, **context) for role in DOMAIN_ROLES}

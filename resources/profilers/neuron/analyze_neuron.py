@@ -24,12 +24,40 @@ the ``neuron_profiler/server.py`` MCP server.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from typing import TextIO
+
+# The same common runtime is staged beside each standalone profiler bundle.
+for _common_name in ("_common", "profilers_common"):
+    _common_path = Path(__file__).resolve().parent.parent / _common_name
+    if (_common_path / "capture_runtime.py").is_file():
+        sys.path.insert(0, str(_common_path))
+        break
+capture_runtime = importlib.import_module("capture_runtime")
+
+
+def _print(
+    *values: object,
+    sep: str = " ",
+    end: str = "\n",
+    file: TextIO | None = None,
+    flush: bool = False,
+) -> None:
+    """Print user-facing command-line output."""
+    if file is None:
+        sys.stdout.write(sep.join(map(str, values)) + end)
+        if flush:
+            sys.stdout.flush()
+    else:
+        print(*values, sep=sep, end=end, file=file, flush=flush)
+
 
 # neuron-explorer ships under the Neuron tools dir, which isn't always on
 # PATH inside a fresh container shell.
@@ -49,31 +77,36 @@ def _explorer() -> str:
     return "neuron-explorer"
 
 
-def _run(cmd: list[str], *, timeout: int = 1800, cwd: str | None = None) -> int:
+def run_command(
+    cmd: list[str],
+    *,
+    timeout: int = 1800,
+    cwd: str | None = None,
+    runner: capture_runtime.CommandRunner = subprocess.run,
+) -> int:
     """Run *cmd*, streaming combined output to stdout. Returns exit code."""
-    print(f"$ {' '.join(cmd)}", flush=True)  # noqa: T201  # tracked: #288
+    _print(f"$ {' '.join(cmd)}", flush=True)
     try:
-        proc = subprocess.run(  # noqa: PLW1510, S603  # tracked: #288
+        proc = runner(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
             cwd=cwd,
+            check=False,
         )
-    except FileNotFoundError:
-        print(  # noqa: T201  # tracked: #288
-            "ERROR: neuron-explorer not found. It ships with aws-neuronx-tools; "
-            "ensure /opt/aws/neuron/bin is on PATH inside the container.",
-        )
-        return 127
-    except subprocess.TimeoutExpired:
-        print(f"ERROR: command timed out after {timeout}s")  # noqa: T201  # tracked: #288
-        return 124
+    except OSError as exc:
+        diagnostic = f"cannot start neuron-explorer: {exc}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic) from exc
+    except subprocess.TimeoutExpired as exc:
+        diagnostic = f"command timed out after {timeout}s"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic) from exc
     if proc.stdout:
-        print(proc.stdout)  # noqa: T201  # tracked: #288
+        _print(proc.stdout)
     if proc.returncode != 0:
-        print(f"(neuron-explorer exited with code {proc.returncode})")  # noqa: T201  # tracked: #288
+        diagnostic = f"neuron-explorer exited with code {proc.returncode}: {proc.stdout}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
     return proc.returncode
 
 
@@ -86,7 +119,10 @@ def _session_dir(report: str) -> Path:
     p = Path(report)
     if p.is_dir():
         return p
-    return p.parent
+    if p.is_file():
+        return p.parent
+    diagnostic = f"session path does not exist: {report}"
+    raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +130,7 @@ def _session_dir(report: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def cmd_capture(ns) -> None:  # noqa: ANN001  # tracked: #288
+def cmd_capture(ns: argparse.Namespace) -> None:
     """Capture a system + device profile around a workload command.
 
     Runs ``neuron-explorer inspect -o <out_dir> <workload>``. The workload
@@ -106,8 +142,8 @@ def cmd_capture(ns) -> None:  # noqa: ANN001  # tracked: #288
     out_dir.mkdir(parents=True, exist_ok=True)
     workload = ns.workload
     if not workload:
-        print("ERROR: --workload is required (the command that drives the model).")  # noqa: T201  # tracked: #288
-        return
+        diagnostic = "--workload is required"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
     # inspect takes the user script as trailing args; run it via bash -lc so
     # the agent can pass a full pipeline / env-prefixed command as one string.
     cmd = [
@@ -124,18 +160,16 @@ def cmd_capture(ns) -> None:  # noqa: ANN001  # tracked: #288
     # of -o. If that's the git-tracked /workspace, those root-owned, mode-600
     # files break the host-side per-round `git add -A`. Keeping cwd in the
     # out-dir (under /tmp) contains them.
-    rc = _run(cmd, timeout=ns.timeout, cwd=str(out_dir))
+    rc = run_command(cmd, timeout=ns.timeout, cwd=str(out_dir))
     ntff = _find_one(out_dir, ".ntff")
     neff = _find_one(out_dir, ".neff")
-    print("\n--- capture artifacts ---")  # noqa: T201  # tracked: #288
-    print(f"output dir : {out_dir}")  # noqa: T201  # tracked: #288
-    print(f"NTFF       : {ntff or '(none found — was the model executed on a NeuronCore?)'}")  # noqa: T201  # tracked: #288
-    print(f"NEFF       : {neff or '(none found — did the model compile + run on device?)'}")  # noqa: T201  # tracked: #288
+    _print("\n--- capture artifacts ---")
+    _print(f"output dir : {out_dir}")
+    _print(f"NTFF       : {ntff or '(none found — was the model executed on a NeuronCore?)'}")
+    _print(f"NEFF       : {neff or '(none found — did the model compile + run on device?)'}")
     if rc == 0 and ntff is None:
-        print(  # noqa: T201  # tracked: #288
-            "WARNING: inspect succeeded but produced no NTFF. The workload likely "
-            "did not run a compiled graph on the NeuronCore (CPU fallback?)."
-        )
+        diagnostic = "inspect produced no NTFF profile"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
 
 
 def _view(session: Path, output_format: str, extra: list[str] | None = None) -> None:
@@ -149,10 +183,10 @@ def _view(session: Path, output_format: str, extra: list[str] | None = None) -> 
     if ntff:
         cmd += ["-s", str(ntff)]
     cmd += extra or []
-    _run(cmd)
+    run_command(cmd)
 
 
-def cmd_summary(ns) -> None:  # noqa: ANN001  # tracked: #288
+def cmd_summary(ns: argparse.Namespace) -> None:
     """High-level report: engine utilization, top operators, DMA totals.
 
     Wraps ``neuron-explorer view --output-format summary-text`` over the
@@ -160,21 +194,21 @@ def cmd_summary(ns) -> None:  # noqa: ANN001  # tracked: #288
     """
     session = _session_dir(ns.report)
     if not session.exists():
-        print(f"ERROR: session path does not exist: {session}")  # noqa: T201  # tracked: #288
-        return
+        diagnostic = f"session path does not exist: {session}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
     _view(session, "summary-text")
 
 
-def cmd_summary_json(ns) -> None:  # noqa: ANN001  # tracked: #288
+def cmd_summary_json(ns: argparse.Namespace) -> None:
     """Machine-readable summary (``view --output-format summary-json``)."""
     session = _session_dir(ns.report)
     if not session.exists():
-        print(f"ERROR: session path does not exist: {session}")  # noqa: T201  # tracked: #288
-        return
+        diagnostic = f"session path does not exist: {session}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
     _view(session, "summary-json")
 
 
-def cmd_operators(ns) -> None:  # noqa: ANN001  # tracked: #288
+def cmd_operators(ns: argparse.Namespace) -> None:
     """Per-operator / per-instruction breakdown from the device profile.
 
     Uses ``show-session -j`` (JSON) over the captured NTFF and prints the
@@ -183,50 +217,52 @@ def cmd_operators(ns) -> None:  # noqa: ANN001  # tracked: #288
     session = _session_dir(ns.report)
     ntff = _find_one(session, ".ntff")
     if ntff is None:
-        print(f"ERROR: no .ntff found under {session}")  # noqa: T201  # tracked: #288
-        return
+        diagnostic = f"no .ntff found under {session}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
     cmd = [_explorer(), "show-session", "-s", str(ntff), "-j"]
     # Capture JSON to summarize the top entries rather than dumping it whole.
-    print(f"$ {' '.join(cmd)}")  # noqa: T201  # tracked: #288
+    _print(f"$ {' '.join(cmd)}")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)  # noqa: PLW1510, S603  # tracked: #288
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        print(f"ERROR running show-session: {exc}")  # noqa: T201  # tracked: #288
-        return
+        # lint-waiver: LW-008040 [S603]; The resolved profiler executable and fixed subcommand are invoked with shell-free argv.
+        proc = subprocess.run(  # noqa: S603
+            cmd, capture_output=True, text=True, timeout=600, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        diagnostic = f"show-session failed: {exc}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic) from exc
     if proc.returncode != 0:
-        print(proc.stdout)  # noqa: T201  # tracked: #288
-        print(proc.stderr)  # noqa: T201  # tracked: #288
-        return
+        diagnostic = f"show-session exited {proc.returncode}: {proc.stdout}{proc.stderr}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
     try:
         data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        # Not JSON we can parse — show it raw so the agent still gets signal.
-        print(proc.stdout[:20000])  # noqa: T201  # tracked: #288
-        return
-    print(json.dumps(data, indent=2)[:20000])  # noqa: T201  # tracked: #288
+    except (ValueError, RecursionError) as exc:
+        # ``json`` raises ``RecursionError`` past the interpreter's nesting limit.
+        diagnostic = f"show-session returned invalid JSON: {exc}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic) from exc
+    _print(json.dumps(data, indent=2)[:20000])
 
 
-def cmd_show(ns) -> None:  # noqa: ANN001  # tracked: #288
+def cmd_show(ns: argparse.Namespace) -> None:
     """Raw session info (``show-session``), optionally with DMA/trace."""
     session = _session_dir(ns.report)
     ntff = _find_one(session, ".ntff")
     if ntff is None:
-        print(f"ERROR: no .ntff found under {session}")  # noqa: T201  # tracked: #288
-        return
+        diagnostic = f"no .ntff found under {session}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
     cmd = [_explorer(), "show-session", "-s", str(ntff)]
     if ns.dma:
         cmd.append("--show-dma")
     if ns.trace:
         cmd.append("--show-trace")
-    _run(cmd)
+    run_command(cmd)
 
 
-def cmd_view(ns) -> None:  # noqa: ANN001  # tracked: #288
+def cmd_view(ns: argparse.Namespace) -> None:
     """Escape hatch: pass an explicit ``--output-format`` to ``view``."""
     session = _session_dir(ns.report)
     if not session.exists():
-        print(f"ERROR: session path does not exist: {session}")  # noqa: T201  # tracked: #288
-        return
+        diagnostic = f"session path does not exist: {session}"
+        raise capture_runtime.CaptureFailedError.analysis_failed(diagnostic)
     _view(session, ns.output_format)
 
 
@@ -235,7 +271,8 @@ def cmd_view(ns) -> None:  # noqa: ANN001  # tracked: #288
 # ---------------------------------------------------------------------------
 
 
-def build_parser() -> argparse.ArgumentParser:  # noqa: D103  # tracked: #288
+def build_parser() -> argparse.ArgumentParser:
+    """Build the Neuron profiler command-line parser."""
     parser = argparse.ArgumentParser(
         prog="analyze_neuron",
         description="Capture and analyze NeuronCore profiles via neuron-explorer.",
@@ -243,7 +280,11 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: D103  # tracked: #288
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("capture", help="Run a workload under neuron-explorer inspect.")
-    p.add_argument("--out-dir", default="/tmp/neuronprof", help="Output dir for profiles.")  # noqa: S108  # tracked: #288
+    p.add_argument(
+        "--out-dir",
+        default=str(Path(tempfile.gettempdir()) / "neuronprof"),
+        help="Output dir for profiles.",
+    )
     p.add_argument("--workload", required=True, help="Shell command that drives the model.")
     p.add_argument("--timeout", type=int, default=1800)
     p.set_defaults(func=cmd_capture)
@@ -282,19 +323,24 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: D103  # tracked: #288
     return parser
 
 
-def _with(ns, **overrides):  # noqa: ANN001, ANN003, ANN202  # tracked: #288
+def _with(ns: argparse.Namespace, **overrides: object) -> argparse.Namespace:
     for k, v in overrides.items():
         setattr(ns, k, v)
     return ns
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: D103  # tracked: #288
+def main(argv: list[str] | None = None) -> int:
     # Make sure the Neuron tools dir is reachable for child processes too.
+    """Run the command-line entry point."""
     for d in _NEURON_BIN_DIRS:
         if Path(d).is_dir() and d not in os.environ.get("PATH", ""):
             os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + d
     args = build_parser().parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except capture_runtime.CaptureFailedError as exc:
+        sys.stderr.write(str(exc) + "\n")
+        return 1
     return 0
 
 

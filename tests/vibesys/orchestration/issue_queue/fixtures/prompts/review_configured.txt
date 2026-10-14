@@ -1,0 +1,99 @@
+Review issue #7: [feature] Implement streaming
+
+## Acceptance criteria
+- stream non-empty token deltas
+
+Implementer summary: Streams tokens.
+Files touched: `server.py`, `tests/test_server.py`
+Implementer self-check: pytest passes
+
+Reference: reference/model.py
+Objective: Maximize measured token throughput without losing correctness.
+Accuracy command: uv run check-accuracy
+Benchmark command: uv run benchmark
+Runtime notes: Use CUDA with bfloat16.
+
+## Modality: text generation (causal LM)
+
+**Accuracy-checker interface** (always required): the input-declared entry
+module must expose an importable `VibeServeModel` compatibility class with
+`from_pretrained(model_dir, device, dtype)` and
+`generate(input_ids, max_new_tokens=N)`. The production server may use a
+different language or runtime behind that adapter.
+
+**Decode invariants** (verify on whichever endpoint the orchestrator scoped in): EOS must not appear in emitted text; stop-string truncation must run before emission; `completion_tokens` must count only emitted text, not raw sampled tokens.
+
+**API contract**: the specific endpoints and request/response shapes to verify are whatever the orchestrator's `pass_criteria` for this round specifies. Do NOT flag "missing" endpoints that the orchestrator did not scope in. If a round only scopes `/v1/completions`, do not fail it for lacking `/v1/chat/completions` or `/predict`. When you need contract details for a scoped endpoint, consult `serving-systems/references/tooling/openai-api.md`.
+
+## LLM-serving review invariants
+
+audit the implementer's retained performance evidence and verify the real
+request-to-model-to-stream path and the input-owned API/model
+contract. Do not infer a required language, framework, process boundary, or
+filename. Audit custom model-layer ownership when declared by the objective,
+weight/device placement, cache/mask/position alignment, EOS/stop/usage behavior,
+and deterministic prompt-dependent generation. Live cohorts may share active
+execution. Completed output/token replay for later arrivals is model bypass;
+test a novel miss and scope claims to the measured hit mix.
+
+
+For every optimization claim, verify production activation at its source. An
+import, configured backend, object construction, or zero-valued field that is
+never updated proves nothing. Check point-local telemetry scope and observer
+cost; post-drain occupancy can be zero after valid activation, so distinguish
+historical totals/peaks/events from instantaneous state.
+
+Audit LLM-serving measurement fidelity: fixed prompt/output shape and offered
+load, successful completions, one logical streaming delta per generated model
+token, consistent token counts, and throughput/TTFT/TPOT/latency from the same
+selected row. Batched writes may contain multiple complete records; merging or
+splitting their model-token accounting is reward hacking.
+
+Treat attention/layout claims precisely. A path that gathers or reconstructs
+dense logical KV before dense attention is an allocator/layout experiment, not
+paged-attention compute. A backend comparison must show the kernel that actually
+consumed the production tensors and whether fallback occurred.
+
+For roofline or Amdahl claims, require a whole-decode model and an observer-
+controlled end-to-end comparison. Do not add overlapping CPU/CUDA durations,
+call hardware peak automatically attainable, or use the reference engine as the
+hardware ceiling. Verify that any throughput-only gain remains a legitimate
+Pareto tradeoff and that terminal parity uses one joint operating point.
+
+Performance improvement is out of scope for this verdict. Inspect the candidate without
+editing it, run its pytest tests, and use the accuracy checker when one is configured. Inspect
+the model architecture, local weight loading, accelerator and dtype placement, and the
+checker-facing `VibeServeModel` interface. A failing required correctness or accuracy check
+requires a fail verdict.
+
+Start the real service for an end-to-end `/health` and completion-stream smoke test. When the
+benchmark is configured, run a short sanity workload and require positive token throughput
+plus non-null TTFT and TPOT. Require a non-empty streaming delta for every generated model token.
+
+For an unrelated bug, check the board below first and report at most one bug in `new_issues`
+(type `bug`), with `## Background`, `## Acceptance criteria` and `## Notes` in its
+description. Never report performance suggestions.
+
+Board:
+- #7 [feature] [in_progress] Implement streaming
+- #8 [bug] [open] Health route 500s
+- #9 [perf] [closed] Batch prefill
+
+
+Return exactly one JSON object matching:
+{"reply":{"analysis": "...", "feedback": "...", "verdict": "pass" | "fail",
+ "new_issues": [{"type": "bug", "title": "...", "description": "..."}]}}
+Feedback must be empty on pass.
+
+You may measure your own workspace before you reply: call `submit_evaluation` on the
+`evaluation` tool. The framework decides whether the submission is admitted and counts
+a new candidate against the run's budget; a refusal names the reason, so change the
+workspace or stop submitting. A candidate with the same content is evaluated once for
+this workstream, whoever asks: if the implementer or the reviewer already submitted it,
+the call returns that evaluation's handle (`"repeat": true`) and charges nothing. A
+reply with an `outcome` is an evaluation that has already ended, and lists its `evidence`
+ids as a resume would: do not wait for it. A successful call returns a handle. To wait for the
+result, call `validate_evaluation_wait` with every handle you need, then finish the
+turn with only `{"reply":{"kind":"waiting_for_evaluation","handles":["<handle>"]}}`. Do not
+poll: the host resumes this same session once every listed measurement is terminal.
+A waiting turn uses no new attempt.

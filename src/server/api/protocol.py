@@ -2,72 +2,99 @@
 
 from __future__ import annotations
 
-import uuid
-from datetime import UTC, datetime
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal, TypeAliasType
 
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
+from pydantic import Field, FiniteFloat, JsonValue, TypeAdapter, ValidationError
 
+from server.api.iterations import MAX_ITERATION_PAGE_SIZE, IterationSlice
 from server.chat.options import ChatOptions
+from server.control_envelope import (
+    ProtocolModel,
+    Request,
+    ResponseEnvelope,
+    StopCommand,
+)
 from server.diagnostics import Diagnostic, DiagnosticScope, exception_to_diagnostic
-from server.events import RunEvent
+from server.events import ChatThreadId, RunEvent
 from server.execution import ActiveAgentExecution
+from server.host_api import PROTOCOL_VERSION
 from server.run_lifecycle import RunStatus
 from server.settings import InteractiveSetupDefaults
-from vibesys.loops.agent.model import HypothesisResolution
-from vibesys.schemas import CandidateDisposition, HypothesisOutcome, PerfDeltaReason
-from vs_loop_state import JudgeVerdict
+from vibesys.api import IterationUnavailable
+from vibesys.api.hypothesis import (
+    CandidateDisposition,
+    HypothesisOutcome,
+    HypothesisResolution,
+    JudgeVerdict,
+    PerfDeltaReason,
+)
+from vs_sim.api import utc_datetime
 
-PROTOCOL_VERSION = 1
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from datetime import datetime
+
+    from vs_sim.api import Clock
+
+# Both snapshots and streamed batches publish the same execution checkpoint.
+# Naming the list keeps the generated client contract referentially identical,
+# rather than making the generator invent one alias per inline occurrence.
+ActiveExecutions = TypeAliasType("ActiveExecutions", list[ActiveAgentExecution])
 
 
-class ProtocolModel(BaseModel):  # noqa: D101  # tracked: #288
-    model_config = ConfigDict(extra="forbid")
+class PauseCommand(Request):
+    """Request pausing after the active agent call."""
 
-
-class Request(ProtocolModel):  # noqa: D101  # tracked: #288
-    protocol_version: Literal[1] = PROTOCOL_VERSION
-    request_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
-
-
-class PauseCommand(Request):  # noqa: D101  # tracked: #288
     type: Literal["command.pause"] = "command.pause"
     mode: Literal["after_current_agent_call"] = "after_current_agent_call"
 
 
-class ResumeCommand(Request):  # noqa: D101  # tracked: #288
+class ResumeCommand(Request):
+    """Request resuming a paused run."""
+
     type: Literal["command.resume"] = "command.resume"
+    # A run paused on a provider capacity limit may switch to its configured
+    # fallback provider as it resumes. Ignored when the run has no fallback.
+    fallback: bool = False
 
 
-class SteerCommand(Request):  # noqa: D101  # tracked: #288
+class SteerCommand(Request):
+    """Send steering text to the active run."""
+
     type: Literal["command.steer"] = "command.steer"
     text: str = Field(min_length=1)
 
 
-class SnapshotQuery(Request):  # noqa: D101  # tracked: #288
+class SnapshotQuery(Request):
+    """Request the current run snapshot.
+
+    ``expected_store_id`` fences the read to the event store whose batch established a
+    client's sequence space. None preserves the unfenced request used by
+    clients that do not combine a snapshot with a live subscription. An empty
+    string is a real fence for the pre-attachment store, not an alias for None.
+    """
+
     type: Literal["query.snapshot"] = "query.snapshot"
+    expected_store_id: str | None = None
 
 
-class ChatQuery(Request):  # noqa: D101  # tracked: #288
+class ChatQuery(Request):
+    """Send a message to an experiment-chat thread."""
+
     type: Literal["query.chat"] = "query.chat"
     text: str
     # None targets the default thread, preserving pre-thread clients.
-    thread_id: str | None = None
+    thread_id: ChatThreadId | None = None
 
 
 class ChatThreadCreateQuery(Request):
     """Create a new experiment-chat thread with its own agent selection.
 
-    Omitted fields resolve to the run's configured driver, provider, and
-    model. The response carries the resolved settings and thread identity.
-    ``driver`` exists for completeness and stays validated when supplied, but
-    which driver backs a run is a deployment detail: clients omit it so every
-    thread inherits the run's.
+    Omitted fields resolve to the run's configured provider and model. The
+    response carries the resolved settings and thread identity.
     """
 
     type: Literal["query.chat_thread_create"] = "query.chat_thread_create"
-    driver: Literal["agentshim", "omnigent"] | None = None
     provider: str | None = None
     model: str | None = None
     # Without a title the server derives one from the thread's first message.
@@ -91,18 +118,32 @@ class TuiDefaultsQuery(Request):
     type: Literal["query.tui_defaults"] = "query.tui_defaults"
 
 
-class HistoryQuery(Request):  # noqa: D101  # tracked: #288
+class HistoryQuery(Request):
+    """Request persisted run history."""
+
     type: Literal["query.history"] = "query.history"
 
 
-class PerformanceQuery(Request):  # noqa: D101  # tracked: #288
+class PerformanceQuery(Request):
+    """Request the run's performance history."""
+
     type: Literal["query.performance"] = "query.performance"
+
+
+class ExperimentCursor(ProtocolModel):
+    """Client's last completely applied experiment projection."""
+
+    run_id: str
+    projection_id: str
+    revision: int = Field(ge=0)
 
 
 class ExperimentQuery(Request):
     """Request the hypothesis-level experiment log for the attached run."""
 
     type: Literal["query.experiments"] = "query.experiments"
+    # Omitted by legacy clients, which continue receiving a complete snapshot.
+    after: ExperimentCursor | None = None
 
 
 class DesignQuery(Request):
@@ -116,8 +157,49 @@ class DesignQuery(Request):
     type: Literal["query.design"] = "query.design"
 
 
-class EventsQuery(Request):  # noqa: D101  # tracked: #288
+class IterationQuery(Request):
+    """Request one bounded page of roots or direct children.
+
+    ``expected_store_id`` fences every page to the event store whose stream
+    established the navigation query. None preserves the unfenced request for
+    clients that do not combine iteration navigation with a live subscription.
+    An empty string is a real fence for the pre-attachment store.
+    """
+
+    type: Literal["query.iterations"] = "query.iterations"
+    expected_store_id: str | None = None
+    parent_id: str | None = None
+    cursor: str | None = None
+    limit: int = Field(default=100, ge=1, le=MAX_ITERATION_PAGE_SIZE)
+
+
+class DesignPatchQuery(Request):
+    """Request one file's unified patch from a round's commit range.
+
+    ``base`` and ``head`` are a round's own range exactly as ``query.design``
+    published it (``DesignRound.base`` and ``DesignRound.commit``), and
+    ``path`` must be one of that round's listed file changes. The server
+    validates all three, so a client cannot diff arbitrary revisions or read
+    paths the design log filtered out.
+    """
+
+    type: Literal["query.design_patch"] = "query.design_patch"
+    base: str
+    head: str
+    path: str
+
+
+class EventsQuery(Request):
+    """Request run events in a sequence interval.
+
+    ``expected_store_id`` fences the interval to the event store whose stream
+    established the caller's history floor. None preserves the unfenced query
+    for callers that do not combine history with a live subscription. An empty
+    string is a real fence for the pre-attachment store.
+    """
+
     type: Literal["query.events"] = "query.events"
+    expected_store_id: str | None = None
     after_sequence: int = Field(default=0, ge=0)
     # Exclusive upper bound: the result is ``after_sequence < sequence <
     # before_sequence``. None keeps the open-ended read. This is the backfill
@@ -126,7 +208,9 @@ class EventsQuery(Request):  # noqa: D101  # tracked: #288
     timeout_ms: int = Field(default=0, ge=0, le=30_000)
 
 
-class SubscribeRequest(Request):  # noqa: D101  # tracked: #288
+class SubscribeRequest(Request):
+    """Subscribe to run events, optionally replaying a recent tail."""
+
     type: Literal["subscribe"] = "subscribe"
     after_sequence: int = Field(default=0, ge=0)
     # Replay from ``max(after_sequence, latest_sequence - tail)`` instead of
@@ -148,6 +232,7 @@ ProtocolRequest = Annotated[
     PauseCommand
     | ResumeCommand
     | SteerCommand
+    | StopCommand
     | SnapshotQuery
     | ChatQuery
     | ChatThreadCreateQuery
@@ -156,7 +241,9 @@ ProtocolRequest = Annotated[
     | HistoryQuery
     | PerformanceQuery
     | ExperimentQuery
+    | IterationQuery
     | DesignQuery
+    | DesignPatchQuery
     | EventsQuery
     | SubscribeRequest,
     Field(discriminator="type"),
@@ -166,41 +253,44 @@ ProtocolRequest = Annotated[
 class ChatThreadInfo(ProtocolModel):
     """Resolved identity and agent settings of one experiment-chat thread."""
 
-    thread_id: str
+    thread_id: ChatThreadId
     title: str = ""
-    driver: str
     provider: str
     model: str
 
 
-class RunSnapshot(ProtocolModel):  # noqa: D101  # tracked: #288
+class RunSnapshot(ProtocolModel):
+    """Current server projection of a run's public state."""
+
     protocol_version: Literal[1] = PROTOCOL_VERSION
     run_id: str
+    # Opaque machine-local namespace for client state keyed by project and run.
+    # None keeps snapshots from older/read-only composition roots compatible.
+    project_scope: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     sequence: int
     status: RunStatus
     agent_kind: str | None = None
     round_label: str | None = None
-    active_executions: list[ActiveAgentExecution] = Field(default_factory=list)
+    active_executions: ActiveExecutions = Field(default_factory=list)
     # Server-owned projection: a thread's title is backfilled from a later
     # CHAT event, so a client that folds only a tail cannot rebuild the
     # registry from the events it holds.
     chat_threads: list[ChatThreadInfo] = Field(default_factory=list)
 
 
-class CommandAck(ProtocolModel):  # noqa: D101  # tracked: #288
-    action: Literal["pause", "resume", "steer"]
-    status: Literal["pending", "consumed"]
+class ChatResult(ProtocolModel):
+    """Answer and thread identity returned by experiment chat."""
 
-
-class ChatResult(ProtocolModel):  # noqa: D101  # tracked: #288
     question: str
     answer: str
     effect: Literal["none"] = "none"
     # Echoes the requested thread; None is the default thread.
-    thread_id: str | None = None
+    thread_id: ChatThreadId | None = None
 
 
-class PerformanceRound(ProtocolModel):  # noqa: D101  # tracked: #288
+class PerformanceRound(ProtocolModel):
+    """One measured performance result in a run."""
+
     round: int
     perf_metric: FiniteFloat
     perf_unit: str
@@ -319,6 +409,22 @@ class HypothesisEntry(ProtocolModel):
     active: bool = False
 
 
+class ExperimentUpdate(ProtocolModel):
+    """How to apply ``Response.experiments`` to a client's prior snapshot.
+
+    A reset replaces the entire list. A delta replaces entries by stable
+    hypothesis ID and then removes the named IDs. ``from_revision`` is None for
+    a reset because no prior client state is trusted.
+    """
+
+    run_id: str
+    projection_id: str
+    from_revision: int | None = Field(default=None, ge=0)
+    through_revision: int = Field(ge=0)
+    reset: bool
+    removed_hypothesis_ids: list[str] = Field(default_factory=list)
+
+
 class DesignFileChange(ProtocolModel):
     """One workspace file a round's commit range touched."""
 
@@ -346,17 +452,41 @@ class DesignRound(ProtocolModel):
     round: int
     # The round's end-of-round checkpoint, and the head of the diffed range.
     commit: str | None = None
+    # The other end of that range, as the projection derived it. Publishing it
+    # lets a client ask ``query.design_patch`` for exactly the range ``files``
+    # describes instead of re-deriving one. None when no base resolved, in
+    # which case ``files`` is None too.
+    base: str | None = None
     files: list[DesignFileChange] | None = None
 
 
-class Response(ProtocolModel):  # noqa: D101  # tracked: #288
-    protocol_version: Literal[1] = PROTOCOL_VERSION
-    request_id: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    ok: bool = True
-    error: str | None = None
-    diagnostic: Diagnostic | None = None
-    ack: CommandAck | None = None
+class DesignPatch(ProtocolModel):
+    """One file's unified patch text from a round's commit range.
+
+    ``patch`` is the raw ``git diff`` output for the one file (rename
+    detection on, so a renamed file arrives as a single patch spanning both
+    paths). None means the workspace repository could not produce the text
+    (repository missing or unreadable), which is distinct from an empty
+    string, a file the range lists but whose content did not change.
+
+    ``truncated`` marks a patch cut at the server's size bound. The echoed
+    range and paths let a client show the exact ``git diff`` command that
+    reproduces the full output externally.
+    """
+
+    base: str
+    head: str
+    path: str
+    # The pre-rename path, echoed from the round's file list when the change
+    # is a rename, so the external-command hint can name both sides.
+    renamed_from: str | None = None
+    patch: str | None = None
+    truncated: bool = False
+
+
+class Response(ResponseEnvelope):
+    """Response envelope for all protocol requests."""
+
     chat: ChatResult | None = None
     chat_thread: ChatThreadInfo | None = None
     # None means the run has not attached its agent selection yet, which is
@@ -372,13 +502,20 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
     # distinct from a run whose plot is merely empty so far.
     performance_context: PerformanceContext | None = None
     experiments: list[HypothesisEntry] = Field(default_factory=list)
+    # Present on revision-aware servers. The experiments list is complete when
+    # reset is true and contains only replacements when reset is false.
+    experiment_update: ExperimentUpdate | None = None
     # False means canonical project/run state is not attached yet. Keeping the
     # readiness marker separate preserves the protocol-v1 list contract while
     # distinguishing bootstrap from an authoritative empty experiment log.
     experiments_ready: bool | None = None
+    iterations: IterationSlice | IterationUnavailable | None = None
+    iterations_ready: bool | None = None
     design: list[DesignRound] = Field(default_factory=list)
     # Same bootstrap-versus-empty distinction as ``experiments_ready``.
     design_ready: bool | None = None
+    # None means the run has not attached yet, so no patch can be produced.
+    design_patch: DesignPatch | None = None
 
     @classmethod
     def from_exception(
@@ -386,32 +523,95 @@ class Response(ProtocolModel):  # noqa: D101  # tracked: #288
         request_id: str,
         error: BaseException,
         *,
+        timestamp: datetime,
         operation: str = "Request",
-        scope: DiagnosticScope = DiagnosticScope.REQUEST,
-        code: str | None = None,
     ) -> Response:
         """Build a failed response with consistent legacy and typed errors."""
-        diagnostic = exception_to_diagnostic(error, scope=scope, operation=operation, code=code)
-        return cls(request_id=request_id, ok=False, error=diagnostic.summary, diagnostic=diagnostic)
+        diagnostic = exception_to_diagnostic(
+            error,
+            scope=DiagnosticScope.REQUEST,
+            operation=operation,
+            code=getattr(error, "diagnostic_code", None),
+        )
+        return cls(
+            request_id=request_id,
+            timestamp=timestamp,
+            ok=False,
+            error=diagnostic.summary,
+            diagnostic=diagnostic,
+        )
 
 
-class SubscribedMessage(ProtocolModel):  # noqa: D101  # tracked: #288
+_REQUEST_ADAPTER = TypeAdapter(ProtocolRequest)
+_JSON_VALUE: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
+
+
+def decode_request(frame: str | bytes, *, clock: Clock) -> ProtocolRequest | Response:
+    """Parse one request frame, or the failed response that rejects it.
+
+    Every transport decodes through here, so a malformed frame (invalid JSON or
+    UTF-8, a JSON value that is not an object, a missing or unknown ``type``,
+    unknown keys, nesting deeper than the JSON parser's depth limit) draws the
+    same typed response on each of them, stamped by ``clock``. The rejection echoes the frame's
+    ``request_id`` and ``client_id`` when it carries them as an object, so a
+    client can match it to what it sent.
+
+    Total: no frame makes this raise. A frame is parsed only by pydantic's JSON
+    parser, which bounds nesting and reports it as a ``ValueError``; Python's
+    ``json`` recurses per level and raises ``RecursionError`` instead, which
+    escaped to the transport and ended the client's session.
+    """
+    try:
+        return _REQUEST_ADAPTER.validate_json(frame)
+    except ValueError as error:
+        request_id, client_id = _frame_ids(frame)
+        return failure_response(request_id, client_id, error, clock=clock)
+
+
+def failure_response(
+    request_id: str, client_id: str, error: BaseException, *, clock: Clock
+) -> Response:
+    """The failed response for ``error``, stamped by ``clock`` and addressed to ``client_id``."""
+    return Response.from_exception(
+        request_id, error, timestamp=utc_datetime(clock), operation="Request"
+    ).model_copy(update={"client_id": client_id})
+
+
+def _frame_ids(frame: str | bytes) -> tuple[str, str]:
+    try:
+        value = _JSON_VALUE.validate_json(frame)
+    except ValidationError:
+        return "unknown", ""
+    if not isinstance(value, dict):
+        return "unknown", ""
+    client_id = value.get("client_id")
+    return str(value.get("request_id", "unknown")), client_id if isinstance(client_id, str) else ""
+
+
+class SubscribedMessage(ProtocolModel):
+    """Initial acknowledgment for an event subscription."""
+
     type: Literal["subscribed"] = "subscribed"
     request_id: str
+    client_id: str = ""
     run_id: str
     latest_sequence: int
 
 
-class EventMessage(ProtocolModel):  # noqa: D101  # tracked: #288
+class EventMessage(ProtocolModel):
+    """Single-event message for the legacy streaming protocol."""
+
     type: Literal["event"] = "event"
     event: RunEvent
 
 
-class EventBatchMessage(ProtocolModel):  # noqa: D101  # tracked: #288
+class EventBatchMessage(ProtocolModel):
+    """Event batch and cursor metadata sent to subscribers."""
+
     type: Literal["event_batch"] = "event_batch"
     events: list[RunEvent]
     through_sequence: int = Field(default=0, ge=0)
-    active_executions: list[ActiveAgentExecution] = Field(default_factory=list)
+    active_executions: ActiveExecutions = Field(default_factory=list)
     # Names the event store these sequences number. A run attaches its durable
     # log after clients subscribe, and sequences are only comparable within one
     # store, so a batch whose id differs from the previous one supersedes what
@@ -423,11 +623,86 @@ class EventBatchMessage(ProtocolModel):  # noqa: D101  # tracked: #288
     # full history was delivered, which is the default and today's behavior.
     # Carried on every batch of the subscription, live ones included.
     history_after_sequence: int = Field(default=0, ge=0)
+    # True only when this already-open subscription has been bootstrapped again
+    # after its first batch. A newly dialed subscription, including a reconnect
+    # that discovers a different store, leaves this false: its first batch is
+    # distinguished by the dial rather than by an in-loop replay transition.
+    rebootstrap: bool = False
+
+    def split_within(self, budget: int) -> Iterator[EventBatchMessage]:
+        """Split this batch into whole batches that each serialize within *budget* bytes.
+
+        Folding the chunks in order has the same effect as folding this batch.
+        Each chunk is a complete ``event_batch`` rather than a fragment, so a
+        transport that bounds its frames needs no reassembly step and
+        ``WP-GRANULARITY`` still holds: one frame is one protocol message. The
+        per-field rules that make that true are:
+
+        - ``through_sequence`` on each chunk is the sequence of the last event it
+          carries, so a consumer advances its cursor exactly as far as the events
+          it has seen, and a connection lost mid-replay resumes from a true
+          cursor. The final chunk keeps the batch's own ``through_sequence``,
+          which may run past its last event when the journal's watermark
+          advanced over events the checkpoint did not return; carrying it on an
+          earlier chunk would claim delivery of events still to come.
+        - ``rebootstrap`` is carried by the first chunk only. It means "this
+          supersedes the fold" (``WP-REBOOTSTRAP``), so on a later chunk it
+          would tell the consumer to discard the earlier chunks of the same
+          replay.
+
+        Chunking is on serialized size, not on event count: measured on a run of
+        output events the per-event JSON ranges from 282 to 647 bytes, so no
+        count is both safe and economical. The split is computed from measured
+        byte lengths rather than by serializing candidate chunks, which would be
+        quadratic. The arithmetic is exact because compact JSON renders a list
+        as its items joined by commas: a chunk costs its envelope (measured once
+        per spelling of ``rebootstrap``, at the batch's own
+        ``through_sequence``, the longest number any chunk carries) plus each
+        event's own serialization plus one separator between neighbors.
+
+        A chunk always carries at least one whole event, so an event larger than
+        the budget travels alone in an oversized chunk. The recording boundary's
+        per-event serialized-size contract keeps that case below the
+        supported-peer cap; this method neither truncates nor special-cases
+        event payloads. A batch with no events yields itself, so an empty
+        checkpoint still reports its watermark.
+        """
+        if not self.events:
+            yield self
+            return
+        room = budget - max(
+            len(
+                self.model_copy(update={"events": [], "rebootstrap": flag})
+                .model_dump_json()
+                .encode()
+            )
+            for flag in (False, True)
+        )
+        start = 0
+        used = 0
+        for index, event in enumerate(self.events):
+            size = len(event.model_dump_json().encode())
+            if index > start and used + 1 + size > room:
+                yield self.model_copy(
+                    update={
+                        "events": self.events[start:index],
+                        "through_sequence": self.events[index - 1].sequence,
+                        "rebootstrap": self.rebootstrap and start == 0,
+                    }
+                )
+                start, used = index, 0
+            used += size + (1 if index > start else 0)
+        yield self.model_copy(
+            update={"events": self.events[start:], "rebootstrap": self.rebootstrap and start == 0}
+        )
 
 
-class ProtocolErrorMessage(ProtocolModel):  # noqa: D101  # tracked: #288
+class ProtocolErrorMessage(ProtocolModel):
+    """Structured error envelope for protocol failures."""
+
     type: Literal["protocol_error"] = "protocol_error"
     request_id: str | None = None
+    client_id: str = ""
     code: str
     message: str
     diagnostic: Diagnostic | None = None
@@ -443,7 +718,12 @@ class ProtocolErrorMessage(ProtocolModel):  # noqa: D101  # tracked: #288
         code: str | None = None,
     ) -> ProtocolErrorMessage:
         """Build a protocol error with consistent legacy and typed errors."""
-        diagnostic = exception_to_diagnostic(error, scope=scope, operation=operation, code=code)
+        diagnostic = exception_to_diagnostic(
+            error,
+            scope=scope,
+            operation=operation,
+            code=code or getattr(error, "diagnostic_code", None),
+        )
         return cls(
             request_id=request_id,
             code=diagnostic.code,

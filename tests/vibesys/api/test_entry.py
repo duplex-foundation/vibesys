@@ -1,0 +1,68 @@
+"""Structural validation of canonical descriptor-backed run requests."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import pytest
+from tests.support.docker_environment import fake_docker_environment
+
+from vibesys.api import Config, OrchestrationDescriptor, ResumeRef, RunRequest
+from vibesys.api.request import load_project_task
+from vs_project.api import Project
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+_EXAMPLE = "examples/model-serving/whisper-large-v3"
+
+
+def _request(root: Path) -> RunRequest:
+    project = Project.open(root)
+    bundle = load_project_task(project, project.select_task("default"))
+    return RunRequest(
+        run_environment=fake_docker_environment(),
+        project_root=root,
+        orchestration=OrchestrationDescriptor(id="multi-agent", config_version=1, options={}),
+        config=Config.model_validate({"model": {"name": "gpt-test"}}),
+        input_bundle=bundle,
+        objective=bundle.objective,
+    )
+
+
+def test_canonical_request_builds_a_runnable_request(repo_root: Path) -> None:
+    project = Project.open(repo_root / _EXAMPLE)
+    request = _request(project.root)
+
+    assert request.orchestration.id == "multi-agent"
+    assert request.project_root == project.root
+    assert request.objective
+
+
+def test_run_request_owns_fresh_and_resumed_identity(repo_root: Path) -> None:
+    request = _request(Project.open(repo_root / _EXAMPLE).root)
+
+    with pytest.raises(ValueError, match="exp_name must be set"):
+        _ = request.resolved_run_id
+
+    fresh = request.model_copy(update={"exp_name": "fresh-run"})
+    resumed = fresh.model_copy(update={"resume": ResumeRef(run_id="prior-run")})
+
+    assert fresh.resolved_run_id == "fresh-run"
+    assert resumed.resolved_run_id == "prior-run"
+
+
+def test_run_request_resolves_the_project_that_owns_each_run(
+    repo_root: Path, tmp_path: Path
+) -> None:
+    source = Project.open(repo_root / _EXAMPLE).root
+    request = _request(source).model_copy(
+        update={"run_id": "shared", "exp_name": "shared", "runs_dir": tmp_path / "runs"}
+    )
+
+    assert request.resolved_project_root == (tmp_path / "runs" / "shared").resolve()
+
+    resumed = request.model_copy(
+        update={"project_root": tmp_path / "existing", "resume": ResumeRef(run_id="shared")}
+    )
+    assert resumed.resolved_project_root == (tmp_path / "existing").resolve()

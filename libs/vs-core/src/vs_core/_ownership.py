@@ -1,0 +1,140 @@
+"""One cleanup fence for irreversible run closure and terminal publication."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from ._proofs import Proven, blocked_unnamed, released_owner
+from .types.attempts import AttemptPhase
+from .types.common import LifecycleClass
+from .types.evaluation import ContinuationPhase
+
+if TYPE_CHECKING:
+    from .types.evaluation import OwnedJob, RegisteredOwnedJob
+    from .types.records import ChildLease, RequestRecord
+    from .types.sessions import Invocation
+from .types.records import RequestPhase
+from .types.sessions import SessionPhase
+
+if TYPE_CHECKING:
+    from .types.kernel import CoreState
+
+
+def cleanup_pending(state: CoreState) -> bool:
+    """Pending work and unresolved ownership cannot be hidden by admission drain."""
+    return any(
+        (
+            bool(state.scheduling.queue or state.scheduling.slots),
+            any(
+                attempt.phase
+                in (
+                    AttemptPhase.QUEUED,
+                    AttemptPhase.ACQUIRING,
+                    AttemptPhase.ACTIVE,
+                    AttemptPhase.CLOSING,
+                    AttemptPhase.BLOCKED,
+                )
+                or attempt.release_dependencies
+                for attempt in state.attempts.attempts
+            ),
+            any(session.phase != SessionPhase.TERMINAL for session in state.sessions.sessions),
+            any(
+                not _job_release_confirmed(job, state.records.records)
+                for job in (*state.evaluation.jobs, *state.evaluation.registered_jobs)
+            ),
+            any(
+                not blocked_unnamed(record)
+                and (
+                    record.phase != RequestPhase.COMPLETED
+                    or (
+                        record.lifecycle in (LifecycleClass.OWNED_JOB, LifecycleClass.SESSION_TURN)
+                        and (not _record_release_confirmed(record, state.records.records))
+                    )
+                )
+                for record in state.records.records
+            ),
+            bool(state.settlement.pending),
+            any(claim.phase != "completed" for claim in state.sessions.interrupts),
+            _unreleased_children(state),
+            any(group.phase == "acquiring" for group in state.sessions.acquisition_groups),
+            any(
+                not _child_release_confirmed(child, state.records.records)
+                for child in state.records.children
+            ),
+            any(
+                _invocation_pending(state, invocation) for invocation in state.sessions.invocations
+            ),
+        )
+    )
+
+
+def _job_release_confirmed(
+    job: OwnedJob | RegisteredOwnedJob, sources: tuple[RequestRecord, ...]
+) -> bool:
+    return isinstance(released_owner(job, sources), Proven)
+
+
+def _record_release_confirmed(record: RequestRecord, sources: tuple[RequestRecord, ...]) -> bool:
+    return isinstance(released_owner(record, sources), Proven)
+
+
+def _child_release_confirmed(child: ChildLease, sources: tuple[RequestRecord, ...]) -> bool:
+    return isinstance(released_owner(child, sources), Proven)
+
+
+def _unreleased_children(state: CoreState) -> bool:
+    jobs = (*state.evaluation.jobs, *state.evaluation.registered_jobs)
+    released = {
+        (job.resource_id, job.scope)
+        for job in jobs
+        if _job_release_confirmed(job, state.records.records)
+    }
+    released.update(
+        (child.resource_id, child.scope)
+        for child in state.records.children
+        if _child_release_confirmed(child, state.records.records)
+    )
+    observations = tuple(
+        record.observation for record in state.records.records if record.observation is not None
+    )
+    observations += tuple(job.observation for job in jobs if job.observation is not None)
+    observations += tuple(
+        child.observation for child in state.records.children if child.observation is not None
+    )
+    observations += tuple(
+        mark.observation
+        for child in state.records.children
+        for mark in child.observation_watermarks
+    )
+    released.update(
+        (record.observation.resource_id, record.observation.scope)
+        for record in state.records.records
+        if record.lifecycle in (LifecycleClass.OWNED_JOB, LifecycleClass.SESSION_TURN)
+        and record.observation is not None
+        and _record_release_confirmed(record, state.records.records)
+    )
+    children = tuple((child, job.scope) for job in jobs for child in job.children)
+    children += tuple(
+        (child, observation.scope)
+        for observation in observations
+        for child in observation.descendants
+    )
+    return any(child not in released for child in children)
+
+
+def _invocation_pending(state: CoreState, invocation: Invocation) -> bool:
+    """Whether the invocation still holds work.
+
+    A yielded (SUSPENDED) invocation stays in that phase for the record. It holds
+    nothing once its continuation was resumed or cancelled.
+    """
+    if invocation.phase in (SessionPhase.TERMINAL, SessionPhase.CHECKPOINTED, SessionPhase.IDLE):
+        return False
+    return not (
+        invocation.phase == SessionPhase.SUSPENDED
+        and any(
+            row.invocation == invocation.invocation
+            and row.phase in (ContinuationPhase.RESUMED, ContinuationPhase.CANCELLED)
+            for row in state.evaluation.continuations
+        )
+    )

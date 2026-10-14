@@ -26,6 +26,8 @@ project/
 ~/.vibesys/projects/<project-key>/
 ├── current-run
 └── runs/<run-id>/                  # logs and machine-local state
+~/.vibesys/cache/<architecture>/
+└── evaluator-tools/<tool>/<spec-digest>/  # evaluator tools, shared by all projects
 ```
 
 VibeSys commits candidate evolution and portable `.vibesys/state/runs/`
@@ -68,14 +70,14 @@ runtime and is never part of the image build context.
 
 Task Dockerfiles are intentionally convention-based: they require no manifest
 field or image-build command. A task Dockerfile cannot be combined with another
-image source or a different run environment. `--docker` and
-`--run-environment docker` are redundant but accepted. Legacy root input
-bundles do not opt in through a root `Dockerfile`, because that file commonly
-belongs to the candidate application.
+image source or a different run environment. `--run-environment docker` is
+redundant but accepted. A root `Dockerfile` never opts in, because that
+file commonly belongs to the candidate application.
 
-The `agent`, `plain`, and `evolve` outer loops all use this model. Local, Docker,
-and Modal execution change where commands run, not the task layout. Task
-commands always start in the repository root. `.vibesys` is mounted read-only
+All outer loops use this model. The agent always runs in a local Docker
+container. Modal, SkyPilot, and Slurm change where evaluation runs, not the task
+layout. The Slurm environments reach the cluster through a host-owned broker
+that the container connects to over a mounted socket. Task commands always start in the repository root. `.vibesys` is mounted read-only
 for coding agents. Machine-local state is outside their workspace.
 
 Modal tasks may set a project-relative deployment file. Omit this block to use
@@ -86,8 +88,8 @@ the legacy `main.py` default:
 entrypoint = "examples/deployment/service.py"
 ```
 
-Accuracy and benchmark commands may be task-owned argv arrays, or stable entry
-points supplied by an exact evaluator package:
+Accuracy, benchmark and diagnostic profile commands may be task-owned argv
+arrays, or stable entry points supplied by an exact evaluator package:
 
 ```toml
 version = 1
@@ -108,6 +110,44 @@ entrypoint = "vibesys-queue"
 args = ["benchmark", "--workspace", "${PROJECT_ROOT}", "--scenario", "spsc"]
 ```
 
+For trusted serving captures, also declare a bundle-owned diagnostic workload:
+
+```toml
+[profile]
+command = ["python", "benchmark/profile.py", "--base-url", "http://127.0.0.1:VIBESYS_DYNAMIC_PORT/v1"]
+timeout_seconds = 120
+```
+
+The workload is short and fixed, exercises requests without benchmark preflight
+or warmup gates, and lives in trusted evaluator inputs. It follows the same
+command-or-entrypoint contract as the other task commands. A configured serving
+capture requires this declaration and names `profile.command` when it is absent.
+The timeout bounds the load after readiness and cannot exceed the remaining
+capture deadline. Profiling provides diagnostic evidence; accuracy and benchmark
+acceptance still use their own unchanged gates.
+
+## Start from an Example
+
+The examples under `examples/<category>/` in a VibeSys source checkout are
+project roots in this layout. Runs never use them in place: copy one into a
+new repository first.
+
+```bash
+vibesys example list                     # categories, examples, and their tasks
+vibesys example new data-structures/stack ~/work/stack
+cd ~/work/stack
+vibesys --task spsc
+```
+
+`example new` copies the files the checkout tracks under the example, runs
+`git init`, makes one initial commit, and prints the `vibesys --task ...` line
+to run. The destination must be absent or an empty directory, outside the
+checkout. An example registered with `external_repo = true` is cloned from its
+repository at the commit the checkout pins instead. A unique last path
+component (`stack`) also selects an example. `vibesys example list --json`
+prints one `ExampleList` document (`entrypoints.example_catalog`), which the
+desktop app reads.
+
 ## Container Topologies
 
 A `microservices` candidate is not a process the agent starts on its own: it is
@@ -115,16 +155,41 @@ a Docker Compose topology the agent must build, start, and trace. Such a task
 needs Docker Engine reachable without `sudo` and, when its benchmark shells out
 to Go helpers, a Go toolchain on `PATH`.
 
-A local run in this domain therefore imports two domain-specific host resources
-the default confinement withholds: the Docker control socket, and the task
-scratch directory `/tmp/vibesys-<task>`. The scratch directory is shared with the host
-rather than masked by the sandbox's private `/tmp`, because Docker resolves a
-bind-mount source in the daemon's namespace, not the agent's, so a capture
-directory only resolves when the path names the same directory inside and
-outside confinement. Sharing it also makes the benchmark's telemetry artifacts
-durable and readable by the profiler in later rounds. Reaching the Docker
-socket is equivalent to root on the host, so this widening is scoped to this
-domain; use `--docker` to confine the workload to a container instead.
+A `microservices` task therefore opts in to a Docker daemon of its own with
+`docker_in_docker = true`:
+
+```toml
+[environment]
+docker_in_docker = true
+```
+
+The key selects the Docker run environment automatically, exactly like a
+task-owned `Dockerfile`. Modal, SkyPilot, or Slurm with the key is an error that
+names it. Without the key a task gets no container runtime at all: VibeSys
+never mounts or imports the host's Docker socket.
+
+### Docker-in-Docker
+
+The agent container runs under the Sysbox runtime (`docker run --runtime
+sysbox-runc`, never `--privileged`) and VibeSys starts `dockerd` inside it
+before the first turn, waiting until `docker info` answers. The agent can
+`docker compose up --build` or create kind clusters inside the sandbox. The
+daemon's images, containers, and volumes live in the sandbox container and
+disappear with it, and trusted evaluator commands run in the same container, so
+they use the same daemon. The sandbox is CPU-only: Sysbox cannot forward
+accelerators.
+
+The workspace is mounted at the same path inside the container as on the host
+(not at `/workspace`), so a compose file's relative or absolute bind sources
+mean the same directory to the agent and to the daemon; `/tmp` is the
+sandbox's own. The agent image gains the Docker engine, the compose plugin,
+kind, and kubectl only for these tasks (the `container-runtime` toolchain;
+versions are pinned in `vs_agent.provider_policy`), so ordinary tasks' images
+do not grow.
+
+If the host's Docker daemon does not register the `sysbox-runc` runtime, the
+run fails before building any image, naming the missing runtime and the key.
+There is no fallback to the host socket or to a plain container.
 
 A benchmark command that names both `--telemetry-output` and
 `--trace-graph-json` declares that the task provisions instrumentation and a
@@ -133,30 +198,29 @@ which gives the loop service, span, datastore, critical-path, and trace
 breakdown evidence. Tasks without those flags stay on `none`, since OTel
 profiling has nothing to read.
 
-## Legacy Input Bundles
+## Task Layout Only
 
-Root-level `OBJECTIVE.md` plus `vibesys.input.toml`, `[workspace]`,
-`evaluator.source`, standalone `--input-*` flags, and `--runs-dir` copied
-projects remain temporarily supported for examples that have not migrated.
-New integrations should use repository-native tasks. A task in a standalone
-repository runs in place. A repository-shaped example nested below another Git
-root uses `--runs-dir` to materialize an isolated project.
+Task inputs live only in `.vibesys/tasks/<task>/`. A project with a root
+`vibesys.input.toml` fails validation with an error that names the file and
+says to move it, with `OBJECTIVE.md` and the files its commands read, to
+`.vibesys/tasks/<task>/vibesys.input.toml`. A directory without
+`.vibesys/tasks/` is not a VibeSys project.
 
-For example:
+A repository-shaped example nested below another Git root uses `--runs-dir` to
+materialize an isolated project:
 
 ```bash
 vibesys \
   --runs-dir /work/vibesys-runs \
   --local \
-  --input /path/to/input
+  --project /path/to/example --task default
 ```
 
-VibeSys provisions a self-contained project below the runs directory. Candidate
-source is at the copied project's root, and a declared evaluator is copied
-below `_evaluator/`. The source input's `.git/`, `.vibesys/`, `agent.toml`, and
+VibeSys provisions a self-contained project below the runs directory, with
+`[[workspace.sources]]` checked out. The source's `.git/`, `.vibesys/state/`, `agent.toml`, and
 `.env*` files are not copied. Omit `--local` to publish the copied project using
-the authenticated GitHub CLI. See [Legacy bundles](cli-flags.md#legacy-bundles)
-for the source, evaluator, and publication contracts.
+the authenticated GitHub CLI. `vibesys example new` is the simpler way to start
+from an example.
 
 ## Resume
 
@@ -170,7 +234,7 @@ vibesys --resume
 vibesys --resume <run-id>
 ```
 
-With `--runs-dir`, the resume argument selects a legacy copied project in the
+With `--runs-dir`, the resume argument selects a copied project in the
 collection. It may be a directory name, a local path, a GitHub `OWNER/NAME`, or
 a cloneable URL. VibeSys then resumes that project's current or newest run.
 
@@ -195,9 +259,10 @@ machine-local `skypilot` state namespace. See
 
 ## Supply an Input with CLI Flags
 
-Automation can supply the input contract without first writing an input
-directory. This form requires `--runs-dir`. VibeSys synthesizes the objective
-and manifest, then provisions the same canonical project layout.
+Automation can supply the task contract without first writing a project.
+This form requires `--runs-dir`. VibeSys synthesizes a one-task project (task
+`default`) under `<runs-dir>/_inputs/<exp-name>/`, then provisions it like any
+other project.
 
 ```bash
 vibesys \
@@ -212,9 +277,8 @@ vibesys \
   --input-evaluator-dir ./evaluation
 ```
 
-Use this form for CI or programmatic integrations. Checked-in
-`OBJECTIVE.md` and `vibesys.input.toml` files are easier to review for projects
-maintained by people.
+Use this form for CI or programmatic integrations. Checked-in task files
+under `.vibesys/tasks/` are easier to review for projects maintained by people.
 
 ## Presentation and Validation
 
@@ -223,8 +287,10 @@ maintained by people.
 - Non-interactive execution runs headless automatically.
 - `vibesys validate [PROJECT] --task NAME` checks the static task contract
   without starting an agent or executing the checker and benchmark.
+- `vibesys tasks [PROJECT] [--json]` lists the tasks a project defines.
+- `vibesys example list [--json]` and `vibesys example new EXAMPLE DEST` list the
+  example catalog and copy an example into a new project.
 
-Legacy root input bundles remain valid positional arguments without `--task`.
 
 See the [CLI reference](cli-flags.md) for every flag and
 [`examples/`](https://github.com/uw-syfi/vibesys/tree/main/examples) for complete objectives and manifests.

@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Keep the Mermaid architecture overview in docs/contributing/architecture.md current.
+
+`tach show --mermaid` renders the module graph declared in `tach.toml`. This
+script embeds a high-level overview collapsed to top-level packages between
+marker comments in the architecture doc.
+
+Tach's edge order is not guaranteed stable, so edges are sorted. Only the local
+Mermaid output is used; never `tach show --web`, which uploads the graph.
+
+Usage:
+    uv run python scripts/check_tach_graph.py           # same as --check
+    uv run python scripts/check_tach_graph.py --check   # fail if block is stale
+    uv run python scripts/check_tach_graph.py --write   # regenerate the block.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+DOC = Path("docs/contributing/architecture.md")
+START = "[//]: # (tach-graph:start)"
+END = "[//]: # (tach-graph:end)"
+
+EDGE_TOKENS = 3
+EXIT_OK = 0
+EXIT_STALE = 1
+EXIT_TOOL_ERROR = 2
+
+
+def tach_edges() -> list[tuple[str, str]]:
+    """Return the sorted `(src, dst)` edges from `tach show --mermaid`."""
+    uv = shutil.which("uv")
+    if uv is None:
+        raise FileNotFoundError(errno.ENOENT, "uv executable was not found on PATH", "uv")
+    # lint-waiver: LW-008044 [S603]; The resolved uv executable receives fixed local Tach arguments without a shell.
+    result = subprocess.run(  # noqa: S603
+        [uv, "run", "tach", "show", "--mermaid", "-o", "-"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    edges = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == EDGE_TOKENS and parts[1] == "-->":
+            edges.add((parts[0], parts[2]))
+    return sorted(edges)
+
+
+def mermaid(edges: list[tuple[str, str]], nodes: tuple[str, ...] = ()) -> str:
+    """Render edges as a Mermaid top-down graph."""
+    connected = {node for edge in edges for node in edge}
+    isolated = sorted(set(nodes) - connected)
+    lines = ["graph TD", *(f"    {node}" for node in isolated)]
+    lines.extend(f"    {src} --> {dst}" for src, dst in edges)
+    return "\n".join(lines)
+
+
+def collapse(edges: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Fold dotted submodules into their top-level package, dropping self-edges."""
+    folded = {(src.split(".")[0], dst.split(".")[0]) for src, dst in edges}
+    return sorted(e for e in folded if e[0] != e[1])
+
+
+def render_block(edges: list[tuple[str, str]], nodes: tuple[str, ...] = ()) -> str:
+    """Build the marked region: architecture overview collapsed to top-level packages."""
+    return "\n".join(
+        [
+            START,
+            "## Architecture overview",
+            "",
+            "Submodules such as `vibesys.orchestration` and `server.api` are collapsed "
+            "into their top-level package.",
+            "",
+            "```mermaid",
+            mermaid(collapse(edges), tuple(node.split(".")[0] for node in nodes)),
+            "```",
+            END,
+        ]
+    )
+
+
+def splice(text: str, block: str) -> str:
+    """Replace the marked region of `text` with `block`."""
+    start = text.find(START)
+    end = text.find(END)
+    if start == -1 or end == -1 or end < start:
+        msg = f"{DOC} is missing the {START} / {END} markers"
+        raise ValueError(msg)
+    return text[:start] + block + text[end + len(END) :]
+
+
+def main() -> int:
+    """Run the check or regenerate the doc block."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--write", action="store_true", help="regenerate the block")
+    mode.add_argument("--check", action="store_true", help="fail if stale (default)")
+    parser.add_argument("--root", type=Path, default=Path())
+    args = parser.parse_args()
+
+    doc = args.root / DOC
+    try:
+        current = doc.read_text()
+        config = tomllib.loads((args.root / "tach.toml").read_text())
+        nodes = tuple(module["path"] for module in config["modules"])
+        expected = splice(current, render_block(tach_edges(), nodes))
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_TOOL_ERROR
+
+    if args.write:
+        if expected != current:
+            doc.write_text(expected)
+            print(f"updated {DOC}")
+        return EXIT_OK
+    if expected != current:
+        print(
+            f"{DOC} tach graph is stale. Run: uv run python scripts/check_tach_graph.py --write",
+            file=sys.stderr,
+        )
+        return EXIT_STALE
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

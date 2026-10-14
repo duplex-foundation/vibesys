@@ -1,0 +1,295 @@
+# Repository check groups and native target commands.
+[native_checks]
+timeout_seconds = 600
+[native_checks.commands]
+go = [["go", "test", "-race", "./..."]]
+rust = [
+  ["cargo", "fmt", "--", "--check"],
+  ["cargo", "clippy", "--locked", "--all-targets", "--", "-D", "warnings"],
+  ["cargo", "test", "--locked"],
+]
+
+[[check_groups]]
+name = "python_tests"
+trigger_job = "python"
+include_in_test = true
+language = "python"
+directory = "."
+timeout_seconds = 1800
+commands = [["uv", "run", "python", "-m", "pytest", "-q"]]
+
+[[check_groups]]
+name = "python_quality"
+language = "python"
+directory = "."
+timeout_seconds = 600
+commands = [
+  ["./scripts/check_format.sh"],
+  ["./scripts/check_lint.sh"],
+  ["uv", "run", "python", "scripts/check_file_length.py"],
+  ["uv", "run", "python", "-m", "scripts.check_purity", "--base-ref", "origin/main"],
+  ["uv", "run", "python", "scripts/check_test_isolation.py"],
+  ["uv", "run", "python", "-m", "scripts.check_contract_sot", "--base-ref", "origin/main"],
+  ["uv", "run", "python", "scripts/check_tach.py"],
+  ["uv", "run", "python", "scripts/check_member_dependencies.py"],
+  ["uv", "run", "python", "scripts/check_tach_graph.py", "--check"],
+  ["uv", "run", "python", "scripts/check_doc_links.py"],
+  ["uv", "run", "python", "-m", "scripts.check_doc_citations"],
+  ["uv", "run", "vibesys", "--headless", "--help"],
+  ["uv", "run", "python", "scripts/check_lint_waivers.py"],
+]
+
+# The fast repo-policy guards (real-API ratchet, isolation baseline, wait bans, CI wall-time, ...).
+# CI also runs them inside the sharded suite; this group runs them on their own, in the quality job
+# that runs beside the shards, so `scripts/check_ci.sh` catches a ratchet failure before the PR.
+[[check_groups]]
+name = "python_guards"
+language = "python"
+directory = "."
+timeout_seconds = 600
+commands = [["uv", "run", "python", "-m", "pytest", "-q", "-n", "auto", "--dist", "loadgroup", "--no-cov", "tests/quality", "tests/ci"]]
+
+[[check_groups]]
+name = "python_types"
+language = "python"
+directory = "."
+timeout_seconds = 600
+commands = [["./scripts/check_types.sh"]]
+
+[[check_groups]]
+name = "tui_tests"
+trigger_job = "tui"
+include_in_test = true
+language = "typescript"
+directory = "clients"
+collection = "pnpm_packages"
+timeout_seconds = 1200
+# The fallback when the change filter selects no package: Turborepo runs every workspace member's
+# `test`, so this does not go stale when one is added. Tests resolve workspace packages to their
+# source (the `@vibesys/source` export condition), so they need no dependency `dist` and run in
+# parallel; `turbo` builds first only what a package's `turbo.json` says its tests need. A selected
+# package runs through the same task graph, so it gets that preparation too.
+commands = [["pnpm", "turbo", "run", "test"]]
+package_commands = [["pnpm", "turbo", "run", "test", "--filter", "{package}"]]
+always_commands = [
+  ["pnpm", "test:ts-architecture"],
+  ["pnpm", "test:conformance"],
+  ["pnpm", "test:bun-runner"],
+  ["pnpm", "test:node-runner"],
+]
+
+[[check_groups]]
+name = "tui_quality"
+language = "typescript"
+directory = "clients"
+timeout_seconds = 1200
+commands = [
+  ["uv", "run", "python", "../scripts/check_test_isolation.py", "--root", ".."],
+  ["pnpm", "check:ts"],
+  ["pnpm", "check:ts-architecture"],
+  ["pnpm", "check:knip"],
+  ["pnpm", "--dir", "libs/contracts", "generate:protocol"],
+  ["git", "diff", "--exit-code", "--", "libs/contracts/src/generated/"],
+  ["pnpm", "check:clients"],
+]
+
+[[check_groups]]
+name = "tui_build"
+language = "typescript"
+directory = "clients"
+timeout_seconds = 1200
+commands = [["pnpm", "build:clients"]]
+
+[[check_groups]]
+name = "tui_e2e"
+language = "typescript"
+directory = "clients"
+timeout_seconds = 1200
+commands = [
+  ["pnpm", "--filter", "@vibesys/app-web", "test:e2e"],
+  ["pnpm", "--filter", "@vibesys/app-desktop-renderer", "test:e2e"],
+  ["pnpm", "--filter", "@vibesys/app-desktop-main", "test:e2e"],
+]
+
+[[check_groups]]
+name = "tui_package_smoke"
+language = "typescript"
+directory = "clients"
+timeout_seconds = 600
+commands = [["bash", "tools/scripts/check_package_smoke.sh"]]
+
+[[check_groups]]
+name = "examples_tests"
+trigger_job = "examples"
+include_in_test = true
+language = "python"
+directory = "."
+timeout_seconds = 1200
+env = { VIBESYS_REQUIRE_EXAMPLE_EXTERNAL_REPOS = "1" }
+commands = [
+  ["uv", "run", "python", "scripts/example_repositories.py"],
+  ["uv", "run", "python", "-m", "pytest", "tests/examples/test_example_registry.py", "-v", "--no-cov"],
+  ["uv", "run", "python", "-m", "pytest", "tests/vibesys/test_microservice_inputs.py", "tests/vibesys/test_kubernetes_inputs.py", "tests/vibesys/test_kubernetes_runtime.py", "tests/vibesys/test_input_sources.py", "-v", "--no-cov"],
+  ["uv", "run", "python", "-m", "pytest", "examples/model-serving/qwen3.5-9b-mi210/.vibesys/tasks/default/benchmark/test_run.py", "-v", "--no-cov"],
+]
+
+# The qwen3.5-9b-mi210 tiny-model CPU check runs in its own CPU-torch uv
+# project. It is ~250 s of serial server starts, so CI splits it across
+# runners: the workflow sets CPU_CHECK_SHARD=I/N (see
+# examples/model-serving/qwen3.5-9b-mi210/.vibesys/tasks/default/cpu_check/shard.py). Unset, as in a
+# local `repoctl test`, it runs every test.
+# The example evaluators' build-and-run tests (cargo, make and go compile native code, then the
+# real Go evaluator judges it): tests that request a native build fixture carry the
+# `native_build` marker (root conftest.py), which the Python shards deselect. They run here, on
+# the examples path, whenever an example, the evaluator SDK or the queue evaluator changes.
+[[check_groups]]
+name = "examples_native_evaluator_tests"
+trigger_job = "examples"
+include_in_test = true
+language = "python"
+directory = "."
+timeout_seconds = 1800
+commands = [
+  [
+    "uv", "run", "--no-sync", "python", "-m", "pytest", "-v", "-n", "auto", "--dist", "loadgroup", "--no-cov", "-m", "native_build",
+    "tests/architecture/test_stack_evaluator.py",
+    "tests/architecture/test_ordered_map_evaluator.py",
+    "tests/architecture/test_unordered_map_evaluator.py",
+    "tests/examples/test_prioqueue_evaluator.py",
+    "tests/examples/test_queue_evaluator.py",
+  ],
+]
+
+[[check_groups]]
+name = "examples_cpu_check_shard"
+trigger_job = "examples"
+include_in_test = true
+language = "python"
+directory = "."
+timeout_seconds = 1200
+commands = [
+  ["uv", "run", "--locked", "--directory", "examples/model-serving/qwen3.5-9b-mi210/.vibesys/tasks/default", "--project", "cpu_check", "python", "-m", "pytest", "cpu_check", "-v", "--durations=0"],
+]
+
+[[check_groups]]
+name = "agent_image_tests"
+trigger_job = "agent_image"
+include_in_test = true
+language = "python"
+directory = "."
+timeout_seconds = 1200
+env = { VIBESYS_E2E_DOCKER = "1" }
+commands = [
+  ["docker", "info", "--format", "{{.ServerVersion}}"],
+  ["uv", "run", "pytest", "tests/e2e/test_agent_image_e2e.py", "libs/vs-sandbox/tests/test_docker_conformance_e2e.py", "tests/e2e/test_credential_sharing_e2e.py", "-v", "-s", "--no-cov"],
+]
+
+# The real-system tiers. They need Docker and are opt-in locally, so neither is
+# in `repoctl test`; CI runs each in its own `real-tiers-*` job (test.yml) and
+# the Nightly workflow runs both on main. VIBESYS_SLURM_CLUSTER_DIR and
+# VIBESYS_MINIMAL_CONTAINER_DIR come from the job (local disk the daemon can mount).
+[[check_groups]]
+name = "slurm_cluster_tests"
+trigger_job = "real_tiers"
+language = "python"
+directory = "."
+timeout_seconds = 1200
+commands = [
+  ["docker", "info", "--format", "{{.ServerVersion}}"],
+  ["./scripts/run_slurm_cluster_tests.sh"],
+]
+
+# CI builds only the CPU base (VIBESYS_MINIMAL_CONTAINER_BASES=cpu in the job):
+# the CUDA and ROCm bases are about 25 GB each to pull.
+[[check_groups]]
+name = "minimal_container_tests"
+trigger_job = "real_tiers"
+language = "python"
+directory = "."
+timeout_seconds = 1200
+commands = [
+  ["docker", "info", "--format", "{{.ServerVersion}}"],
+  ["./scripts/run_minimal_container_tests.sh"],
+]
+
+[[check_groups]]
+name = "repoctl_tests"
+trigger_job = "impact"
+include_in_test = true
+language = "go"
+directory = "support/repoctl"
+timeout_seconds = 600
+commands = [
+  ["go", "test", "./..."],
+  ["go", "vet", "./..."],
+  ["go", "test", "-run=^$", "-fuzz=^FuzzGraphSelection$", "-fuzztime=20000x", "-parallel=2", "."],
+  ["go", "test", "-run=^$", "-fuzz=^FuzzParseNameStatusZ$", "-fuzztime=20000x", "-parallel=2", "."],
+]
+
+[[check_groups]]
+name = "sandbox_tests"
+language = "python"
+directory = "."
+timeout_seconds = 900
+env = { VIBESYS_REQUIRE_SANDBOX_TESTS = "1" }
+commands = [["uv", "run", "python", "-m", "pytest", "libs/vs-agent/tests/test_hostsandbox.py", "-v"]]
+
+[[check_groups]]
+name = "microservice_workload_checks"
+language = "go"
+directory = "resources/evaluators/microservice"
+timeout_seconds = 1200
+commands = [["bash", "check_workloads.sh"]]
+
+# CI runs the suite as shards on separate runners, then combines their
+# coverage data in one follow-up job. The workflow sets VIBESYS_TEST_SHARD=I/N
+# (see tests/support/sharding.py) and COVERAGE_FILE=.coverage.shard-I per
+# runner; `--cov-report=` leaves the report to the combine step. `--no-sync`
+# skips `uv run`'s environment re-check: the job already ran `uv sync --dev`.
+[[check_groups]]
+name = "python_ci_tests_shard"
+language = "python"
+directory = "."
+timeout_seconds = 1800
+commands = [
+  # One invocation per shard. The crash sweeps (tests/system/crash) used to run
+  # in a second `pytest --no-cov` process because a simulation per crash point is
+  # slower under coverage, but that process paid a full startup (~30 s of imports
+  # and collection) for ~6 s of tests, which costs more than measuring them.
+  # Every test still runs in exactly one shard.
+  ["uv", "run", "--no-sync", "python", "-m", "pytest", "-v", "-n", "auto", "--dist", "loadgroup", "--durations=25", "--cov-report="],
+]
+
+# Combines the shards' coverage data and applies the repo-wide and per-module
+# floors that the unsharded run applied.
+[[check_groups]]
+name = "python_ci_coverage"
+language = "python"
+directory = "."
+timeout_seconds = 600
+commands = [
+  ["uv", "run", "--no-sync", "coverage", "combine", "coverage-data"],
+  # The three read the combined data and write different outputs; each spends most of its
+  # ~8 s re-analyzing every source file, so running them together takes one's time, not three's.
+  # The shell waits for all of them and fails if any did.
+  [
+    "bash", "-c",
+    'uv run --no-sync coverage report --fail-under=75 & a=$!; uv run --no-sync coverage xml & b=$!; uv run --no-sync coverage json & c=$!; s=0; for p in $a $b $c; do wait $p || s=1; done; exit $s',
+  ],
+  ["uv", "run", "--no-sync", "python", "scripts/check_coverage_floor.py", "coverage.json"],
+]
+
+[[check_groups]]
+name = "patch_coverage"
+language = "python"
+directory = "."
+timeout_seconds = 300
+commands = [["uv", "run", "diff-cover", "coverage.xml", "--compare-branch=origin/main", "--fail-under=80"]]
+
+[[native_check_overrides]]
+root = "sdk/vs-evaluator/vseval"
+assertions = [{ file = "go.mod", line_prefix = "module ", equals = "github.com/uw-syfi/vibesys/sdk/vs-evaluator/vseval" }]
+
+[[native_check_overrides]]
+root = "resources/evaluators/microservice"
+env = { VIBESYS_REQUIRE_MANAGED_CANDIDATE_TESTS = "1" }

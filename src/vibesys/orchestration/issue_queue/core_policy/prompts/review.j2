@@ -1,0 +1,52 @@
+{% from '_evaluations.j2' import trusted_evaluations %}
+{% from '_macros.j2' import board_list %}
+{% from 'domain_section.j2' import domain_section %}
+Review issue #{{ issue.id }}: [{{ issue.type }}] {{ issue.title }}
+
+{{ issue.description }}
+
+Implementer summary: {{ summary }}
+{% if files_touched %}
+Files touched: {% for path in files_touched %}`{{ path }}`{% if not loop.last %}, {% endif %}{% endfor +%}
+{% endif %}
+Implementer self-check: {{ self_check or "<none>" }}
+
+{% if evaluations %}
+Trusted evaluation results the framework recorded for this candidate (measured by the
+framework, not claimed by the implementer):
+
+{{ trusted_evaluations(evaluations) }}
+{% endif %}
+{% include '_run_context.j2' %}
+{{ domain_section(domain_sections, 'judge') }}
+Performance improvement is out of scope for this verdict. Inspect the candidate without
+{% if facts.domain_id == "llm-serving" %}
+editing it, run its pytest tests, and use the accuracy checker when one is configured. Inspect
+the model architecture, local weight loading, accelerator and dtype placement, and the
+checker-facing `VibeServeModel` interface. A failing required correctness or accuracy check
+requires a fail verdict.
+
+Start the real service for an end-to-end `/health` and completion-stream smoke test. When the
+benchmark is configured, run a short sanity workload and require positive token throughput
+plus non-null TTFT and TPOT. Require a non-empty streaming delta for every generated model token.
+{% else %}
+editing it, run its focused automated tests, and use the accuracy checker when one is configured. A
+failing required correctness check requires a fail verdict.
+
+Exercise the changed behavior through the public interface declared by the objective and issue.
+When the benchmark is configured, run a short sanity workload and require a successful,
+well-formed result without judging the issue on performance improvement.
+{% endif %}
+
+For an unrelated bug, check the board below first and report at most one bug in {{ reply.new_issues }}
+(type `bug`), with `## Background`, `## Acceptance criteria` and `## Notes` in its
+description. Never report performance suggestions.
+
+Board:
+{{ board_list(board) }}
+
+Return exactly one JSON object matching:
+{"reply":{"analysis": "...", "feedback": "...", "verdict": "pass" | "fail",
+ "new_issues": [{"type": "bug", "title": "...", "description": "..."}]}}
+Feedback must be empty on pass.
+{% include 'agent_evaluation.j2' %}

@@ -32,6 +32,21 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+# `run_node_tests.mjs` cleans these package-local compiler outputs in a
+# `finally`, but a killed runner cannot execute cleanup.
+clients/*/.vibesys-node-tests-*/
+clients/*/*/.vibesys-node-tests-*/
+# `tools/scripts/new_package.test.mjs` scaffolds into these and removes them when it finishes.
+clients/.vibesys-scaffold-test-*/
+clients/apps/web/artifacts/
+clients/apps/web/test-results/
+clients/apps/web/.browser-dist/
+clients/apps/web/.desktop-dist/
+# `tsc -b` build info for the check-only projects, and Turborepo's local cache and task logs.
+clients/**/.tsbuild/
+.turbo/
+clients/.turbo/
+clients/**/.turbo/
 downloads/
 eggs/
 .eggs/
@@ -65,6 +80,10 @@ htmlcov/
 .coverage.*
 .cache
 nosetests.xml
+# `bun test --coverage` writes here by default (bun 1.4.2 `coverageDir`), and
+# `clients/tools/scripts/workspace_layout.mjs` asks git which directories hold no source, so an
+# unignored report directory becomes a dependency-cruiser scan root.
+coverage/
 coverage.xml
 coverage.json
 *.cover
@@ -244,10 +263,6 @@ inputs/**/model
 examples/**/model
 examples/**/draft_model
 
-# KV store benchmark: YCSB Redis binding (auto-fetched on first run)
-examples/kv-store/benchmark/ycsb/
-examples/kv-store/benchmark/ycsb-*.tar.gz
-
 # Claude Code session state (kept local)
 .claude/
 
@@ -261,6 +276,7 @@ sandbox-*/
 # TypeScript client build/install output
 node_modules/
 clients/tui/dist/
+clients/apps/web/.vibesys-demo/
 
 # TUI bundle staged into the package by setup.py's build_py step
 src/vibesys/_tui/

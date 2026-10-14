@@ -1,25 +1,63 @@
 """Persistence and cursor tests for the run-event store."""
 
+from __future__ import annotations
+
 import json
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from functools import partial
 from itertools import pairwise
 from pathlib import Path
+from typing import TYPE_CHECKING, TypedDict, Unpack, cast
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 from pydantic import ValidationError
+from tests.server.support import Task
 
-from server.events import EventStore, EventType, RunEvent, ToolCallData, make_event
+from server.events import (
+    MAX_SERIALIZED_RUN_EVENT_BYTES,
+    EventStore,
+    EventType,
+    OutputData,
+    RunEvent,
+    ToolCallData,
+    make_event,
+)
+from vs_sim.api.testing import SimThreads, examples, wait_or_fail
+
+if TYPE_CHECKING:
+    from types import TracebackType
+    from typing import TextIO
+
+_TIMESTAMP = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class _PathOpenOptions(TypedDict, total=False):
+    buffering: int
+    encoding: str | None
+    errors: str | None
+    newline: str | None
 
 
 def _persisted_event(sequence: int, text: str = "") -> RunEvent:
     return RunEvent(
         sequence=sequence,
         run_id="persisted-run",
-        timestamp=datetime.now(UTC),
+        timestamp=_TIMESTAMP,
         type=EventType.OUTPUT,
         text=text,
+    )
+
+
+def _recordable_output_event(content: str) -> RunEvent:
+    """An event already stamped exactly as this test's store will stamp it."""
+    return RunEvent(
+        sequence=1,
+        run_id="run",
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        type=EventType.OUTPUT,
+        data=OutputData(stream="stdout", content=content),
     )
 
 
@@ -33,7 +71,7 @@ def _write_events(path: Path, events: list[RunEvent]) -> None:
 
 
 class TestEventStore:
-    def test_startup_replay_cursor_and_next_sequence(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_startup_replay_cursor_and_next_sequence(self, tmp_path: Path) -> None:
         path = tmp_path / "events.jsonl"
         _write_events(path, [_persisted_event(1, "one"), _persisted_event(2, "two")])
 
@@ -42,12 +80,108 @@ class TestEventStore:
         assert [event.text for event in store.read()] == ["one", "two"]
         assert [event.text for event in store.read(after_sequence=1)] == ["two"]
         assert store.read(after_sequence=2) == []
-        appended = store.append(make_event(EventType.OUTPUT, "three"))
+        appended = store.append(
+            make_event(EventType.OUTPUT, "three", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        )
         assert appended.sequence == 3
         assert appended.run_id == "active-run"
         assert [event.sequence for event in store.read(after_sequence=1)] == [2, 3]
 
-    def test_legacy_out_of_order_sequences_get_stable_monotonic_cursors(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    @settings(
+        max_examples=examples(pr=10, nightly=12),
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+    @given(
+        delta=st.integers(min_value=-2048, max_value=2048),
+        unit=st.sampled_from(("x", "é", "🧪")),
+    )
+    def test_append_bounds_serialized_events_without_touching_ordinary_bytes(
+        self, tmp_path: Path, delta: int, unit: str
+    ) -> None:
+        """Every UTF-8 payload fits; every already-fitting payload stays exact."""
+        target = MAX_SERIALIZED_RUN_EVENT_BYTES + delta
+        empty = _recordable_output_event("")
+        overhead = len(empty.model_dump_json().encode())
+        repeats, remainder = divmod(target - overhead, len(unit.encode()))
+        produced = _recordable_output_event(unit * repeats + "x" * remainder)
+        produced_json = produced.model_dump_json()
+        assert len(produced_json.encode()) == target
+        path = tmp_path / f"event-{len(tuple(tmp_path.iterdir()))}.jsonl"
+
+        recorded = EventStore(path, run_id="run").append(produced)
+
+        assert len(recorded.model_dump_json().encode()) <= MAX_SERIALIZED_RUN_EVENT_BYTES
+        if target <= MAX_SERIALIZED_RUN_EVENT_BYTES:
+            assert recorded.model_dump_json() == produced_json
+            assert recorded is not produced
+            assert recorded.truncated is False
+        else:
+            assert recorded.truncated is True
+            assert isinstance(recorded.data, OutputData)
+            assert isinstance(produced.data, OutputData)
+            assert produced.data.content.startswith(recorded.data.content)
+        assert RunEvent.model_validate_json(path.read_bytes()) == recorded
+
+    @pytest.mark.parametrize("collection_kind", ["list", "dict"])
+    def test_append_cuts_structured_payloads_on_collection_entry_boundaries(
+        self, tmp_path: Path, collection_kind: str
+    ) -> None:
+        """Nested lists and mappings retain whole prefixes around the byte bound."""
+
+        def items(count: int) -> list[str] | dict[str, str]:
+            if collection_kind == "list":
+                return ["x" * 128] * count
+            return {f"entry-{index:05d}": "x" * 112 for index in range(count)}
+
+        def structured_event(count: int) -> RunEvent:
+            return RunEvent(
+                sequence=1,
+                run_id="run",
+                timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+                type=EventType.TOOL_CALL,
+                data=ToolCallData(tool="structured", args={"items": items(count)}),
+            )
+
+        low = 0
+        high = 10_000
+        while low < high:
+            middle = (low + high) // 2
+            if (
+                len(structured_event(middle).model_dump_json().encode())
+                <= MAX_SERIALIZED_RUN_EVENT_BYTES
+            ):
+                low = middle + 1
+            else:
+                high = middle
+        first_over_bound = low
+        below = structured_event(first_over_bound - 1)
+        above = structured_event(first_over_bound)
+        assert len(below.model_dump_json().encode()) <= MAX_SERIALIZED_RUN_EVENT_BYTES
+        assert len(above.model_dump_json().encode()) > MAX_SERIALIZED_RUN_EVENT_BYTES
+
+        recorded_below = EventStore(
+            tmp_path / f"structured-{collection_kind}-below.jsonl", run_id="run"
+        ).append(below)
+        recorded_above = EventStore(
+            tmp_path / f"structured-{collection_kind}-above.jsonl", run_id="run"
+        ).append(above)
+
+        assert recorded_below.model_dump_json() == below.model_dump_json()
+        assert recorded_above.truncated is True
+        assert len(recorded_above.model_dump_json().encode()) <= MAX_SERIALIZED_RUN_EVENT_BYTES
+        assert isinstance(recorded_above.data, ToolCallData)
+        retained = recorded_above.data.args["items"]
+        original = items(first_over_bound)
+        if isinstance(retained, list) and isinstance(original, list):
+            assert retained == original[: len(retained)]
+        else:
+            assert isinstance(retained, dict)
+            assert isinstance(original, dict)
+            assert list(retained.items()) == list(original.items())[: len(retained)]
+
+    def test_legacy_out_of_order_sequences_get_stable_monotonic_cursors(
+        self, tmp_path: Path
+    ) -> None:
         path = tmp_path / "events.jsonl"
         _write_events(
             path,
@@ -64,7 +198,12 @@ class TestEventStore:
         ]
         assert path.read_bytes() == original
         assert [event.text for event in store.read(after_sequence=2)] == ["one", "three"]
-        assert store.append(make_event(EventType.OUTPUT, "four")).sequence == 5
+        assert (
+            store.append(
+                make_event(EventType.OUTPUT, "four", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+            ).sequence
+            == 5
+        )
 
         reopened = EventStore(path, run_id="reopened-run")
         assert [(event.sequence, event.text) for event in reopened.read()] == [
@@ -74,7 +213,7 @@ class TestEventStore:
             (5, "four"),
         ]
 
-    def test_legacy_duplicate_sequences_preserve_every_payload(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_legacy_duplicate_sequences_preserve_every_payload(self, tmp_path: Path) -> None:
         path = tmp_path / "events.jsonl"
         _write_events(
             path,
@@ -99,7 +238,9 @@ class TestEventStore:
             "three",
         ]
 
-    def test_legacy_sequence_resets_replay_every_payload_across_cursors(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_legacy_sequence_resets_replay_every_payload_across_cursors(
+        self, tmp_path: Path
+    ) -> None:
         path = tmp_path / "events.jsonl"
         raw_sequences = [*range(7690, 7711), *range(7690, 7715), *range(7711, 7738)]
         _write_events(
@@ -123,14 +264,16 @@ class TestEventStore:
         assert all(previous.sequence < current.sequence for previous, current in pairwise(replayed))
         assert store.last_sequence == replayed[-1].sequence
 
-    def test_repeated_tail_reads_do_not_reparse_history(self, tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_repeated_tail_reads_do_not_reparse_history(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         path = tmp_path / "events.jsonl"
         event_count = 1_000
         _write_events(path, [_persisted_event(index) for index in range(1, event_count + 1)])
         parse_count = 0
         parse = RunEvent.model_validate_json
 
-        def counting_parse(raw):  # noqa: ANN001, ANN202  # tracked: #288
+        def counting_parse(raw: str) -> RunEvent:
             nonlocal parse_count
             parse_count += 1
             return parse(raw)
@@ -145,7 +288,7 @@ class TestEventStore:
 
         assert parse_count == event_count
 
-    def test_ignores_only_a_malformed_final_record(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_ignores_only_a_malformed_final_record(self, tmp_path: Path) -> None:
         path = tmp_path / "events.jsonl"
         valid = _persisted_event(1, "complete").model_dump_json()
         path.write_text(valid + "\n" + '{"protocol_version":1')
@@ -155,13 +298,17 @@ class TestEventStore:
         assert [event.text for event in store.read()] == ["complete"]
 
     @pytest.mark.parametrize("tail", ['{"protocol_version":1', '{"protocol_version":1\n'])
-    def test_append_repairs_ignored_malformed_tail_before_writing(self, tmp_path, tail):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_append_repairs_ignored_malformed_tail_before_writing(
+        self, tmp_path: Path, tail: str
+    ) -> None:
         path = tmp_path / "events.jsonl"
         valid = _persisted_event(1, "complete").model_dump_json()
         path.write_text(valid + "\n" + tail)
         store = EventStore(path, run_id="active-run")
 
-        store.append(make_event(EventType.OUTPUT, "after repair"))
+        store.append(
+            make_event(EventType.OUTPUT, "after repair", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        )
         reopened = EventStore(path, run_id="reopened-run")
 
         assert [(event.sequence, event.text) for event in reopened.read()] == [
@@ -169,13 +316,15 @@ class TestEventStore:
             (2, "after repair"),
         ]
 
-    def test_append_preserves_a_valid_unterminated_final_record(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_append_preserves_a_valid_unterminated_final_record(self, tmp_path: Path) -> None:
         path = tmp_path / "events.jsonl"
         path.write_text(_persisted_event(1, "unterminated").model_dump_json())
         store = EventStore(path, run_id="active-run")
         assert [event.text for event in store.read()] == ["unterminated"]
 
-        store.append(make_event(EventType.OUTPUT, "appended"))
+        store.append(
+            make_event(EventType.OUTPUT, "appended", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        )
 
         assert [event.text for event in store.read()] == ["unterminated", "appended"]
         reopened = EventStore(path, run_id="reopened-run")
@@ -190,23 +339,29 @@ class TestEventStore:
             "appended",
         ]
 
-    def test_append_writes_no_repair_newline_after_a_terminated_tail(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_append_writes_no_repair_newline_after_a_terminated_tail(self, tmp_path: Path) -> None:
         path = tmp_path / "events.jsonl"
         _write_events(path, [_persisted_event(1, "one")])
         original = path.read_bytes()
         store = EventStore(path, run_id="active-run")
 
-        appended = store.append(make_event(EventType.OUTPUT, "two"))
+        appended = store.append(
+            make_event(EventType.OUTPUT, "two", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        )
 
         assert path.read_bytes() == original + (appended.model_dump_json() + "\n").encode()
 
-    def test_a_missing_final_newline_is_repaired_exactly_once(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_a_missing_final_newline_is_repaired_exactly_once(self, tmp_path: Path) -> None:
         path = tmp_path / "events.jsonl"
         path.write_text(_persisted_event(1, "unterminated").model_dump_json())
         store = EventStore(path, run_id="active-run")
 
-        store.append(make_event(EventType.OUTPUT, "second"))
-        store.append(make_event(EventType.OUTPUT, "third"))
+        store.append(
+            make_event(EventType.OUTPUT, "second", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        )
+        store.append(
+            make_event(EventType.OUTPUT, "third", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        )
 
         raw = path.read_text()
         assert "\n\n" not in raw
@@ -217,18 +372,22 @@ class TestEventStore:
             "third",
         ]
 
-    def test_append_after_external_removal_starts_the_new_file_cleanly(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_append_after_external_removal_starts_the_new_file_cleanly(
+        self, tmp_path: Path
+    ) -> None:
         path = tmp_path / "events.jsonl"
         path.write_text(_persisted_event(1, "unterminated").model_dump_json())
         store = EventStore(path, run_id="active-run")
         path.unlink()
 
-        appended = store.append(make_event(EventType.OUTPUT, "fresh"))
+        appended = store.append(
+            make_event(EventType.OUTPUT, "fresh", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        )
 
         assert path.read_bytes() == (appended.model_dump_json() + "\n").encode()
         assert [event.text for event in EventStore(path, run_id="reopened-run").read()] == ["fresh"]
 
-    def test_concatenated_final_records_raise_instead_of_truncating(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_concatenated_final_records_raise_instead_of_truncating(self, tmp_path: Path) -> None:
         path = tmp_path / "events.jsonl"
         first = _persisted_event(1, "first").model_dump_json()
         second = _persisted_event(2, "second").model_dump_json()
@@ -241,7 +400,9 @@ class TestEventStore:
 
         assert path.read_bytes() == original
 
-    def test_a_complete_but_invalid_final_record_raises_instead_of_truncating(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_a_complete_but_invalid_final_record_raises_instead_of_truncating(
+        self, tmp_path: Path
+    ) -> None:
         path = tmp_path / "events.jsonl"
         valid = _persisted_event(1, "complete").model_dump_json()
         record = json.loads(_persisted_event(2, "terminal").model_dump_json())
@@ -255,29 +416,36 @@ class TestEventStore:
         assert str(path) in str(excinfo.value)
         assert path.read_bytes() == original
 
-    def test_rejects_a_malformed_record_before_the_tail(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_rejects_a_malformed_record_before_the_tail(self, tmp_path: Path) -> None:
         path = tmp_path / "events.jsonl"
         first = _persisted_event(1).model_dump_json()
         last = _persisted_event(2).model_dump_json()
         path.write_text(first + "\nnot-json\n" + last + "\n")
 
-        with pytest.raises(ValueError):  # noqa: PT011  # tracked: #288
+        with pytest.raises(ValueError, match="Invalid JSON"):
             EventStore(path, run_id="active-run")
 
-    def test_append_wakes_multiple_independent_readers(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-        store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
-        ready = threading.Barrier(3)
+    def test_append_wakes_multiple_independent_readers(self, tmp_path: Path) -> None:
+        threads = SimThreads()
+        store = EventStore(tmp_path / "events.jsonl", run_id="active-run", threads=threads)
+        waiting = [threads.event(), threads.event()]
 
-        def wait_for_first_event() -> list[RunEvent]:
-            ready.wait()
-            return store.wait(after_sequence=0, timeout=2)
+        def wait_for_first_event(reader: int) -> list[RunEvent]:
+            return store.wait(after_sequence=0, on_waiting=waiting[reader].set)
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            readers = [executor.submit(wait_for_first_event) for _ in range(2)]
-            ready.wait()
-            appended = store.append(make_event(EventType.OUTPUT, "visible"))
+        def scenario() -> tuple[RunEvent, list[list[RunEvent]]]:
+            readers = [
+                Task(threads, partial(wait_for_first_event, reader), name=f"reader-{reader}")
+                for reader in range(2)
+            ]
+            for registered in waiting:
+                wait_or_fail(registered, "a reader to start waiting")
+            appended = store.append(
+                make_event(EventType.OUTPUT, "visible", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+            )
+            return appended, [reader.result() for reader in readers]
 
-        batches = [reader.result() for reader in readers]
+        appended, batches = threads.run(scenario)
         assert [[event.sequence for event in batch] for batch in batches] == [[1], [1]]
         assert all(batch[0] == appended for batch in batches)
         # Readers share the stored event rather than each getting a copy: it is
@@ -285,9 +453,11 @@ class TestEventStore:
         assert batches[0][0] is batches[1][0]
         assert batches[0] is not batches[1]
 
-    def test_cached_events_are_isolated_from_reader_mutation(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_cached_events_are_isolated_from_reader_mutation(self, tmp_path: Path) -> None:
         store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
-        appended = store.append(make_event(EventType.OUTPUT, "durable"))
+        appended = store.append(
+            make_event(EventType.OUTPUT, "durable", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        )
 
         first_read = store.read()
         with pytest.raises(ValidationError):
@@ -296,20 +466,26 @@ class TestEventStore:
         assert appended.text == "durable"
         assert store.read()[0].text == "durable"
 
-    def test_reader_projections_do_not_disturb_stored_history(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_reader_projections_do_not_disturb_stored_history(self, tmp_path: Path) -> None:
         """The read path builds variants by copy, which the store never sees."""
         store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
-        store.append(make_event(EventType.OUTPUT, "durable"))
+        store.append(
+            make_event(EventType.OUTPUT, "durable", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+        )
 
         projected = store.read()[0].model_copy(update={"text": "projected"})
 
         assert projected.text == "projected"
         assert store.read()[0].text == "durable"
 
-    def test_appended_events_are_immutable(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_appended_events_are_immutable(self, tmp_path: Path) -> None:
         store = EventStore(tmp_path / "events.jsonl", run_id="active-run")
         appended = store.append(
-            make_event(EventType.TOOL_CALL, data=ToolCallData(tool="Bash", call_id="c1"))
+            make_event(
+                EventType.TOOL_CALL,
+                data=ToolCallData(tool="Bash", call_id="c1"),
+                timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            )
         )
 
         with pytest.raises(ValidationError):
@@ -318,30 +494,47 @@ class TestEventStore:
         with pytest.raises(ValidationError):
             _assign(appended.data, "tool", "Write")
 
-    def test_append_does_not_publish_cache_state_when_file_close_fails(self, tmp_path, monkeypatch):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_append_does_not_publish_cache_state_when_file_close_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         path = tmp_path / "events.jsonl"
         store = EventStore(path, run_id="active-run")
         real_open = Path.open
 
         class FailingCloseStream:
-            def __enter__(self):  # noqa: ANN204  # tracked: #288
+            def __enter__(self) -> FailingCloseStream:
                 return self
 
-            def write(self, _text):  # noqa: ANN001, ANN202  # tracked: #288
+            def write(self, _text: str) -> None:
                 return None
 
-            def __exit__(self, *_args):  # noqa: ANN002, ANN204  # tracked: #288
-                raise OSError("close failed")  # noqa: TRY003  # tracked: #288
+            def __exit__(
+                self,
+                _exc_type: type[BaseException] | None,
+                _exc_value: BaseException | None,
+                _traceback: TracebackType | None,
+            ) -> bool | None:
+                _failure_message = "close failed"
+                raise OSError(_failure_message)
 
-        def open_with_close_failure(target, mode="r", *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202  # tracked: #288
+        def open_with_close_failure(
+            target: Path,
+            mode: str = "r",
+            **options: Unpack[_PathOpenOptions],
+        ) -> TextIO | FailingCloseStream:
             if target == path and mode == "a":
                 return FailingCloseStream()
-            return real_open(target, mode, *args, **kwargs)
+            return cast(
+                "TextIO",
+                real_open(target, mode, **options),
+            )
 
         monkeypatch.setattr(Path, "open", open_with_close_failure)
 
         with pytest.raises(OSError, match="close failed"):
-            store.append(make_event(EventType.OUTPUT, "ghost"))
+            store.append(
+                make_event(EventType.OUTPUT, "ghost", timestamp=datetime(2026, 1, 1, tzinfo=UTC))
+            )
 
         assert store.read() == []
         assert store.last_sequence == 0

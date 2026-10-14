@@ -1,0 +1,1903 @@
+"""Pure measurement submission, canonical evidence ingress and job cleanup.
+
+Only committed source facts grant observation authority. Submission ordinals and
+requests are allocated together; scientific references retain their first source
+receipt. Continuation wakes carry the exact facts before the atomic job update.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from ._deadlines import resolve_until
+from ._evaluation_history import produce_history
+from ._proofs import (
+    Mismatch,
+    Missing,
+    ProofField,
+    ProofReason,
+    Proven,
+    Verdict,
+    accepted_receipt_for,
+    committed_stop,
+    current_admission,
+    current_closure,
+    fresh_observation,
+    observation_for,
+    operation_for,
+    released_owner,
+    request_matches,
+    submission_budget_for,
+)
+from ._registry import ContractError
+from ._values import digest
+from .types.attempts import (
+    AttemptEvaluationHistoryUpdated,
+    AttemptPhase,
+    CloseAttemptScope,
+    SnapshotAndRetain,
+)
+from .types.common import (
+    MAX_SUBMISSIONS_PER_MEASUREMENT,
+    AttemptId,
+    AttemptRef,
+    EvidenceKind,
+    ExecuteRegisteredOperation,
+    LifecycleClass,
+    ObservationStatus,
+    RequestId,
+    RevisionRef,
+    RunStatus,
+    Scope,
+)
+from .types.evaluation import (
+    MEASUREMENT_DIAGNOSTIC_LIMIT,
+    AgentCall,
+    AgentMeasurementRequested,
+    AgentRejection,
+    CancelOwnedJob,
+    CollectEvidence,
+    ContinuationJobsChanged,
+    ContinuationPhase,
+    EvidenceAcceptanceReceipt,
+    InspectOwnedJob,
+    JobObserved,
+    JobsDrainRequested,
+    JobTerminationRequested,
+    JobWaitLapsed,
+    MeasurementIdentity,
+    MeasurementRequested,
+    MeasurementResult,
+    MeasurementSubmissionObserved,
+    ObservationsDue,
+    ObservedJobFacts,
+    ObserveOwnedJob,
+    ObservePacing,
+    OwnedJob,
+    PreparedSubmissionReceipt,
+    RegisteredJobObserved,
+    RegisteredJobRequested,
+    RegisteredOwnedJob,
+    RunJobsCancelRequested,
+    SnapshotResultRef,
+    SubmissionBudget,
+    SubmitMeasurement,
+    UnobservedJobFacts,
+)
+from .types.evaluation_history import EvaluationStageOutcome
+from .types.job_observations import MeasurementFailure
+from .types.kernel import AreaChange
+from .types.records import Outbound, RequestObserved, RequestPhase, inherit, within
+from .types.strategy import Measure
+from .types.until import Until, Within
+from .types.waits import WaitOn
+
+if TYPE_CHECKING:
+    from .types.common import DecisionId, Observation, ResourceId, Seconds
+    from .types.evaluation import EvaluationEvent, EvaluationState, EvidenceRef, MeasurementPlan
+    from .types.kernel import EvaluationContext, Signal
+    from .types.records import Request, RequestRecord
+
+__all__ = ["advance"]
+
+
+def _current(context: EvaluationContext, scope: Scope) -> Verdict[DecisionId | None]:
+    if context.run.status != RunStatus.RUNNING:
+        return Missing(ProofReason.UNRESOLVED)
+    if scope.owner == context.run.run_id:
+        return (
+            Proven(None)
+            if scope.generation == context.run.generation
+            else Mismatch(ProofField.GENERATION)
+        )
+    owner = next((row for row in context.attempts.attempts if row.attempt_id == scope.owner), None)
+    proof = current_admission(owner, scope, owner.admission_id if owner is not None else None)
+    if not isinstance(proof, Proven):
+        return proof
+    if owner is None or owner.phase != AttemptPhase.ACTIVE or owner.closure is not None:
+        return Missing(ProofReason.UNRESOLVED)
+    if owner.terminal_reason is not None:
+        return Missing(ProofReason.UNRESOLVED)
+    return proof
+
+
+def _origin(context: EvaluationContext, event: MeasurementRequested) -> Verdict[Measure]:
+    rows = tuple(
+        receipt
+        for receipt in context.run.receipts
+        if isinstance(receipt.decision, Measure)
+        and receipt.decision.scope == event.scope
+        and receipt.decision.plan == event.plan
+    )
+    if not rows:
+        return Missing(ProofReason.ABSENT_RECEIPT)
+    # Identical measurements can be proposed again after conclusive failure.
+    # The latest accepted command supplies correlation, never a new budget key.
+    receipt = rows[-1]
+    proof = accepted_receipt_for(context.run.receipts, receipt.decision_id, receipt.decision)
+    if not isinstance(proof, Proven):
+        return proof
+    return (
+        Proven(receipt.decision)
+        if isinstance(receipt.decision, Measure)
+        else Mismatch(ProofField.PAYLOAD)
+    )
+
+
+def _resolved_plan(
+    context: EvaluationContext, scope: Scope, plan: MeasurementPlan
+) -> Verdict[MeasurementPlan]:
+    if not isinstance(plan.candidate, SnapshotResultRef):
+        return Proven(plan)
+    revision = _snapshot_revision(context, scope, plan.candidate)
+    return (
+        Proven(plan.model_copy(update={"candidate": revision.value}))
+        if isinstance(revision, Proven)
+        else revision
+    )
+
+
+def _snapshot_revision(
+    context: EvaluationContext, scope: Scope, candidate: SnapshotResultRef
+) -> Verdict[RevisionRef]:
+    rows = context.records.find(candidate.request_id)
+    if len(rows) != 1:
+        return Missing(ProofReason.ABSENT_REQUEST)
+    row = rows[0]
+    if not isinstance(row.request, SnapshotAndRetain) or row.request.scope != scope:
+        return Mismatch(ProofField.SCOPE)
+    if not isinstance(request_matches(row, row.request), Proven):
+        return Mismatch(ProofField.PAYLOAD)
+    proof = observation_for(row, row.observation)
+    if not isinstance(proof, Proven):
+        return proof
+    observation = proof.value
+    if (
+        not observation.accepted
+        or not observation.terminal
+        or observation.status != ObservationStatus.SUCCEEDED
+    ):
+        return Missing(ProofReason.ABSENT_CHECKPOINT)
+    checkpoints = tuple(
+        checkpoint
+        for owner in context.attempts.attempts
+        if owner.attempt_id == scope.owner and owner.generation == scope.generation
+        for checkpoint in owner.checkpoints
+        if checkpoint.request_id == row.request_id
+    )
+    return (
+        Proven(checkpoints[0].revision)
+        if len(checkpoints) == 1
+        else Missing(ProofReason.ABSENT_CHECKPOINT)
+    )
+
+
+def _identity(plan: MeasurementPlan) -> Verdict[MeasurementIdentity]:
+    if not isinstance(plan.candidate, RevisionRef):
+        return Missing(ProofReason.ABSENT_CHECKPOINT)
+    try:
+        return Proven(MeasurementIdentity.from_plan(plan, plan.candidate))
+    except ValueError:
+        return Mismatch(ProofField.PAYLOAD)
+
+
+def _budget_ready(
+    state: EvaluationState, context: EvaluationContext, budget: SubmissionBudget | None
+) -> Verdict[SubmissionBudget | None]:
+    if budget is None or not budget.receipts:
+        return Proven(budget)
+    latest = budget.receipts[-1]
+    if not isinstance(latest, PreparedSubmissionReceipt) or latest.observation is None:
+        return Missing(ProofReason.ABSENT_OBSERVATION)
+    observation = latest.observation
+    if (
+        observation.status in (ObservationStatus.UNKNOWN, ObservationStatus.PENDING)
+        or not observation.terminal
+    ):
+        return Missing(ProofReason.UNRESOLVED)
+    if (
+        latest.failure is None
+        or not latest.failure.retryable
+        or (
+            observation.accepted
+            and not isinstance(_submission_released(state, context, latest), Proven)
+        )
+    ):
+        return Missing(ProofReason.UNRESOLVED)
+    if len(budget.receipts) >= min(budget.limit, MAX_SUBMISSIONS_PER_MEASUREMENT):
+        return Missing(ProofReason.ABSENT_CHARGE)
+    return Proven(budget)
+
+
+def _submission_released(
+    state: EvaluationState, context: EvaluationContext, receipt: PreparedSubmissionReceipt
+) -> Verdict[Observation]:
+    rows = tuple(
+        j
+        for j in (*state.jobs, *state.registered_jobs)
+        if (j.submission_id if isinstance(j, OwnedJob) else j.request_id) == receipt.request_id
+    )
+    if len(rows) != 1:
+        return Missing(ProofReason.ABSENT_RESOURCE)
+    job = rows[0]
+    proof = released_owner(job, context.records.records)
+    if not isinstance(proof, Proven):
+        return proof
+    return (
+        proof
+        if isinstance(_descendants_released(context, job), Proven)
+        else Missing(ProofReason.INCOMPLETE_MANIFEST)
+    )
+
+
+def _descendants_released(
+    context: EvaluationContext, job: OwnedJob | RegisteredOwnedJob
+) -> Verdict[OwnedJob | RegisteredOwnedJob]:
+    pending = list(
+        dict.fromkeys(
+            (*job.children, *(job.observation.descendants if job.observation is not None else ()))
+        )
+    )
+    seen = set()
+    while pending:
+        resource = pending.pop()
+        if resource in seen:
+            continue
+        seen.add(resource)
+        rows = tuple(
+            child
+            for child in context.records.children
+            if child.resource_id == resource and child.scope == job.scope
+        )
+        if len(rows) != 1:
+            return Missing(ProofReason.INCOMPLETE_MANIFEST)
+        child = rows[0]
+        if not isinstance(released_owner(child, context.records.records), Proven):
+            return Missing(ProofReason.UNRESOLVED)
+        pending.extend(
+            resource
+            for mark in child.observation_watermarks
+            for resource in mark.observation.descendants
+        )
+    return Proven(job)
+
+
+def _reused(
+    state: EvaluationState, context: EvaluationContext, scope: Scope, plan: MeasurementPlan
+) -> tuple[EvidenceRef, ...]:
+    if plan.purpose != "profile":
+        return ()
+    return tuple(
+        proof.value
+        for evidence in state.evidence
+        if isinstance(proof := _reusable_capture(state, context, scope, plan, evidence), Proven)
+    )
+
+
+def _reusable_capture(
+    state: EvaluationState,
+    context: EvaluationContext,
+    scope: Scope,
+    plan: MeasurementPlan,
+    evidence: EvidenceRef,
+) -> Verdict[EvidenceRef]:
+    identity = _identity(plan)
+    if not isinstance(identity, Proven):
+        return identity
+    jobs = tuple(
+        j
+        for j in (*state.jobs, *state.registered_jobs)
+        if (j.submission_id if isinstance(j, OwnedJob) else j.request_id) == evidence.source_request
+        and evidence in j.evidence
+    )
+    if len(jobs) != 1:
+        return Missing(ProofReason.ABSENT_RESOURCE)
+    job = jobs[0]
+    source = context.records.record(evidence.source_request)
+    if source is None:
+        return Missing(ProofReason.ABSENT_REQUEST)
+    binding = _job_source(state, context, job, source)
+    expected = _job_identity(job)
+    if (
+        not isinstance(binding, Proven)
+        or not isinstance(expected, Proven)
+        or expected.value != identity.value
+        or evidence.scope != scope
+    ):
+        return Mismatch(ProofField.NORMALIZATION)
+    receipt = evidence.acceptance_receipt
+    if (
+        evidence.kind != EvidenceKind.PROFILING
+        or evidence.provenance != "trusted"
+        or evidence.status != ObservationStatus.SUCCEEDED
+        or receipt is None
+        or not receipt.observation.terminal
+    ):
+        return Missing(ProofReason.UNRESOLVED)
+    # A retained reference must still match its independently normalized source.
+    fields = (
+        evidence.purpose == identity.value.purpose,
+        evidence.candidate == identity.value.candidate,
+        evidence.evaluator_digest == identity.value.evaluator_digest,
+        evidence.workload_digest == identity.value.workload_digest,
+        evidence.environment_digest == identity.value.environment_digest,
+    )
+    return Proven(evidence) if all(fields) else Mismatch(ProofField.DIGEST)
+
+
+def _requested(
+    state: EvaluationState, context: EvaluationContext, event: MeasurementRequested
+) -> AreaChange[EvaluationState]:
+    authority = _current(context, event.scope)
+    origin = _origin(context, event)
+    resolved = _resolved_plan(context, event.scope, event.plan)
+    if (
+        not isinstance(authority, Proven)
+        or not isinstance(origin, Proven)
+        or not isinstance(resolved, Proven)
+    ):
+        return _rejected(state, event.scope)
+    plan = resolved.value
+    identity = _identity(plan)
+    if not isinstance(identity, Proven):
+        return _rejected(state, event.scope)
+    reuse = _reused(state, context, event.scope, plan)
+    if reuse:
+        return AreaChange(
+            state=state,
+            events=(
+                MeasurementResult(
+                    scope=event.scope, evidence=reuse, status=ObservationStatus.SUCCEEDED
+                ),
+            ),
+        )
+    # Replayed commands never allocate another ordinal, including changed timing.
+    if any(
+        isinstance(row.request, SubmitMeasurement)
+        and row.request.decision_id == origin.value.decision_id
+        for row in context.records.records
+    ):
+        return AreaChange(state=state)
+    return _admit(
+        state, context, _Origin(event.scope, origin.value.decision_id), plan, identity.value
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Origin:
+    """Who a submission is charged to: the scope and the Measure decision, if any."""
+
+    scope: Scope
+    decision_id: DecisionId | None
+    within: Within | None = None
+    """The agent's limit; None for a Measure decision, whose limit is its wait's."""
+
+
+def _admit(
+    state: EvaluationState,
+    context: EvaluationContext,
+    origin: _Origin,
+    plan: MeasurementPlan,
+    identity: MeasurementIdentity,
+) -> AreaChange[EvaluationState]:
+    """Charge the identity's budget and allocate one submission, or reject."""
+    scope = origin.scope
+    matches = tuple(
+        b for b in state.submission_budgets if b.scope == scope and b.identity == identity
+    )
+    budget = matches[0] if matches else None
+    if len(matches) > 1 or not isinstance(_budget_ready(state, context, budget), Proven):
+        failure = (
+            next(
+                (
+                    r.failure
+                    for r in reversed(budget.receipts)
+                    if isinstance(r, PreparedSubmissionReceipt)
+                    and r.failure == MeasurementFailure.WORKLOAD
+                ),
+                None,
+            )
+            if budget is not None
+            else None
+        )
+        return _rejected(state, scope, failure)
+    return _allocate(state, context, origin, plan, budget)
+
+
+def _agent_requested(
+    state: EvaluationState, context: EvaluationContext, event: AgentMeasurementRequested
+) -> AreaChange[EvaluationState]:
+    """Admit an agent tool call: same authority, identity and budget as a Measure.
+
+    A call for a candidate this scope already measures or measured (same identity) is a
+    repeat. It is answered with that submission and charges nothing: the scope's budget
+    receipts are the one record of "this candidate's evaluation", so every role that holds
+    the scope (an implementer and the judge reviewing its candidate) gets the same handle.
+    A repeat exists only while the earlier submission cannot be redone; after a released
+    retryable infrastructure failure the call is a real retry and is charged like any other.
+
+    An agent's call is answered to the agent and tells the strategy nothing: a refusal of
+    it is not the rejection of a Measure decision, and neither is the end of its job.
+    """
+    if any(call.call_id == event.call_id for call in state.agent_calls):
+        return AreaChange(state=state)
+    identity = _identity(event.plan)
+    rejection: AgentRejection | None = None
+    if context.run.status != RunStatus.RUNNING:
+        rejection = AgentRejection.RUN_STOPPING
+    elif not isinstance(_current(context, event.scope), Proven):
+        rejection = AgentRejection.NOT_ADMITTED
+    elif not isinstance(identity, Proven):
+        rejection = AgentRejection.INVALID_PLAN
+    if rejection is not None or not isinstance(identity, Proven):
+        return _recorded(AreaChange(state=state), AgentCall.refused(event, rejection))
+    repeated = _repeated(state, context, event.scope, identity.value)
+    if repeated is not None:
+        request_id, deadline_at = repeated
+        call = AgentCall.answered(event, request_id, deadline_at, repeat=True)
+        return _recorded(AreaChange(state=state), call)
+    change = _admit(
+        state, context, _Origin(event.scope, None, _capped(event)), event.plan, identity.value
+    )
+    outbound = next((r for r in change.requests if isinstance(r.request, SubmitMeasurement)), None)
+    if outbound is None or outbound.request.request_id is None:
+        refused = AgentCall.refused(event, AgentRejection.NOT_ALLOWED)
+        return _recorded(AreaChange(state=state), refused)
+    call = AgentCall.answered(
+        event, outbound.request.request_id, _deadline_at(context, outbound), repeat=False
+    )
+    return _recorded(change, call)
+
+
+def _capped(event: AgentMeasurementRequested) -> Within:
+    """The agent's limit, no longer than the plan's declared stages and queue allowance."""
+    within = event.within
+    return within.model_copy(update={"limit": min(within.limit, event.plan.time_bound)})
+
+
+def _deadline_at(context: EvaluationContext, outbound: Outbound) -> Seconds:
+    """The absolute time core ends a submission, for the agent that asked for it."""
+    match outbound.until:
+        case Until() as until:
+            return until.at
+        case Within() as within:
+            return resolve_until(context.run, within).at
+        case _:
+            raise ContractError(("until",), "an agent submission has an explicit limit")
+
+
+def _recorded(change: AreaChange[EvaluationState], call: AgentCall) -> AreaChange[EvaluationState]:
+    """``change`` without the events meant for a strategy, and with ``call`` on record."""
+    state = change.state
+    return change.model_copy(
+        update={
+            "state": state.model_copy(update={"agent_calls": (*state.agent_calls, call)}),
+            "events": (),
+        }
+    )
+
+
+def _repeated(
+    state: EvaluationState, context: EvaluationContext, scope: Scope, identity: MeasurementIdentity
+) -> tuple[RequestId, Seconds] | None:
+    """The submission a repeat call is answered with, and its deadline; None for a new one.
+
+    The scope's budget for the identity holds the evaluation: its latest receipt is the
+    submission that is running, or ended and cannot be redone. It is not a repeat when
+    the budget would admit another submission (none yet, or a released retryable
+    failure), nor when the receipt names no request (a migrated one).
+    """
+    matches = tuple(
+        b for b in state.submission_budgets if b.scope == scope and b.identity == identity
+    )
+    if len(matches) != 1 or not matches[0].receipts:
+        return None
+    if isinstance(_budget_ready(state, context, matches[0]), Proven):
+        return None
+    latest = matches[0].receipts[-1]
+    if not isinstance(latest, PreparedSubmissionReceipt):
+        return None
+    deadline_at = _deadline_of(state, context, latest.request_id)
+    return None if deadline_at is None else (latest.request_id, deadline_at)
+
+
+def _deadline_of(
+    state: EvaluationState, context: EvaluationContext, request_id: RequestId
+) -> Seconds | None:
+    """The deadline core gave a submission, from the call that allocated it or its record."""
+    call = next(
+        (
+            c
+            for c in state.agent_calls
+            if c.request_id == request_id and not c.repeat and c.deadline_at is not None
+        ),
+        None,
+    )
+    if call is not None:
+        return call.deadline_at
+    row = context.records.record(request_id)
+    if row is not None and isinstance(row.request, SubmitMeasurement):
+        return row.until.at
+    return None
+
+
+def _allocate(
+    state: EvaluationState,
+    context: EvaluationContext,
+    origin: _Origin,
+    plan: MeasurementPlan,
+    budget: SubmissionBudget | None,
+) -> AreaChange[EvaluationState]:
+    scope, decision_id = origin.scope, origin.decision_id
+    identity = _identity(plan)
+    authority = _current(context, scope)
+    if not isinstance(identity, Proven) or not isinstance(authority, Proven):
+        return _rejected(state, scope)
+    if budget is None:
+        budget = SubmissionBudget(
+            scope=scope, identity=identity.value, limit=MAX_SUBMISSIONS_PER_MEASUREMENT
+        )
+    # New work is refused once the run's time is over, and a submission needs a positive limit.
+    if not context.run.deadline_at > context.run.now_at or (
+        origin.within is not None and origin.within.limit <= 0
+    ):
+        return _rejected(state, scope)
+    ordinal = len(budget.receipts) + 1
+    key = digest(budget.identity)[:24]
+    identity_id = RequestId(
+        root=f"measurement:{scope.owner.root}:{scope.generation}:{key}:{ordinal}"
+    )
+    request = SubmitMeasurement(
+        request_id=identity_id,
+        scope=scope,
+        admission_id=authority.value,
+        decision_id=decision_id,
+        plan=plan,
+    )
+    updated = budget.model_copy(
+        update={
+            "receipts": (
+                *budget.receipts,
+                PreparedSubmissionReceipt(request_id=identity_id, ordinal=ordinal),
+            )
+        }
+    )
+    budgets = (
+        tuple(updated if b == budget else b for b in state.submission_budgets)
+        if budget in state.submission_budgets
+        else (*state.submission_budgets, updated)
+    )
+    # A measurement decision waits as long as its wait says; an agent's own submission, as
+    # long as the limit parsed from its call says. Neither is a field of the plan.
+    outbound = (
+        inherit(request)
+        if decision_id is not None or origin.within is None
+        else Outbound(request=request, until=origin.within)
+    )
+    return AreaChange(
+        state=state.model_copy(update={"submission_budgets": budgets}), requests=(outbound,)
+    )
+
+
+def _rejected(
+    state: EvaluationState, scope: Scope, failure: MeasurementFailure | None = None
+) -> AreaChange[EvaluationState]:
+    return AreaChange(
+        state=state,
+        events=(
+            MeasurementResult(
+                scope=scope, evidence=(), status=ObservationStatus.REJECTED, failure=failure
+            ),
+        ),
+    )
+
+
+def _reported_to_strategy(context: EvaluationContext, job: OwnedJob | RegisteredOwnedJob) -> bool:
+    """Whether the end of ``job`` is a result the strategy asked for.
+
+    A strategy awaits the result of its own Measure decision and takes any result of its
+    scope for that one. A job an agent submitted from its turn (a request without a
+    decision) answers the agent, which waits for it through its continuation; reporting
+    it too would hand the awaiting Measure another submission's evidence.
+    """
+    if isinstance(job, RegisteredOwnedJob):
+        return True
+    row = context.records.record(job.submission_id)
+    return not (
+        row is not None
+        and isinstance(row.request, SubmitMeasurement)
+        and row.request.decision_id is None
+    )
+
+
+def _held_mismatch(
+    held: Observation | None, observation: Observation, *, later: bool
+) -> Mismatch | Missing | None:
+    if not later:
+        return None if held == observation else Mismatch(ProofField.PAYLOAD)
+    if held is None:
+        return Missing(ProofReason.ABSENT_OBSERVATION)
+    if observation.sequence < held.sequence:
+        return Mismatch(ProofField.SEQUENCE)
+    if observation.sequence == held.sequence and held != observation:
+        return Mismatch(ProofField.PAYLOAD)
+    return None
+
+
+def _source(
+    context: EvaluationContext, observation: Observation, *, later: bool = False
+) -> Verdict[RequestRecord]:
+    """The committed request an observation belongs to.
+
+    A job's observations carry its submission's request id, but only the submission's
+    own observation goes through the record ledger. With ``later``, the ledger must
+    hold the submission's observation, and the incoming one may be newer than it: an
+    earlier or conflicting one is refused, and freshness against the job follows.
+    """
+    rows = context.records.find(observation.request_id)
+    if len(rows) != 1:
+        return Missing(ProofReason.ABSENT_REQUEST) if not rows else Mismatch(ProofField.REQUEST_ID)
+    row = rows[0]
+    canonical = request_matches(row, row.request)
+    if not isinstance(canonical, Proven):
+        return canonical
+    proof = observation_for(row, observation)
+    if not isinstance(proof, Proven):
+        return proof
+    mismatch = _held_mismatch(row.observation, observation, later=later)
+    if mismatch is not None:
+        return mismatch
+    if row.lifecycle != LifecycleClass.OWNED_JOB:
+        return Mismatch(ProofField.LIFECYCLE)
+    return Proven(row)
+
+
+def _submission_observed(
+    state: EvaluationState, context: EvaluationContext, event: MeasurementSubmissionObserved
+) -> AreaChange[EvaluationState]:
+    """Apply a submission's own observation, then re-derive the attempt's history.
+
+    The ledger takes a job's end as its submission's own observation after the job event
+    that carried it, so the history that event produced could not yet read the closed
+    submission. This is the first moment it can.
+    """
+    change = _submission_receipted(state, context, event)
+    proof = _source(context, event.observation)
+    if (
+        not _conclusive(event.observation)
+        or not isinstance(proof, Proven)
+        or not isinstance(proof.value.request, SubmitMeasurement)
+    ):
+        return change
+    scope = proof.value.request.scope
+    wake = _deferred_wake(change.state, event, proof.value)
+    # A waiting continuation derives and publishes the history itself when it authorizes.
+    history = () if wake else _history_signals(change.state, context, scope)
+    return change.model_copy(update={"signals": (*change.signals, *history, *wake)})
+
+
+def _deferred_wake(
+    state: EvaluationState, event: MeasurementSubmissionObserved, source: RequestRecord
+) -> tuple[ContinuationJobsChanged, ...]:
+    """Wake the scope's waiting continuations when one of its submissions concludes.
+
+    A continuation's authorization waits for the scope to be settled (every submission
+    concluded), so the conclusion of any submission of the scope, with or without a job, is
+    a moment it can proceed. Each wake names one of the continuation's own jobs at its
+    current observation, which the continuation handler accepts as its own job event.
+    """
+    if not _conclusive(event.observation):
+        return ()
+    wakes: list[ContinuationJobsChanged] = []
+    for continuation in state.continuations:
+        if continuation.phase != ContinuationPhase.WAITING:
+            continue
+        job = next(
+            (
+                j
+                for j in (*state.jobs, *state.registered_jobs)
+                if j.resource_id in continuation.jobs
+                and j.scope == source.request.scope
+                and j.observation is not None
+            ),
+            None,
+        )
+        if job is None or job.resource_id is None or job.observation is None:
+            continue
+        wakes.append(
+            ContinuationJobsChanged(
+                resource_id=job.resource_id,
+                observation=job.observation,
+                previous=UnobservedJobFacts(resource_id=job.resource_id),
+            )
+        )
+    return tuple(wakes)
+
+
+def _awaited(state: EvaluationState, resource_id: ResourceId) -> bool:
+    """Whether a waiting continuation names the job, so its authorization publishes the history."""
+    return any(
+        c.phase == ContinuationPhase.WAITING and resource_id in c.jobs for c in state.continuations
+    )
+
+
+def _submission_receipted(
+    state: EvaluationState, context: EvaluationContext, event: MeasurementSubmissionObserved
+) -> AreaChange[EvaluationState]:
+    proof = _source(context, event.observation)
+    if not isinstance(proof, Proven):
+        return AreaChange(state=state)
+    source = proof.value
+    request = source.request
+    if not isinstance(request, SubmitMeasurement):
+        return AreaChange(state=state)
+    if _resource_taken(state, event.observation, source.request_id):
+        return AreaChange(state=state)
+    budget = submission_budget_for(request, state.submission_budgets, context.run.receipts)
+    if not isinstance(budget, Proven):
+        return AreaChange(state=state)
+    updated = _submission_receipt(budget.value, event, source)
+    if not isinstance(updated, Proven):
+        return AreaChange(state=state)
+    state = state.model_copy(
+        update={
+            "submission_budgets": tuple(
+                updated.value if b == budget.value else b for b in state.submission_budgets
+            )
+        }
+    )
+    return _submission_job(state, context, event, source, request)
+
+
+def _owner_request(job: OwnedJob | RegisteredOwnedJob) -> RequestId:
+    return job.submission_id if isinstance(job, OwnedJob) else job.request_id
+
+
+def _resource_taken(state: EvaluationState, observation: Observation, owner: RequestId) -> bool:
+    """Whether another submission already owns this external resource id.
+
+    Ownership, cancellation and release are all addressed by resource id, so a second
+    owner would orphan both jobs. The colliding observation is refused whole.
+    """
+    return observation.resource_id is not None and any(
+        j.resource_id == observation.resource_id and _owner_request(j) != owner
+        for j in (*state.jobs, *state.registered_jobs)
+    )
+
+
+def _canonical_failure(
+    observation: Observation, claim: MeasurementFailure | None, *, has_facts: bool
+) -> MeasurementFailure | None:
+    """Restrict the caller's failure claim to what the committed facts allow.
+
+    A classification can only narrow what the canonical observation proves. It never
+    grants retry authority after execution succeeded, never contradicts committed
+    scientific facts, and never exists before a conclusive terminal observation.
+    """
+    if claim is None or not _conclusive(observation):
+        return None
+    if observation.accepted:
+        if observation.status == ObservationStatus.SUCCEEDED:
+            return None
+        if claim is not None and claim.retryable and has_facts:
+            return MeasurementFailure.UNKNOWN
+    return claim
+
+
+def _conclusive(observation: Observation | None) -> bool:
+    return (
+        observation is not None
+        and observation.terminal
+        and observation.status not in (ObservationStatus.UNKNOWN, ObservationStatus.PENDING)
+    )
+
+
+def _submission_receipt(
+    budget: SubmissionBudget, event: MeasurementSubmissionObserved, source: RequestRecord
+) -> Verdict[SubmissionBudget]:
+    matches = tuple(
+        r
+        for r in budget.receipts
+        if isinstance(r, PreparedSubmissionReceipt) and r.request_id == event.observation.request_id
+    )
+    if len(matches) != 1:
+        return Missing(ProofReason.ABSENT_RECEIPT)
+    receipt = matches[0]
+    history = (receipt.observation,) if receipt.observation is not None else ()
+    proof = fresh_observation(history, event.observation, complete=True)
+    if not isinstance(proof, Proven):
+        return proof
+    if receipt.observation == event.observation or receipt.failure == MeasurementFailure.WORKLOAD:
+        return Missing(ProofReason.UNRESOLVED)
+    updated = receipt.model_copy(
+        update={
+            "observation": event.observation,
+            "failure": _canonical_failure(
+                event.observation, event.failure, has_facts=source.evaluation_result is not None
+            ),
+        }
+    )
+    return Proven(
+        budget.model_copy(
+            update={"receipts": tuple(updated if r == receipt else r for r in budget.receipts)}
+        )
+    )
+
+
+def _submission_job(
+    state: EvaluationState,
+    context: EvaluationContext,
+    event: MeasurementSubmissionObserved,
+    source: RequestRecord,
+    request: SubmitMeasurement,
+) -> AreaChange[EvaluationState]:
+    observation = event.observation
+    jobs = tuple(j for j in state.jobs if j.submission_id == source.request_id)
+    if not jobs and observation.accepted and observation.resource_id is not None:
+        job = OwnedJob(
+            resource_id=observation.resource_id,
+            submission_id=source.request_id,
+            scope=request.scope,
+            plan=request.plan,
+            status=ObservationStatus.PENDING,
+            # A job nobody has polled is due now. Normally the first JobObserved replaces
+            # this; after a restart that lost it (the submit ran, its job observation was
+            # never committed) this is the only thing that starts the observe cycle.
+            wait=WaitOn(timer=context.run.now_at),
+        )
+        state = state.model_copy(update={"jobs": (*state.jobs, job)})
+        return AreaChange(state=state)
+    if observation.terminal and not observation.accepted and request.decision_id is not None:
+        return AreaChange(
+            state=state,
+            events=(
+                MeasurementResult(
+                    scope=request.scope,
+                    source_request=observation.request_id,
+                    evidence=(),
+                    status=observation.status,
+                    failure=event.failure,
+                ),
+            ),
+        )
+    return AreaChange(state=state)
+
+
+def _registered_requested(
+    state: EvaluationState, context: EvaluationContext, event: RegisteredJobRequested
+) -> AreaChange[EvaluationState]:
+    request = event.request
+    proof = operation_for(context.run.receipts, request)
+    current = _current(context, request.scope)
+    if not isinstance(proof, Proven) or not isinstance(current, Proven):
+        return _rejected(state, request.scope)
+    if (
+        request.operation.schema_ref.lifecycle != LifecycleClass.OWNED_JOB
+        or request.request_id is None
+    ):
+        return _rejected(state, request.scope)
+    identity = proof.value.registered_measurement
+    if event.expected_measurement != identity:
+        return _rejected(state, request.scope)
+    existing = tuple(
+        j
+        for j in state.registered_jobs
+        if j.request_id == request.request_id or j.operation_id == request.operation_id
+    )
+    if existing:
+        return (
+            AreaChange(state=state)
+            if len(existing) == 1
+            and existing[0].scope == request.scope
+            and existing[0].expected_measurement == identity
+            else _rejected(state, request.scope)
+        )
+    budgets = state.submission_budgets
+    if identity is not None:
+        matches = tuple(b for b in budgets if b.scope == request.scope and b.identity == identity)
+        if matches:
+            return _rejected(state, request.scope)
+        budgets = (
+            *budgets,
+            SubmissionBudget(
+                scope=request.scope,
+                identity=identity,
+                limit=1,
+                receipts=(PreparedSubmissionReceipt(request_id=request.request_id, ordinal=1),),
+            ),
+        )
+    job = RegisteredOwnedJob(
+        operation_id=request.operation_id,
+        expected_measurement=identity,
+        request_id=request.request_id,
+        scope=request.scope,
+        resource_pool=event.resource_pool,
+        # Its operation's answer names the job; until then that request is what moves it.
+        wait=WaitOn(requests=(request.request_id,)),
+    )
+    return AreaChange(
+        state=state.model_copy(
+            update={"registered_jobs": (*state.registered_jobs, job), "submission_budgets": budgets}
+        ),
+        requests=(inherit(request),),
+    )
+
+
+def _job_identity(job: OwnedJob | RegisteredOwnedJob) -> Verdict[MeasurementIdentity]:
+    if isinstance(job, OwnedJob):
+        return _identity(job.plan)
+    return (
+        Proven(job.expected_measurement)
+        if job.expected_measurement is not None
+        else Missing(ProofReason.ABSENT_DECLARATION)
+    )
+
+
+def _required_stages(identity: MeasurementIdentity, kind: EvidenceKind) -> frozenset[str]:
+    """Stages that must have passed before this kind of evidence can be trusted.
+
+    Correctness is gated by the plan's declared accuracy stage; a plan that declares
+    none requires every stage, and a benchmark rate always needs every stage.
+    """
+    if kind == EvidenceKind.CORRECTNESS and identity.accuracy_stage is not None:
+        return frozenset((identity.accuracy_stage,))
+    return frozenset(s.stage_id for s in identity.stages)
+
+
+def _scientific_evidence(
+    event: JobObserved | RegisteredJobObserved,
+    evidence: EvidenceRef,
+    identity: MeasurementIdentity,
+) -> Verdict[EvidenceRef]:
+    facts = event.evaluation_result
+    if evidence.status != ObservationStatus.SUCCEEDED:
+        return Proven(evidence)
+    if facts is None:
+        return Missing(ProofReason.INCOMPLETE_HISTORY)
+    outcomes = {stage.stage_id: stage.outcome for stage in facts.stages}
+    gated = evidence.kind in identity.accuracy_gated
+    unsound = (
+        # Scientific success cannot ride an execution that did not succeed.
+        event.observation.status != ObservationStatus.SUCCEEDED
+        or (gated and not facts.accuracy_passed)
+        or any(
+            outcomes.get(stage_id) != EvaluationStageOutcome.PASSED
+            for stage_id in _required_stages(identity, evidence.kind)
+        )
+        or (evidence.kind == EvidenceKind.BENCHMARK and facts.failed_benchmark is not None)
+    )
+    return Mismatch(ProofField.STATUS) if unsound else Proven(evidence)
+
+
+def _evidence(
+    job: OwnedJob | RegisteredOwnedJob,
+    event: JobObserved | RegisteredJobObserved,
+    evidence: EvidenceRef,
+) -> Verdict[EvidenceRef]:
+    observation = event.observation
+    identity = _job_identity(job)
+    if not isinstance(identity, Proven):
+        return identity
+    science = _scientific_evidence(event, evidence, identity.value)
+    expected = identity.value
+    request_id = job.submission_id if isinstance(job, OwnedJob) else job.request_id
+    checks = (
+        (ProofField.SCOPE, evidence.scope, job.scope),
+        (ProofField.REQUEST_ID, evidence.source_request, request_id),
+        (ProofField.REVISION, evidence.candidate, expected.candidate),
+        (ProofField.SEQUENCE, evidence.observation_sequence, observation.sequence),
+        (ProofField.PAYLOAD, evidence.purpose, expected.purpose),
+        (ProofField.DIGEST, evidence.evaluator_digest, expected.evaluator_digest),
+        (ProofField.DIGEST, evidence.workload_digest, expected.workload_digest),
+        (ProofField.DIGEST, evidence.environment_digest, expected.environment_digest),
+    )
+    for field, actual, canonical in checks:
+        if actual != canonical:
+            return Mismatch(field)
+    if (
+        not isinstance(science, Proven)
+        or not observation.accepted
+        or not observation.terminal
+        or observation.status in (ObservationStatus.UNKNOWN, ObservationStatus.PENDING)
+    ):
+        return Missing(ProofReason.UNRESOLVED)
+    if evidence.status in (ObservationStatus.UNKNOWN, ObservationStatus.PENDING):
+        return Missing(ProofReason.UNRESOLVED)
+    # Receipt status is scientific, and can differ from successful execution.
+    receipt_observation = observation.model_copy(update={"status": evidence.status})
+    if (
+        evidence.acceptance_receipt is not None
+        and evidence.acceptance_receipt.observation != receipt_observation
+    ):
+        return Mismatch(ProofField.PAYLOAD)
+    return Proven(
+        evidence.model_copy(
+            update={
+                "acceptance_receipt": EvidenceAcceptanceReceipt(observation=receipt_observation)
+            }
+        )
+    )
+
+
+def _observed_owner(
+    state: EvaluationState, context: EvaluationContext, event: JobObserved | RegisteredJobObserved
+) -> Verdict[OwnedJob | RegisteredOwnedJob]:
+    proof = _source(context, event.observation, later=isinstance(event, JobObserved))
+    if not isinstance(proof, Proven):
+        return proof
+    source = proof.value
+    rows = (
+        tuple(j for j in state.jobs if j.resource_id == event.resource_id)
+        if isinstance(event, JobObserved)
+        else tuple(j for j in state.registered_jobs if j.operation_id == event.operation_id)
+    )
+    if len(rows) != 1:
+        return Missing(ProofReason.ABSENT_RESOURCE)
+    job = rows[0]
+    binding = _job_source(state, context, job, source)
+    if not isinstance(binding, Proven):
+        return binding
+    if _resource_taken(state, event.observation, source.request_id):
+        return Mismatch(ProofField.RESOURCE_ID)
+    return _incoming_job(job, source, event)
+
+
+def _job_source(
+    state: EvaluationState,
+    context: EvaluationContext,
+    job: OwnedJob | RegisteredOwnedJob,
+    source: RequestRecord,
+) -> Verdict[OwnedJob | RegisteredOwnedJob]:
+    request_id = job.submission_id if isinstance(job, OwnedJob) else job.request_id
+    if request_id != source.request_id or job.scope != source.request.scope:
+        return Mismatch(ProofField.REQUEST_ID)
+    if isinstance(job, OwnedJob):
+        return _builtin_source(state, context, job, source)
+    if not isinstance(source.request, ExecuteRegisteredOperation):
+        return Mismatch(ProofField.LIFECYCLE)
+    origin = operation_for(context.run.receipts, source.request)
+    if not isinstance(origin, Proven):
+        return origin
+    return (
+        Proven(job)
+        if origin.value.registered_measurement == job.expected_measurement
+        else Mismatch(ProofField.NORMALIZATION)
+    )
+
+
+def _measure_origin(
+    state: EvaluationState,
+    context: EvaluationContext,
+    source: RequestRecord,
+    request: SubmitMeasurement,
+) -> Verdict[None]:
+    """Prove where a submission came from: an accepted Measure, or a recorded agent call.
+
+    An agent call has no decision. Core's own record of the call it admitted names the
+    request it allocated, so the same scope and request id prove the origin.
+    """
+    if request.decision_id is None:
+        admitted = any(
+            call.request_id == source.request_id and call.scope == request.scope
+            for call in state.agent_calls
+        )
+        return Proven(None) if admitted else Missing(ProofReason.ABSENT_RECEIPT)
+    receipt = accepted_receipt_for(context.run.receipts, request.decision_id, None)
+    if not isinstance(receipt, Proven):
+        return receipt
+    decision = receipt.value.decision
+    if (
+        not isinstance(decision, Measure)
+        or decision.scope != request.scope
+        or source.request_id not in receipt.value.request_ids
+    ):
+        return Mismatch(ProofField.REQUEST_ID)
+    resolved = _resolved_plan(context, request.scope, decision.plan)
+    if not isinstance(resolved, Proven):
+        return resolved
+    if resolved.value != request.plan:
+        return Mismatch(ProofField.PAYLOAD)
+    return Proven(None)
+
+
+def _builtin_source(
+    state: EvaluationState, context: EvaluationContext, job: OwnedJob, source: RequestRecord
+) -> Verdict[OwnedJob]:
+    request = source.request
+    if not isinstance(request, SubmitMeasurement) or request.plan != job.plan:
+        return Mismatch(ProofField.PAYLOAD)
+    origin = _measure_origin(state, context, source, request)
+    if not isinstance(origin, Proven):
+        return origin
+    budget = submission_budget_for(request, state.submission_budgets, context.run.receipts)
+    return Proven(job) if isinstance(budget, Proven) else budget
+
+
+def _incoming_job(
+    job: OwnedJob | RegisteredOwnedJob,
+    source: RequestRecord,
+    event: JobObserved | RegisteredJobObserved,
+) -> Verdict[OwnedJob | RegisteredOwnedJob]:
+    observation = event.observation
+    if observation.resource_id is None or (
+        job.resource_id is not None and observation.resource_id != job.resource_id
+    ):
+        return Mismatch(ProofField.RESOURCE_ID)
+    history = (job.observation,) if job.observation is not None else ()
+    proof = fresh_observation(history, observation, complete=True)
+    if not isinstance(proof, Proven):
+        return proof
+    if source.observation == observation and source.evaluation_result != event.evaluation_result:
+        return Mismatch(ProofField.PAYLOAD)
+    side = _side_facts(job, event)
+    if not isinstance(side, Proven):
+        return side
+    if job.observation is not None and (
+        observation.observed_at < job.observation.observed_at
+        or (
+            job.terminal
+            and (
+                not observation.terminal
+                or observation.status in (ObservationStatus.PENDING, ObservationStatus.UNKNOWN)
+            )
+        )
+        or (job.released and not observation.released)
+    ):
+        return Mismatch(ProofField.SEQUENCE)
+    return Proven(job)
+
+
+def _side_facts(
+    job: OwnedJob | RegisteredOwnedJob, event: JobObserved | RegisteredJobObserved
+) -> Verdict[OwnedJob | RegisteredOwnedJob]:
+    identity = _job_identity(job)
+    stages = {s.stage_id for s in identity.value.stages} if isinstance(identity, Proven) else set()
+    if (
+        event.progress is not None
+        and event.progress.stage_id is not None
+        and isinstance(identity, Proven)
+        and event.progress.stage_id not in stages
+    ):
+        return Mismatch(ProofField.PAYLOAD)
+    if event.evaluation_result is not None and (
+        not isinstance(identity, Proven)
+        or any(s.stage_id not in stages for s in event.evaluation_result.stages)
+    ):
+        return Mismatch(ProofField.PAYLOAD)
+    return Proven(job)
+
+
+def _store_evidence(
+    state: EvaluationState,
+    job: OwnedJob | RegisteredOwnedJob,
+    event: JobObserved | RegisteredJobObserved,
+) -> tuple[tuple[EvidenceRef, ...], tuple[EvidenceRef, ...], bool]:
+    """Accept evidence keyed by (source request, evidence id).
+
+    The same EvidenceId from two jobs is two records. A repeat of one key with
+    different content is refused, and the caller reports that refusal instead of
+    dropping it silently.
+    """
+    accepted = list(job.evidence)
+    ledger = list(state.evidence)
+    refused = False
+    for evidence in event.evidence:
+        verdict = _evidence(job, event, evidence)
+        if not isinstance(verdict, Proven):
+            continue
+        incoming = verdict.value
+        previous = next((e for e in ledger if e.key == incoming.key), None)
+        if previous is None:
+            ledger.append(incoming)
+            accepted.append(incoming)
+        elif previous != incoming:
+            refused = True
+        elif incoming not in accepted:
+            accepted.append(incoming)
+    return tuple(accepted), tuple(ledger), refused
+
+
+def _job_observed(
+    state: EvaluationState, context: EvaluationContext, event: JobObserved | RegisteredJobObserved
+) -> AreaChange[EvaluationState]:
+    owner = _observed_owner(state, context, event)
+    if not isinstance(owner, Proven):
+        # Unknown, foreign, early or stale observations carry unverified scope and
+        # identity, so they change nothing and tell the strategy nothing.
+        return AreaChange(state=state)
+    if owner.value.observation == event.observation:
+        return AreaChange(state=state)
+    job = owner.value
+    observation = event.observation
+    if observation.resource_id is None:
+        return AreaChange(state=state)
+    accepted, ledger, refused = _store_evidence(state, job, event)
+    previous = (
+        ObservedJobFacts(
+            resource_id=observation.resource_id,
+            observation=job.observation,
+            progress=job.progress,
+            evidence=job.evidence,
+        )
+        if job.observation is not None
+        else UnobservedJobFacts(resource_id=observation.resource_id)
+    )
+    updated = job.model_copy(
+        update={
+            "resource_id": observation.resource_id,
+            "observation": observation,
+            "progress": event.progress if event.progress is not None else job.progress,
+            "status": observation.status,
+            "terminal": observation.terminal,
+            "released": observation.released,
+            "children": tuple(dict.fromkeys((*job.children, *observation.children))),
+            "evidence": tuple(accepted),
+            **_next_poll(job, observation, context),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "jobs": tuple(updated if j == job else j for j in state.jobs)
+            if isinstance(job, OwnedJob)
+            else state.jobs,
+            "registered_jobs": tuple(updated if j == job else j for j in state.registered_jobs)
+            if isinstance(job, RegisteredOwnedJob)
+            else state.registered_jobs,
+            "evidence": tuple(ledger),
+        }
+    )
+    claim = _canonical_failure(
+        observation,
+        event.failure if isinstance(event, JobObserved) else None,
+        has_facts=event.evaluation_result is not None,
+    )
+    state = _job_budget(state, context, updated, claim)
+    wake = ContinuationJobsChanged(
+        resource_id=observation.resource_id, observation=observation, previous=previous
+    )
+    requests: tuple[Outbound, ...] = ()
+    events: tuple[MeasurementResult, ...] = ()
+    source_id = updated.submission_id if isinstance(updated, OwnedJob) else updated.request_id
+    reported = _reported_to_strategy(context, job)
+    if _conclusive(observation):
+        newly = tuple(e for e in accepted if e not in job.evidence)
+        # A refused evidence id is reported as an unclassified failure, never hidden.
+        failure = MeasurementFailure.UNKNOWN if refused else claim
+        if reported and not _conclusive(job.observation):
+            events = (
+                MeasurementResult(
+                    scope=job.scope,
+                    source_request=source_id,
+                    evidence=tuple(accepted),
+                    status=observation.status,
+                    failure=failure,
+                    diagnostic=observation.diagnostic[-MEASUREMENT_DIAGNOSTIC_LIMIT:],
+                ),
+            )
+        elif reported and (newly or refused):
+            # Late evidence is published once, as the delta, never replayed or dropped.
+            events = (
+                MeasurementResult(
+                    scope=job.scope,
+                    source_request=source_id,
+                    evidence=newly,
+                    status=observation.status,
+                    failure=failure,
+                    diagnostic=observation.diagnostic[-MEASUREMENT_DIAGNOSTIC_LIMIT:],
+                ),
+            )
+        # A cancel stop discards its run's jobs, so it collects nothing from them: a job the
+        # executor holds no record of cannot be collected from, and asking would hold the
+        # run closing for good.
+        if (
+            observation.accepted
+            and not updated.evidence
+            and _cancelling_scope(context) != job.scope
+        ):
+            collect = _job_request(CollectEvidence, updated, context, "evidence")
+            # One collection per job. A collection that yields nothing (a job that failed
+            # before producing evidence) is itself observed as a job event, and asking
+            # again on that event would never end.
+            if not context.records.positions(collect.request_id):
+                requests = (_job_outbound(CollectEvidence, updated, context, "evidence"),)
+    closing = _ended(context, job, event)
+    return AreaChange(
+        state=state,
+        # While the ledger still has to take the job's end as its submission's own, the
+        # history and the wake wait for it (see `_submission_observed`): both would read a
+        # history in which this submission is not closed.
+        signals=closing or (*_history_unless_awaited(state, context, job, event), wake),
+        requests=requests if context.run.status != RunStatus.TERMINAL else (),
+        events=events,
+    )
+
+
+def _ended(
+    context: EvaluationContext,
+    job: OwnedJob | RegisteredOwnedJob,
+    event: JobObserved | RegisteredJobObserved,
+) -> tuple[Signal, ...]:
+    """The job's first conclusive observation, handed to the ledger as its submission's own.
+
+    A job's observations carry its submission's request id and sequence, so the end of
+    the job is a fact about the submit request, with the terminal facts the history reads.
+    When the submit's own view was taken
+    while the job still ran, nothing else completes that record, and a closing run waits
+    for every open one. A submission the ledger already closed needs only the job's release:
+    one closed while its job still ran (blocked at its bound when the run closed) holds the
+    run closing until that is proved. One the ledger never dispatched cannot have been
+    observed.
+    """
+    if (
+        not isinstance(job, OwnedJob)
+        or not _conclusive(event.observation)
+        or _conclusive(job.observation)
+    ):
+        return ()
+    record = context.records.record(job.submission_id)
+    if record is None or record.phase == RequestPhase.PREPARED:
+        return ()
+    if record.phase == RequestPhase.COMPLETED and (
+        record.observation is None or record.observation.released or not event.observation.released
+    ):
+        return ()
+    return (
+        RequestObserved(observation=event.observation, evaluation_result=event.evaluation_result),
+    )
+
+
+def _next_poll(
+    job: OwnedJob | RegisteredOwnedJob, observation: Observation, context: EvaluationContext
+) -> dict[str, ObservePacing | WaitOn | None]:
+    """The pacing and wait of *job* after it took *observation*.
+
+    An ended job waits on nothing. A poll the executor could not answer (not accepted)
+    is retried after a backoff (``_backed_off``); after any other observation the job
+    waits one ``observe_interval`` from the run limits for its next poll.
+    """
+    if observation.terminal:
+        return {"pacing": ObservePacing(), "wait": None}
+    if not observation.accepted:
+        return _backed_off(job, context)
+    timer = context.run.now_at + context.run.limits.observe_interval
+    return {"pacing": ObservePacing(), "wait": WaitOn(timer=timer)}
+
+
+def _backed_off(
+    job: OwnedJob | RegisteredOwnedJob, context: EvaluationContext
+) -> dict[str, ObservePacing | WaitOn | None]:
+    """The job waits for a poll after a delay that doubles with each poll that did not move it.
+
+    It doubles from ``observe_interval`` up to ``observe_backoff_cap``, both run limits.
+    """
+    limits = context.run.limits
+    retries = job.pacing.retries + 1
+    delay = limits.observe_interval
+    for _ in range(retries - 1):
+        delay = min(delay * 2, limits.observe_backoff_cap)
+        if delay == limits.observe_backoff_cap:
+            break
+    return {
+        "pacing": ObservePacing(retries=retries),
+        "wait": WaitOn(timer=context.run.now_at + delay),
+    }
+
+
+def _poll(job: OwnedJob | RegisteredOwnedJob, context: EvaluationContext) -> Outbound:
+    """The next poll of *job*, under an identity no earlier poll used.
+
+    A poll is named by the observation it follows, so a poll that ended without the job
+    taking an answer (blocked at its bound, or refused) would share its successor's name;
+    the successor then counts on from it.
+    """
+    outbound = _job_outbound(ObserveOwnedJob, job, context, "observe")
+    base = outbound.request.request_id
+    if base is None or not context.records.positions(base):
+        return outbound
+    lapsed = 1
+    while context.records.positions(RequestId(root=f"{base.root}:b{lapsed}")):
+        lapsed += 1
+    identity = RequestId(root=f"{base.root}:b{lapsed}")
+    return outbound.model_copy(
+        update={"request": outbound.request.model_copy(update={"request_id": identity})}
+    )
+
+
+def _poll_due(
+    state: EvaluationState, context: EvaluationContext, event: ObservationsDue
+) -> AreaChange[EvaluationState]:
+    """Issue the poll of every job whose wait timer has come, once each; it then waits on it."""
+    if context.run.status == RunStatus.TERMINAL:
+        return AreaChange(state=state)
+    requests: list[Outbound] = []
+
+    def release[J: OwnedJob | RegisteredOwnedJob](job: J) -> J:
+        wait = job.wait
+        if wait is None or wait.timer is None or wait.timer > event.now_at:
+            return job
+        poll = _poll(job, context)
+        identity = poll.request.request_id
+        if identity is None:
+            raise ContractError(("job", "poll"), "a poll is named by its job")
+        requests.append(poll)
+        return job.model_copy(update={"wait": WaitOn(requests=(identity,))})
+
+    state = state.model_copy(
+        update={
+            "jobs": tuple(release(job) for job in state.jobs),
+            "registered_jobs": tuple(release(job) for job in state.registered_jobs),
+        }
+    )
+    return AreaChange(state=state, requests=tuple(requests))
+
+
+def _job_wait_ended(
+    state: EvaluationState, context: EvaluationContext, event: ObservationsDue | JobWaitLapsed
+) -> AreaChange[EvaluationState]:
+    """What a job's wait ends with: its poll timer came, or the request it named ended."""
+    if isinstance(event, ObservationsDue):
+        return _poll_due(state, context, event)
+    return _wait_lapsed(state, context, event)
+
+
+def _wait_lapsed(
+    state: EvaluationState, context: EvaluationContext, event: JobWaitLapsed
+) -> AreaChange[EvaluationState]:
+    """A job whose poll ended without moving it polls again after its backoff.
+
+    The poll blocked at its bound (the executor never answered in time, or the host was
+    down past it) or the job refused its answer. A registered job whose operation ended
+    without ever naming a job has nothing to poll: it ends with what that request reported,
+    and its release is proved from that record like any other.
+    """
+
+    def woken[J: OwnedJob | RegisteredOwnedJob](job: J) -> J:
+        if _owner_request(job) != event.job or job.wait is None:
+            return job
+        ended = context.records.record(event.request_id)
+        if event.request_id not in job.wait.requests or ended is None or _open(ended):
+            return job
+        if job.resource_id is not None:
+            return job.model_copy(update=_backed_off(job, context))
+        observation = ended.observation
+        return job.model_copy(
+            update={
+                "status": ObservationStatus.UNKNOWN if observation is None else observation.status,
+                "terminal": True,
+                "released": observation is not None and observation.released,
+                "wait": None,
+            }
+        )
+
+    return AreaChange(
+        state=state.model_copy(
+            update={
+                "jobs": tuple(woken(job) for job in state.jobs),
+                "registered_jobs": tuple(woken(job) for job in state.registered_jobs),
+            }
+        )
+    )
+
+
+def _open(record: RequestRecord) -> bool:
+    return record.phase in (
+        RequestPhase.PREPARED,
+        RequestPhase.DISPATCHED,
+        RequestPhase.RECONCILING,
+    )
+
+
+def _job_budget(
+    state: EvaluationState,
+    context: EvaluationContext,
+    job: OwnedJob | RegisteredOwnedJob,
+    claim: MeasurementFailure | None = None,
+) -> EvaluationState:
+    if job.observation is None:
+        return state
+    source_id = job.submission_id if isinstance(job, OwnedJob) else job.request_id
+    source = context.records.record(source_id)
+    if source is None or not isinstance(
+        source.request, SubmitMeasurement | ExecuteRegisteredOperation
+    ):
+        return state
+    proof = submission_budget_for(source.request, state.submission_budgets, context.run.receipts)
+    if not isinstance(proof, Proven):
+        return state
+    receipt = next(
+        (
+            r
+            for r in proof.value.receipts
+            if isinstance(r, PreparedSubmissionReceipt) and r.request_id == source_id
+        ),
+        None,
+    )
+    updated = _submission_receipt(
+        proof.value,
+        MeasurementSubmissionObserved(
+            observation=job.observation,
+            failure=(receipt.failure if receipt is not None else None) or claim,
+        ),
+        source,
+    )
+    return (
+        state.model_copy(
+            update={
+                "submission_budgets": tuple(
+                    updated.value if b == proof.value else b for b in state.submission_budgets
+                )
+            }
+        )
+        if isinstance(updated, Proven)
+        else state
+    )
+
+
+def _history_unless_awaited(
+    state: EvaluationState,
+    context: EvaluationContext,
+    job: OwnedJob | RegisteredOwnedJob,
+    event: JobObserved | RegisteredJobObserved,
+) -> tuple[AttemptEvaluationHistoryUpdated, ...]:
+    """The history signal, unless the continuation this job's end wakes publishes it itself."""
+    if (
+        job.resource_id is not None
+        and _conclusive(event.observation)
+        and _awaited(state, job.resource_id)
+    ):
+        return ()
+    return _history_signals(state, context, job.scope)
+
+
+def _history_signals(
+    state: EvaluationState, context: EvaluationContext, scope: Scope
+) -> tuple[AttemptEvaluationHistoryUpdated, ...]:
+    if not isinstance(scope.owner, AttemptId):
+        return ()
+    owner = next(
+        (
+            o
+            for o in context.attempts.attempts
+            if o.attempt_id == scope.owner and o.generation == scope.generation
+        ),
+        None,
+    )
+    if owner is None:
+        return ()
+    history = produce_history(scope, state, context.records, owner, context.run)
+    if history == owner.evaluation_history or any(
+        record not in history.records for record in owner.evaluation_history.records
+    ):
+        return ()
+    return (
+        AttemptEvaluationHistoryUpdated(
+            attempt=AttemptRef(attempt_id=owner.attempt_id, generation=owner.generation),
+            history=history,
+        ),
+    )
+
+
+#: The step that ends a job the executor has not confirmed: an inspection, before any cancel.
+_TERMINATION_INSPECT = "inspect"
+
+
+def _step_prefix(job: OwnedJob | RegisteredOwnedJob, action: str) -> str:
+    """The request id of *action* on *job*, without the observation sequence it may name."""
+    source = job.submission_id if isinstance(job, OwnedJob) else job.request_id
+    return f"measurement:{source.root}:{action}"
+
+
+def _job_request(
+    model: type[ObserveOwnedJob]
+    | type[InspectOwnedJob]
+    | type[CancelOwnedJob]
+    | type[CollectEvidence],
+    job: OwnedJob | RegisteredOwnedJob,
+    context: EvaluationContext,
+    action: str,
+) -> Request:
+    if job.resource_id is None:
+        raise ContractError(("job", "resource_id"), "cannot request an unidentified job")
+    source = job.submission_id if isinstance(job, OwnedJob) else job.request_id
+    observation = job.observation
+    sequence = observation.sequence if observation is not None else 0
+    # Evidence is collected once per job, so its id does not name an observation.
+    suffix = "" if model is CollectEvidence else f":{sequence}"
+    canonical = context.records.record(source)
+    # A step on a job is the job's own, whoever asks for it: a poll raised by the clock, a
+    # stop, a drain and a late observation all name the submission's decision. Left to the
+    # asker, two events asking for one step at one instant stamp it differently and the one
+    # request id would carry two payloads.
+    inherited = (
+        canonical.request if canonical is not None and model is not CollectEvidence else None
+    )
+    return model(
+        request_id=RequestId(root=f"{_step_prefix(job, action)}{suffix}"),
+        scope=job.scope,
+        admission_id=canonical.request.admission_id if canonical is not None else None,
+        decision_id=inherited.decision_id if inherited is not None else None,
+        resource_id=job.resource_id,
+    )
+
+
+def _job_outbound(
+    model: type[ObserveOwnedJob]
+    | type[InspectOwnedJob]
+    | type[CancelOwnedJob]
+    | type[CollectEvidence],
+    job: OwnedJob | RegisteredOwnedJob,
+    context: EvaluationContext,
+    action: str,
+) -> Outbound:
+    """A job request with the bound its kind gets: cancellation or reconciliation."""
+    limits = context.run.limits
+    bound = limits.cancellation_bound if model is CancelOwnedJob else limits.reconciliation_bound
+    return within(_job_request(model, job, context, action), bound)
+
+
+def _terminate(
+    state: EvaluationState,
+    context: EvaluationContext,
+    resource: ResourceId,
+    *,
+    cancel_unconfirmed: bool = False,
+) -> AreaChange[EvaluationState]:
+    rows = tuple(j for j in (*state.jobs, *state.registered_jobs) if j.resource_id == resource)
+    if len(rows) != 1:
+        return AreaChange(state=state)
+    job = rows[0]
+    if isinstance(released_owner(job, context.records.records), Proven):
+        return AreaChange(state=state)
+    source_id = job.submission_id if isinstance(job, OwnedJob) else job.request_id
+    source = context.records.record(source_id)
+    if (
+        source is None
+        or not isinstance(request_matches(source, source.request), Proven)
+        or not isinstance(_job_source(state, context, job, source), Proven)
+    ):
+        return AreaChange(state=state)
+    return _termination(
+        state, context, _next_step(job, context, cancel_unconfirmed=cancel_unconfirmed)
+    )
+
+
+def _next_step(
+    job: OwnedJob | RegisteredOwnedJob, context: EvaluationContext, *, cancel_unconfirmed: bool
+) -> Outbound:
+    """The one step that moves *job* toward its end, given what the executor has confirmed."""
+    unconfirmed = (
+        job.observation is None
+        or job.observation.status == ObservationStatus.UNKNOWN
+        or not job.observation.accepted
+    )
+    if unconfirmed and not (cancel_unconfirmed and job.observation is not None):
+        return _job_outbound(InspectOwnedJob, job, context, _TERMINATION_INSPECT)
+    if job.terminal:
+        return _job_outbound(InspectOwnedJob, job, context, "release")
+    return _job_outbound(CancelOwnedJob, job, context, "cancel")
+
+
+def _termination(
+    state: EvaluationState, context: EvaluationContext, outbound: Outbound
+) -> AreaChange[EvaluationState]:
+    """Ask for a termination step once: the request id names the job's step, not the asker.
+
+    The stop, a drain, a termination request and a late observation can all want the same
+    step at the same instant. Each would stamp it with its own decision, and one id may not
+    carry two payloads, so a step already on the ledger is the job's one outstanding intent.
+    """
+    request_id = outbound.request.request_id
+    if context.records.positions(request_id):
+        return AreaChange(state=state)
+    return AreaChange(state=state, requests=(outbound,))
+
+
+def _drain(
+    state: EvaluationState, context: EvaluationContext, event: JobsDrainRequested
+) -> AreaChange[EvaluationState]:
+    owners = tuple(
+        o
+        for o in context.attempts.attempts
+        if o.attempt_id == event.scope.owner and o.generation == event.scope.generation
+    )
+    if len(owners) != 1:
+        return AreaChange(state=state)
+    owner = owners[0]
+    proof = current_closure(owner, owner.closure)
+    authority = context.records.record(event.authority)
+    if (
+        not isinstance(proof, Proven)
+        or proof.value.authority != event.authority
+        or proof.value.disposition != event.disposition
+    ):
+        return AreaChange(state=state)
+    if (
+        authority is None
+        or not isinstance(authority.request, CloseAttemptScope)
+        or not isinstance(request_matches(authority, authority.request), Proven)
+        or authority.request.scope != event.scope
+    ):
+        return AreaChange(state=state)
+    requests = tuple(
+        request
+        for job in (*state.jobs, *state.registered_jobs)
+        if job.scope == event.scope and job.resource_id is not None
+        for request in _terminate(state, context, job.resource_id).requests
+    )
+    return AreaChange(state=state, requests=requests)
+
+
+def _cancelling_scope(context: EvaluationContext) -> Scope | None:
+    """The scope whose jobs a closing run cancels: under a cancel stop, or past its deadline.
+
+    A drain lets the run's own jobs finish, but only while the run has time left. From the
+    run deadline on nothing is waited for, as for an attempt's queued episodes (scheduling
+    retires them with a cancel then), so a job that never ends cannot hold the run closing.
+    """
+    match committed_stop(context.run):
+        case Proven(value=stop) if context.run.status == RunStatus.CLOSING and (
+            stop.mode == "cancel" or context.run.now_at >= context.run.deadline_at
+        ):
+            return stop.scope
+        case _:
+            return None
+
+
+def _cancel_requested(context: EvaluationContext, resource: ResourceId) -> bool:
+    """Whether core is done asking to cancel *resource*: one cancel is open or was answered.
+
+    A cancel blocked at its bound proved nothing: the executor's cancel failed or its outcome
+    is unknown, and the job may still run. It does not count, so the job's next observation
+    asks for a new cancel (its id names that observation) instead of holding the run closing
+    until the job ends by itself. The backend's ``request_retries.limit`` bounds those
+    re-sends; past it core waits for the job's own end, as it did before any retry.
+    """
+    cancels = tuple(
+        row
+        for row in context.records.about_resource(resource)
+        if isinstance(row.request, CancelOwnedJob)
+    )
+    blocked = sum(1 for row in cancels if row.phase == RequestPhase.BLOCKED)
+    return blocked < len(cancels) or blocked > context.run.limits.request_retries.limit
+
+
+def _known(job: OwnedJob | RegisteredOwnedJob) -> bool:
+    """Whether the executor has confirmed the job, so that the next step is a cancellation."""
+    return (
+        job.observation is not None
+        and job.observation.accepted
+        and job.observation.status != ObservationStatus.UNKNOWN
+    )
+
+
+def _inspected(context: EvaluationContext, resource: ResourceId) -> bool:
+    return any(
+        isinstance(row.request, InspectOwnedJob) for row in context.records.about_resource(resource)
+    )
+
+
+def _termination_inspected(context: EvaluationContext, job: OwnedJob | RegisteredOwnedJob) -> bool:
+    """Whether core already asked to end *job* and, finding it unconfirmed, inspected it."""
+    if job.resource_id is None:
+        return False
+    prefix = f"{_step_prefix(job, _TERMINATION_INSPECT)}:"
+    return any(
+        isinstance(row.request, InspectOwnedJob) and row.request_id.root.startswith(prefix)
+        for row in context.records.about_resource(job.resource_id)
+    )
+
+
+def _closing_scopes(context: EvaluationContext) -> frozenset[Scope]:
+    """The scopes of the attempts whose closure is proved: closing drains their jobs."""
+    return frozenset(
+        Scope(owner=owner.attempt_id, generation=owner.generation)
+        for owner in context.attempts.attempts
+        if owner.closure is not None and isinstance(current_closure(owner, owner.closure), Proven)
+    )
+
+
+def _cancel_scope_jobs(
+    state: EvaluationState, context: EvaluationContext, scope: Scope | None
+) -> AreaChange[EvaluationState]:
+    """Move every live job core is ending one step on, at most one cancellation per job.
+
+    Core ends every job of an attempt whose closure is proved (the drain asks once, when
+    the closure is requested, and may find the close request not yet on the ledger), every
+    job it already asked to terminate (a continuation's deadline, a retirement), and every
+    job *scope* owns: the run's own jobs (its input baseline) have no attempt to close, so
+    ``_cancelling_scope`` ends them. Applied when a cancel stop commits and again as each
+    job is observed or its poll falls due.
+
+    A job the executor does not confirm cannot be cancelled by name, so core inspects it
+    once. If it is still unconfirmed after that, whether the executor holds no record of it
+    or cannot say, core cancels it anyway: a cancellation is idempotent, and the executor
+    answers it for a job that never began exactly as for one it ended. Waiting for a
+    confirmation that may never come would hold the run closing until its budget ran out.
+    """
+    closing = _closing_scopes(context)
+    requests = tuple(
+        request
+        for job in (*state.jobs, *state.registered_jobs)
+        if job.resource_id is not None
+        and not job.terminal
+        and not _cancel_requested(context, job.resource_id)
+        and (job.scope == scope or job.scope in closing or _termination_inspected(context, job))
+        for request in _terminate(
+            state, context, job.resource_id, cancel_unconfirmed=_inspected(context, job.resource_id)
+        ).requests
+    )
+    return AreaChange(state=state, requests=requests)
+
+
+def _run_jobs_cancel(
+    state: EvaluationState, context: EvaluationContext, event: RunJobsCancelRequested
+) -> AreaChange[EvaluationState]:
+    match committed_stop(context.run):
+        case Proven(value=stop) if stop.decision_id == event.authority:
+            pass
+        case _:
+            return AreaChange(state=state)
+    if _cancelling_scope(context) != event.scope:
+        return AreaChange(state=state)
+    return _cancel_scope_jobs(state, context, event.scope)
+
+
+def _cancelled_after_stop(
+    change: AreaChange[EvaluationState], context: EvaluationContext
+) -> AreaChange[EvaluationState]:
+    """Keep ending the jobs core is ending as they are observed (see ``_cancel_scope_jobs``)."""
+    if context.run.status == RunStatus.TERMINAL:
+        return change
+    cancels = _cancel_scope_jobs(change.state, context, _cancelling_scope(context))
+    if not cancels.requests:
+        return change
+    return change.model_copy(update={"requests": (*change.requests, *cancels.requests)})
+
+
+def advance(
+    state: EvaluationState, context: EvaluationContext, event: EvaluationEvent
+) -> AreaChange[EvaluationState]:
+    """Preserve sibling continuations while consuming every measurement event."""
+    match event:
+        case MeasurementRequested():
+            change = _requested(state, context, event)
+        case AgentMeasurementRequested():
+            change = _agent_requested(state, context, event)
+        case MeasurementSubmissionObserved():
+            change = _cancelled_after_stop(_submission_observed(state, context, event), context)
+        case RegisteredJobRequested():
+            change = _registered_requested(state, context, event)
+        case JobObserved() | RegisteredJobObserved():
+            change = _cancelled_after_stop(_job_observed(state, context, event), context)
+        case ObservationsDue() | JobWaitLapsed():
+            change = _cancelled_after_stop(_job_wait_ended(state, context, event), context)
+        case JobTerminationRequested():
+            change = _terminate(state, context, event.resource_id)
+        case JobsDrainRequested():
+            change = _drain(state, context, event)
+        case RunJobsCancelRequested():
+            change = _run_jobs_cancel(state, context, event)
+        case _:
+            raise ContractError(("event", event.kind), "not a measurement event")
+    return change

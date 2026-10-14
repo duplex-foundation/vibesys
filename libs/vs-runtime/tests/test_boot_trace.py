@@ -1,0 +1,201 @@
+"""Public contract tests for the runtime boot-trace facility.
+
+``vs_runtime.api.boot_trace`` times the boot stages that run before a ``RunLogger``
+exists (``main.py``'s dispatch preamble, ``context.py``'s assembly) and
+buffers their lines until a consumer drains them into the run log. See
+``tests/vibesys/test_context.py`` for the integration test that exercises the drain
+through a real ``open_run_resources`` call.
+"""
+
+from collections.abc import Iterator
+
+import pytest
+from hypothesis import given
+from hypothesis import strategies as st
+
+from vs_runtime.api import boot_trace
+from vs_sim.api.testing import ManualClock
+
+_EPOCH_S = 1_800_000_000
+
+
+@pytest.fixture(autouse=True)
+def quiet_and_empty(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Start each test with the trace off and nothing left buffered, on virtual clocks."""
+    monkeypatch.delenv(boot_trace.BOOT_TRACE_ENV, raising=False)
+    boot_trace.install(boot_trace.BootTrace(wall=ManualClock(_EPOCH_S), elapsed=ManualClock()))
+    yield
+    boot_trace.install(None)
+
+
+def test_span_records_one_line_per_span() -> None:
+    with boot_trace.span("parse_cli_invocation"):
+        pass
+
+    lines = boot_trace.drain_log_lines()
+    assert len(lines) == 1
+    assert lines[0].startswith("boot span parse_cli_invocation: ")
+    assert lines[0].endswith("ms")
+
+
+def test_nested_spans_qualify_names_and_report_children_first() -> None:
+    with boot_trace.span("dispatch"):
+        with boot_trace.span("parse_cli_invocation"):
+            pass
+        with boot_trace.span("run_started_event"):
+            pass
+
+    names = [line.split(":")[0] for line in boot_trace.drain_log_lines()]
+    assert names == [
+        "boot span dispatch.parse_cli_invocation",
+        "boot span dispatch.run_started_event",
+        "boot span dispatch",
+    ]
+
+
+def test_sibling_spans_after_a_nest_are_not_qualified_by_it() -> None:
+    """The stack unwinds, so a later span is not a child of an earlier one."""
+    with boot_trace.span("dispatch"), boot_trace.span("parse_cli_invocation"):
+        pass
+    with boot_trace.span("context"):
+        pass
+
+    names = [line.split(":")[0] for line in boot_trace.drain_log_lines()]
+    assert names == [
+        "boot span dispatch.parse_cli_invocation",
+        "boot span dispatch",
+        "boot span context",
+    ]
+
+
+def test_a_raising_span_is_recorded_and_the_exception_propagates() -> None:
+    def open_project() -> None:
+        with boot_trace.span("project_open"):
+            raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"), boot_trace.span("context"):
+        open_project()
+
+    lines = boot_trace.drain_log_lines()
+    assert [line.split(":")[0] for line in lines] == [
+        "boot span context.project_open",
+        "boot span context",
+    ]
+    assert all(line.endswith("(raised ValueError)") for line in lines)
+
+
+def test_traced_decorator_times_the_whole_call() -> None:
+    @boot_trace.traced("load_config_and_skills")
+    def load(value: int) -> int:
+        return value + 1
+
+    assert load(1) == 2
+
+    lines = boot_trace.drain_log_lines()
+    assert len(lines) == 1
+    assert lines[0].startswith("boot span load_config_and_skills: ")
+
+
+def test_drain_clears_the_buffer() -> None:
+    with boot_trace.span("first"):
+        pass
+    boot_trace.drain_log_lines()
+    with boot_trace.span("second"):
+        pass
+
+    assert [line.split(":")[0] for line in boot_trace.drain_log_lines()] == ["boot span second"]
+
+
+def test_spans_are_silent_on_stderr_by_default(capfd: pytest.CaptureFixture[str]) -> None:
+    with boot_trace.span("context"):
+        pass
+
+    assert capfd.readouterr().err == ""
+    assert boot_trace.drain_log_lines() != []  # still recorded for the run log
+
+
+def test_boot_trace_env_echoes_spans_to_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv(boot_trace.BOOT_TRACE_ENV, "1")
+
+    with boot_trace.span("context"):
+        pass
+
+    assert "boot span context: " in capfd.readouterr().err
+    assert boot_trace.drain_log_lines() != []
+
+
+@pytest.mark.parametrize("value", ["", "0", "true", "yes"])
+def test_only_the_exact_value_one_enables_the_stderr_echo(
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv(boot_trace.BOOT_TRACE_ENV, value)
+
+    with boot_trace.span("context"):
+        pass
+
+    assert capfd.readouterr().err == ""
+    assert boot_trace.trace_enabled() is False
+
+
+def test_child_env_carries_the_launch_anchor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(boot_trace.BOOT_TRACE_ENV, raising=False)
+    boot_trace.mark_launch()
+
+    env = boot_trace.child_env()
+
+    assert set(env) == {boot_trace.LAUNCH_START_ENV}
+    assert int(env[boot_trace.LAUNCH_START_ENV]) == _EPOCH_S * 1000
+
+
+def test_child_env_anchors_even_without_mark_launch() -> None:
+    """A spawn that skipped ``mark_launch`` still ships an anchor."""
+    assert int(boot_trace.child_env()[boot_trace.LAUNCH_START_ENV]) == _EPOCH_S * 1000
+
+
+def test_before_install_a_span_runs_its_body_and_records_nothing() -> None:
+    boot_trace.install(None)
+    ran: list[str] = []
+
+    with boot_trace.span("context"):
+        ran.append("body")
+
+    assert (ran, boot_trace.drain_log_lines()) == (["body"], [])
+
+
+def test_the_launch_anchor_needs_an_installed_trace() -> None:
+    boot_trace.install(None)
+
+    with pytest.raises(RuntimeError, match="no boot trace is installed"):
+        boot_trace.child_env()
+
+
+def test_child_env_propagates_the_trace_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(boot_trace.BOOT_TRACE_ENV, "1")
+
+    assert boot_trace.child_env()[boot_trace.BOOT_TRACE_ENV] == "1"
+
+
+@given(elapsed_ms=st.integers(min_value=0, max_value=100_000))
+def test_a_span_reports_the_time_its_clock_advanced(elapsed_ms: int) -> None:
+    clock = ManualClock()
+    trace = boot_trace.BootTrace(wall=ManualClock(), elapsed=clock)
+
+    with trace.span("stage"):
+        clock.advance(elapsed_ms / 1000)
+
+    assert trace.drain() == [f"boot span stage: {elapsed_ms}ms"]
+
+
+@given(epoch_s=st.integers(min_value=1, max_value=4_000_000_000))
+def test_the_launch_anchor_is_the_wall_clock_in_milliseconds(epoch_s: int) -> None:
+    wall = ManualClock(epoch_s)
+    trace = boot_trace.BootTrace(wall=wall, elapsed=ManualClock())
+
+    assert trace.mark_launch() == epoch_s * 1000
+    wall.advance(60)
+    assert trace.launched_at_ms() == epoch_s * 1000

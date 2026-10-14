@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path  # noqa: TC003  # tracked: #288
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from datetime import datetime
+    from pathlib import Path
 
 
 class RepositoryVisibility(StrEnum):
@@ -23,14 +26,14 @@ REPOSITORY_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 def generate_experiment_name(
     input_path: Path | None,
     *,
-    now: datetime | None = None,
+    now: datetime,
 ) -> str:
     """Generate a readable, collision-resistant name for an interactive run."""
     source_name = input_path.name if input_path is not None else "experiment"
     base = re.sub(r"[^A-Za-z0-9_.-]+", "-", source_name).strip("-._").lower()
     if not base:
         base = "experiment"
-    timestamp = (now or datetime.now(UTC)).strftime("%Y%m%d-%H%M%S")
+    timestamp = now.strftime("%Y%m%d-%H%M%S")
     return f"{base}-{timestamp}"
 
 
@@ -42,10 +45,8 @@ def validate_experiment_name(experiment_name: str) -> str:
         or "/" in experiment_name
         or "\\" in experiment_name
     ):
-        raise ValueError(  # noqa: TRY003  # tracked: #288
-            "--exp-name must be a non-empty single path component other than '.' or '..': "
-            f"{experiment_name!r}"
-        )
+        message = f"--exp-name must be a non-empty single path component other than '.' or '..': {experiment_name!r}"
+        raise ValueError(message)
     return experiment_name
 
 

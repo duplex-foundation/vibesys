@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=70.1", "wheel>=0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vs-agent"
+version = "0.1.0"
+description = "Agent sessions, drivers, skills and structured turns"
+requires-python = ">=3.12"
+dependencies = [
+    "agentshim>=0.15.7,<0.16",
+    "pydantic>=2",
+    "vs-faults",
+    "vs-mcp",
+    "vs-project",
+    "vs-prompts",
+    "vs-sandbox",
+    "vs-sim",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vs_agent = ["py.typed", "images/features/src/*/*", "images/features/test/*/*"]
+
+[tool.uv.sources]
+vs-faults = { workspace = true }
+vs-mcp = { workspace = true }
+vs-project = { workspace = true }
+vs-prompts = { workspace = true }
+vs-sandbox = { workspace = true }
+vs-sim = { workspace = true }

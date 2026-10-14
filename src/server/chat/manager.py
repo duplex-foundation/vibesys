@@ -3,26 +3,27 @@
 from __future__ import annotations
 
 import threading
-import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import Future
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING
 
 from server.events import (
     ChatData,
     ChatThreadCreatedData,
+    ChatThreadId,
     EventHeader,
     EventStatus,
     EventType,
     RunEvent,
 )
+from vs_sim.api import OsThreads
 
 if TYPE_CHECKING:
     from server.chat.options import ChatRunSettings
-    from server.journal import EventJournal
+    from server.journal import WireJournal
     from server.run_lifecycle import RunStatus
+    from vs_sim.api import Condition, Lock, Threads
 
 _CHAT_DRAIN_TIMEOUT_SECONDS = 5.0
 _CHAT_THREAD_TITLE_MAX_CHARS = 40
@@ -63,7 +64,7 @@ class ChatThreadHandle:
     close: Callable[[], None] = _noop_thread_close
 
 
-ChatThreadFactory = Callable[[str, str | None, str | None, str | None], ChatThreadHandle]
+ChatThreadFactory = Callable[[ChatThreadId, str | None, str | None], ChatThreadHandle]
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,7 @@ class _ThreadRoute:
     """One installed handler and the lock serializing its turns."""
 
     handler: Callable[[str], ChatAnswer]
-    turn_lock: threading.Lock
+    turn_lock: Lock
 
 
 @dataclass(frozen=True)
@@ -79,14 +80,53 @@ class _ThreadLease:
     """A callable route whose turn lock and teardown lease are held."""
 
     handler: Callable[[str], ChatAnswer]
-    turn_lock: threading.Lock
+    turn_lock: Lock
 
     def __call__(self, text: str) -> ChatAnswer:
         """Invoke the leased route."""
         return self.handler(text)
 
 
-_ThreadRestoration: TypeAlias = Future[_ThreadRoute]
+class _ThreadRestoration:
+    """The outcome of one thread restoration, awaited by every caller that joined it.
+
+    Built on the injected ``Threads`` event so the wait is visible to a simulator.
+    """
+
+    def __init__(self, threads: Threads) -> None:
+        self._done = threads.event()
+        self._outcome: _ThreadRoute | BaseException | None = None
+
+    def set_result(self, route: _ThreadRoute) -> None:
+        """Publish the restored route and wake every waiter."""
+        self._outcome = route
+        self._done.set()
+
+    def set_exception(self, error: BaseException) -> None:
+        """Publish the failure and wake every waiter."""
+        self._outcome = error
+        self._done.set()
+
+    def result(self) -> _ThreadRoute:
+        """Wait for the outcome; raise the restoration's failure."""
+        self._done.wait()
+        outcome = self._outcome
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome is None:
+            message = "restoration ended without an outcome"
+            raise RuntimeError(message)
+        return outcome
+
+
+@dataclass(frozen=True)
+class _ThreadRestorationClaim:
+    """State reserved under the chat lock before one caller restores a thread."""
+
+    spec: ChatThreadCreatedData
+    factory: ChatThreadFactory
+    restoration: _ThreadRestoration
+    should_restore: bool
 
 
 class _ThreadsDrainingError(RuntimeError):
@@ -98,22 +138,30 @@ class ChatManager:
 
     def __init__(
         self,
-        condition: threading.Condition,
-        journal: EventJournal,
+        condition: Condition,
+        journal: WireJournal,
         *,
         run_status: Callable[[], RunStatus],
+        drain_timeout_seconds: float = _CHAT_DRAIN_TIMEOUT_SECONDS,
+        threads: Threads | None = None,
     ) -> None:
-        """Initialize chat routing over the shared server condition and journal."""
+        """Initialize chat routing over the shared server condition and journal.
+
+        ``drain_timeout_seconds`` bounds how long closing the terminal resource
+        waits for an answer in flight before it defers the close.
+        """
         self._condition = condition
+        self._threads = threads or OsThreads()
+        self._drain_timeout_seconds = drain_timeout_seconds
         self._journal = journal
         self._run_status = run_status
         self._chat_response_local = _ChatResponseLocal()
         self._fallback_answer: Callable[[str], str] | None = None
         self._default_handler: Callable[[str], ChatAnswer] | None = None
         self._thread_factory: ChatThreadFactory | None = None
-        self._thread_handlers: dict[str, _ThreadRoute] = {}
-        self._thread_restorations: dict[str, _ThreadRestoration] = {}
-        self._thread_specs: dict[str, ChatThreadCreatedData] = {}
+        self._thread_handlers: dict[ChatThreadId, _ThreadRoute] = {}
+        self._thread_restorations: dict[ChatThreadId, _ThreadRestoration] = {}
+        self._thread_specs: dict[ChatThreadId, ChatThreadCreatedData] = {}
         self._run_settings: ChatRunSettings | None = None
         self._active_default_calls = 0
         self._active_thread_calls = 0
@@ -159,7 +207,7 @@ class ChatManager:
         with self._condition:
             return self._default_handler is not None
 
-    def chat(self, text: str, thread_id: str | None = None) -> str:
+    def chat(self, text: str, thread_id: ChatThreadId | None = None) -> str:
         """Answer and record a question on the default or selected thread."""
         if thread_id is not None:
             return self._thread_chat(text, thread_id)
@@ -198,7 +246,7 @@ class ChatManager:
                 self._release_default_call()
 
     def chat_with_event(
-        self, text: str, thread_id: str | None = None
+        self, text: str, thread_id: ChatThreadId | None = None
     ) -> tuple[str, RunEvent | None]:
         """Answer a question and return its synchronously folded terminal event."""
         captures = self._chat_response_local.captures
@@ -212,7 +260,6 @@ class ChatManager:
     def create_thread(
         self,
         *,
-        driver: str | None = None,
         provider: str | None = None,
         model: str | None = None,
         title: str | None = None,
@@ -223,12 +270,12 @@ class ChatManager:
             if factory is not None:
                 self._active_thread_calls += 1
         if factory is None:
-            raise RuntimeError(  # noqa: TRY003  # Report current run availability.
-                "Experiment chat threads are not available for this run "
-                f"({self._unavailable_reason()})"
+            message = f"Experiment chat threads are not available for this run ({self._unavailable_reason()})"
+            raise RuntimeError(  # Report current run availability.
+                message
             )
         try:
-            handle = factory(uuid.uuid4().hex, driver, provider, model)
+            handle = factory(uuid.uuid4().hex, provider, model)
             spec = handle.spec
             if title is not None and title.strip():
                 spec = spec.model_copy(update={"title": title.strip()})
@@ -237,7 +284,7 @@ class ChatManager:
                 if accepting:
                     self._thread_specs[spec.thread_id] = spec
                     self._thread_handlers[spec.thread_id] = _ThreadRoute(
-                        handle.handler, threading.Lock()
+                        handle.handler, self._threads.lock()
                     )
             if not accepting:
                 handle.close()
@@ -312,8 +359,9 @@ class ChatManager:
             if not self._retain_terminal:
                 return False
             if self._terminal_resource is not None:
-                raise RuntimeError(  # noqa: TRY003  # This invariant has no input value.
-                    "Terminal chat resources are already retained"
+                message = "Terminal chat resources are already retained"
+                raise RuntimeError(  # This invariant has no input value.
+                    message
                 )
             self._terminal_resource = resource
             self._default_handler = resource.handler
@@ -329,14 +377,14 @@ class ChatManager:
                 self._default_handler = None
             if resource is not None and not self._wait_locked(
                 lambda: self._active_default_calls > 0,
-                timeout=_CHAT_DRAIN_TIMEOUT_SECONDS,
+                timeout=self._drain_timeout_seconds,
             ):
                 self._retired_terminal_resource = resource
                 resource = None
         if resource is not None:
             resource.close()
 
-    def _thread_chat(self, text: str, thread_id: str) -> str:
+    def _thread_chat(self, text: str, thread_id: ChatThreadId) -> str:
         handler = self._acquire_thread_handler(thread_id)
         if isinstance(handler, str):
             return handler
@@ -361,39 +409,21 @@ class ChatManager:
             handler.turn_lock.release()
             self._release_thread_call()
 
-    def _acquire_thread_handler(self, thread_id: str) -> _ThreadLease | str:
-        with self._condition:
-            route = self._thread_handlers.get(thread_id)
-            spec = self._thread_specs.get(thread_id)
-            factory = self._thread_factory
-            if route is not None:
-                self._active_thread_calls += 1
-            elif spec is None:
-                return (
-                    f"Unknown experiment chat thread {thread_id!r}. Create one with "
-                    "/new-chat, or omit the thread to use the default experiment chat."
-                )
-            elif factory is None:
-                return self._thread_unavailable_message(thread_id)
-            else:
-                restoration = self._thread_restorations.get(thread_id)
-                restore = restoration is None
-                if restoration is None:
-                    restoration = Future()
-                    self._thread_restorations[thread_id] = restoration
-                self._active_thread_calls += 1
-        if route is not None:
-            return self._lease_thread_route(route)
-        assert spec is not None  # noqa: S101  # Narrowed above.
-        assert factory is not None  # noqa: S101  # Narrowed above.
-        if restore:
-            self._restore_thread(thread_id, spec, factory, restoration)
+    def _acquire_thread_handler(self, thread_id: ChatThreadId) -> _ThreadLease | str:
+        claim = self._reserve_thread_handler(thread_id)
+        if isinstance(claim, str):
+            return claim
+        if isinstance(claim, _ThreadRoute):
+            return self._lease_thread_route(claim)
+
+        if claim.should_restore:
+            self._restore_thread(thread_id, claim.spec, claim.factory, claim.restoration)
         try:
-            route = restoration.result()
+            route = claim.restoration.result()
         except _ThreadsDrainingError:
             self._release_thread_call()
             return self._thread_unavailable_message(thread_id)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001  # lint-waiver: LW-010248 [BLE001]; arbitrary configured factory failures must release the lease and become a thread-specific diagnostic.
             self._release_thread_call()
             return (
                 f"Could not restore experiment chat thread {thread_id!r}: "
@@ -403,6 +433,32 @@ class ChatManager:
             self._release_thread_call()
             raise
         return self._lease_thread_route(route)
+
+    def _reserve_thread_handler(
+        self, thread_id: ChatThreadId
+    ) -> _ThreadRoute | _ThreadRestorationClaim | str:
+        """Reserve one thread call or return its current user-facing failure."""
+        with self._condition:
+            route = self._thread_handlers.get(thread_id)
+            spec = self._thread_specs.get(thread_id)
+            factory = self._thread_factory
+            if route is not None:
+                self._active_thread_calls += 1
+                return route
+            if spec is None:
+                return (
+                    f"Unknown experiment chat thread {thread_id!r}. Create one with "
+                    "/new-chat, or omit the thread to use the default experiment chat."
+                )
+            if factory is None:
+                return self._thread_unavailable_message(thread_id)
+            restoration = self._thread_restorations.get(thread_id)
+            should_restore = restoration is None
+            if restoration is None:
+                restoration = _ThreadRestoration(self._threads)
+                self._thread_restorations[thread_id] = restoration
+            self._active_thread_calls += 1
+            return _ThreadRestorationClaim(spec, factory, restoration, should_restore)
 
     def _lease_thread_route(self, route: _ThreadRoute) -> _ThreadLease:
         try:
@@ -414,20 +470,22 @@ class ChatManager:
 
     def _restore_thread(
         self,
-        thread_id: str,
+        thread_id: ChatThreadId,
         spec: ChatThreadCreatedData,
         factory: ChatThreadFactory,
         restoration: _ThreadRestoration,
     ) -> None:
         with self._condition:
-            assert self._thread_restorations.get(thread_id) is restoration  # noqa: S101
+            if self._thread_restorations.get(thread_id) is not restoration:
+                message = "experiment chat restoration ownership changed"
+                raise RuntimeError(message)
         try:
-            handle = factory(thread_id, spec.driver, spec.provider, spec.model)
-        except BaseException as exc:  # noqa: BLE001  # Wake waiters on cancellation too.
+            handle = factory(thread_id, spec.provider, spec.model)
+        except BaseException as exc:  # noqa: BLE001  # lint-waiver: LW-010249 [BLE001]; cancellation must also wake waiters before it is propagated.
             self._finish_thread_restoration(thread_id, restoration, error=exc)
             return
 
-        route = _ThreadRoute(handle.handler, threading.Lock())
+        route = _ThreadRoute(handle.handler, self._threads.lock())
         with self._condition:
             if self._thread_factory is factory:
                 self._thread_handlers[thread_id] = route
@@ -439,7 +497,7 @@ class ChatManager:
         error = _ThreadsDrainingError(self._thread_unavailable_message(thread_id))
         try:
             handle.close()
-        except BaseException as cleanup_error:  # noqa: BLE001
+        except BaseException as cleanup_error:  # noqa: BLE001  # lint-waiver: LW-010250 [BLE001]; cleanup errors annotate the original restoration failure without replacing it.
             error.add_note(
                 "Additional error while cleaning up chat-thread restoration: "
                 f"{type(cleanup_error).__name__}: {cleanup_error}"
@@ -448,7 +506,7 @@ class ChatManager:
 
     def _finish_thread_restoration(
         self,
-        thread_id: str,
+        thread_id: ChatThreadId,
         restoration: _ThreadRestoration,
         *,
         error: BaseException,
@@ -464,7 +522,7 @@ class ChatManager:
             self._active_thread_calls -= 1
             self._condition.notify_all()
 
-    def _thread_unavailable_message(self, thread_id: str | None = None) -> str:
+    def _thread_unavailable_message(self, thread_id: ChatThreadId | None = None) -> str:
         subject = (
             "Experiment chat threads"
             if thread_id is None
@@ -472,7 +530,7 @@ class ChatManager:
         )
         return f"{subject} cannot answer right now ({self._unavailable_reason()})."
 
-    def _title_thread_if_needed(self, thread_id: str, question: str) -> str | None:
+    def _title_thread_if_needed(self, thread_id: ChatThreadId, question: str) -> str | None:
         with self._condition:
             spec = self._thread_specs.get(thread_id)
             if spec is None or spec.title:
@@ -495,7 +553,7 @@ class ChatManager:
             return
         try:
             retired.close()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001  # lint-waiver: LW-010251 [BLE001]; retired handler failures are logged while thread cleanup continues.
             self._journal.publish_output(
                 "stderr",
                 f"Terminal experiment chat cleanup failed: {type(exc).__name__}: {exc}\n",
@@ -510,9 +568,9 @@ class ChatManager:
         )
 
     def _wait_locked(self, busy: Callable[[], bool], *, timeout: float | None) -> bool:
-        deadline = time.monotonic() + timeout if timeout is not None else None
+        deadline = self._threads.now() + timeout if timeout is not None else None
         while busy():
-            remaining = None if deadline is None else deadline - time.monotonic()
+            remaining = None if deadline is None else deadline - self._threads.now()
             if remaining is not None and remaining <= 0:
                 return False
             self._condition.wait(timeout=remaining)

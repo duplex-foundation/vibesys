@@ -1,0 +1,109 @@
+# Repository-owned contracts for the impact policy. Verify with `repoctl verify-policy`.
+
+[[cases]]
+name = "server event changes reach the client"
+paths = ["src/server/events.py"]
+jobs = ["python", "tui"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "gateway transport changes reach the browser e2e suite"
+paths = ["src/server/transport/websocket.py"]
+jobs = ["python", "tui"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "run fold changes reach downstream TypeScript packages"
+paths = ["clients/libs/run-state/src/reduce.test.ts"]
+jobs = ["tui"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = ["@vibesys/app-web", "@vibesys/feature-run-view", "@vibesys/run-session", "@vibesys/run-state", "@vibesys/tui"]
+
+[[cases]]
+name = "evaluator SDK changes reach consumers"
+paths = ["sdk/vs-evaluator/vseval/go.mod"]
+jobs = ["evaluators", "examples", "python"]
+[cases.collections]
+native_languages = ["go"]
+native_targets = ["resources/evaluators/microservice", "resources/evaluators/queue", "sdk/vs-evaluator/vseval"]
+pnpm_packages = []
+
+[[cases]]
+name = "repoctl code and policy changes select all checks"
+paths = ["support/repoctl/main.go", ".repoctl/components.toml", ".repoctl/checks.toml"]
+jobs = ["agent_image", "evaluators", "examples", "impact", "python", "real_tiers", "tui"]
+[cases.collections]
+native_languages = ["go", "rust"]
+native_targets = [
+  "examples/data-structures/ordered-map",
+  "examples/data-structures/prioqueue",
+  "examples/data-structures/repositories/queue-rs",
+  "examples/data-structures/stack",
+  "examples/data-structures/unordered-map",
+  "resources/evaluators/microservice",
+  "resources/evaluators/ordered-map",
+  "resources/evaluators/ordered-map/native_runner",
+  "resources/evaluators/priority-queue",
+  "resources/evaluators/priority-queue/native_runner",
+  "resources/evaluators/queue",
+  "resources/evaluators/queue/native_runner",
+  "resources/evaluators/stack",
+  "resources/evaluators/stack/native_runner",
+  "resources/evaluators/unordered-map",
+  "resources/evaluators/unordered-map/native_runner",
+  "sdk/vs-evaluator/vseval",
+]
+pnpm_packages = ["@vibesys/app-desktop-main", "@vibesys/app-desktop-renderer", "@vibesys/app-web", "@vibesys/connection", "@vibesys/contracts", "@vibesys/feature-gateway-connect", "@vibesys/feature-hosts", "@vibesys/feature-recent-runs", "@vibesys/feature-replay", "@vibesys/feature-run-control", "@vibesys/feature-run-view", "@vibesys/feature-start-run", "@vibesys/hosts", "@vibesys/ipc", "@vibesys/machine", "@vibesys/run-session", "@vibesys/run-state", "@vibesys/runs", "@vibesys/settings", "@vibesys/store", "@vibesys/transport", "@vibesys/transport-node", "@vibesys/tui", "@vibesys/ui"]
+
+[[cases]]
+name = "test isolation policy changes reach Python and TypeScript checks"
+paths = ["scripts/check_test_isolation.py"]
+jobs = ["python", "tui"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "website files do not start application CI"
+paths = ["website/package.json"]
+jobs = []
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "broker and Slurm runner changes start the real-system tiers"
+paths = ["libs/vs-sandbox/src/vs_sandbox/slurm_broker.py", "libs/vs-slurm/src/vs_slurm/runner.py"]
+jobs = ["agent_image", "python", "real_tiers"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "the real-system tiers' own files start their job"
+paths = ["tests/slurm_cluster/image/slurm.conf", "scripts/run_minimal_container_tests.sh"]
+jobs = ["python", "real_tiers"]
+[cases.collections]
+native_languages = []
+native_targets = []
+pnpm_packages = []
+
+[[cases]]
+name = "evaluator SDK and queue evaluator changes reach the example evaluator tests"
+paths = ["resources/evaluators/queue/benchmark.go"]
+jobs = ["evaluators", "examples", "python"]
+[cases.collections]
+native_languages = ["go"]
+native_targets = ["resources/evaluators/queue"]
+pnpm_packages = []

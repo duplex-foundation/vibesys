@@ -1,56 +1,80 @@
 import {describe, expect, it, test} from 'bun:test';
-import type {RunEvent, RunStatus} from '@vibesys/backend-client';
-import {hasRunEnded} from '@vibesys/core-state';
-import type {SessionState} from './session-model.js';
+import type {IterationPage, RunEvent, RunSnapshot, RunStatus} from '@vibesys/contracts';
+import {chatEvent as fixtureChatEvent, event as fixtureEvent} from '@vibesys/contracts/testing';
+import {hasRunEnded} from '@vibesys/run-state';
 import {
-  applyActiveExecutionCheckpoint,
-  applyEvent,
-  applyEventBatch,
-  chatDocked,
-  chatPaneVisible,
-  clearInputError,
-  closePane,
-  closeThemePicker,
-  cyclePaneFocus,
-  dismissErrorBanner,
   enterExperimentDrilldown,
   enterExperimentRound,
   enterUnownedExperimentRound,
   experimentIndexItems,
+  hypothesisPlanningActivity,
+  leaveExperimentDrilldown,
+  leaveHypothesisDetail,
+  moveExperimentSelection,
+  moveHypothesisRoundSelection,
+  selectExperimentActivity,
+  setExperiments,
+  unownedExperimentRounds,
+} from './experiments.js';
+import {
+  selectIteration,
+  selectNextAgent,
+  selectNextRound,
+  selectPreviousRound,
+  selectRound,
+} from './round-agent-selection.js';
+import type {SessionState} from './session-model.js';
+import {
+  applyEvent,
+  applyEventBatch,
+  applyEventPrefix,
+  applyEventRebootstrap,
+  applyIterationResult,
+  applySnapshot,
+  chatDocked,
+  chatPaneVisible,
+  clearInputError,
+  closeNotepad,
+  closeNotepadAfterPromotion,
+  closePane,
+  cyclePaneFocus,
+  dismissErrorBanner,
   failPane,
   focusedPane,
   focusPane,
   focusRound,
-  hypothesisPlanningActivity,
+  hydrateNotepad,
   initialSessionState,
-  leaveExperimentDrilldown,
-  leaveHypothesisDetail,
+  iterationRailRounds,
   markEventStreamUnavailable,
-  moveExperimentSelection,
-  moveHypothesisRoundSelection,
-  moveThemeSelection,
+  markNotepadConflict,
+  notepadPromotionText,
   openChat,
+  openNotepad,
   openPane,
-  openThemePicker,
   reportError,
-  runStatusLabel,
-  selectExperimentActivity,
-  selectNextAgent,
-  selectNextRound,
-  selectRound,
   setChatDockFits,
-  setExperiments,
-  setPaneContent,
-  setTheme,
+  setNotepadPersistenceError,
+  setNotepadText,
+  setPerformancePane,
   showDetail,
+  stripRounds,
   togglePaneZoom,
   toggleTodos,
-  unownedExperimentRounds,
+  updateChatConversation,
   visibleActiveExecutions,
   visibleConversation,
+  visibleIterationId,
   visiblePhases,
+  visibleRoundNumber,
   visibleTodos,
 } from './session-model.js';
+import {
+  closeThemePicker,
+  moveThemeSelection,
+  openThemePicker,
+  setTheme,
+} from './theme-picker-model.js';
 import {headerSegments, runStateText, usageText} from './ui/header.js';
 
 describe('input errors', () => {
@@ -111,7 +135,7 @@ describe('error report normalization', () => {
     });
 
     expect(state.errorBanner).toEqual({
-      title: 'Invocation failed',
+      titleKind: 'invocation',
       message: 'The worker failed.',
       detail: 'Exit code: 2',
       hint: 'Inspect the worker log.',
@@ -132,7 +156,7 @@ describe('error report normalization', () => {
     });
 
     expect(state.errorBanner).toEqual({
-      title: 'Connection lost',
+      titleKind: 'transport',
       message: 'An unknown error occurred.',
       detail: null,
       hint: null,
@@ -160,7 +184,7 @@ describe('error report normalization', () => {
     });
 
     expect(merged.errorBanner).toMatchObject({
-      title: 'Run failed',
+      titleKind: 'run',
       message: 'The worker failed.\nExit code: 2',
       detail: 'Exit code: 2',
       diagnosticId: 'diagnostic-1',
@@ -173,6 +197,25 @@ describe('error report normalization', () => {
 });
 
 describe('event batch projection', () => {
+  it('surfaces one banner when a batch delivers a foreign run identity', () => {
+    const owned = applyEventBatch(initialSessionState(), [
+      {...event(1, 'server_started'), run_id: 'run-a'},
+    ]);
+
+    const rejected = applyEventBatch(owned, [{...event(2, 'server_started'), run_id: 'run-b'}]);
+
+    expect(rejected.errorBanner).toMatchObject({
+      diagnosticId: 'core-state:run-identity-mismatch',
+      message: 'Ignored data for run run-b; this projection owns run-a',
+      scope: 'run',
+      count: 1,
+    });
+    const repeated = applyEventBatch(dismissErrorBanner(rejected), [
+      {...event(3, 'server_started'), run_id: 'run-b'},
+    ]);
+    expect(repeated.errorBanner).toBeNull();
+  });
+
   it('keeps the existing banner while resumed history ends in a running session', () => {
     const before = reportError(initialSessionState(), 'Local protocol problem', {
       scope: 'protocol',
@@ -272,6 +315,202 @@ describe('event batch projection', () => {
       diagnosticId: 'failure-1',
     });
   });
+
+  it('keeps a dismissed failure banner closed across post-mortem chat batches', () => {
+    const failed = applyEventBatch(initialSessionState(), [
+      event(1, 'run_started', {
+        kind: 'run_started',
+        outer_loop: 'agent',
+        input: '.',
+        max_rounds: 3,
+      }),
+      {
+        ...event(2, 'run_failed'),
+        diagnostic: {
+          id: 'failure-1',
+          code: 'run_failed',
+          summary: 'The current run failed.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+    ]);
+    expect(failed.errorBanner).not.toBeNull();
+    const dismissed = dismissErrorBanner(failed);
+
+    const chatted = applyEventBatch(dismissed, [
+      sessionChatEvent(3, 'chat', {kind: 'chat', answer: 'The gate exited 1.'}),
+    ]);
+
+    expect(chatted.core.status).toBe('failed');
+    expect(chatted.errorBanner).toBeNull();
+  });
+
+  it('reports the terminal diagnostic once, not once per later fold', () => {
+    const failed = applyEventBatch(initialSessionState(), [
+      {
+        ...event(1, 'run_failed'),
+        diagnostic: {
+          id: 'failure-1',
+          code: 'run_failed',
+          summary: 'The current run failed.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+    ]);
+    expect(failed.errorBanner?.count).toBe(1);
+
+    const chatted = applyEventBatch(
+      applyEventBatch(failed, [
+        sessionChatEvent(2, 'chat', {kind: 'chat', answer: 'first answer'}),
+      ]),
+      [sessionChatEvent(3, 'chat', {kind: 'chat', answer: 'second answer'})],
+    );
+
+    expect(chatted.errorBanner?.count).toBe(1);
+  });
+
+  it('banners a diagnostic appended while the run is already failed', () => {
+    const failed = applyEventBatch(initialSessionState(), [
+      {
+        ...event(1, 'run_failed'),
+        diagnostic: {
+          id: 'failure-1',
+          code: 'run_failed',
+          summary: 'The current run failed.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+    ]);
+    const dismissed = dismissErrorBanner(failed);
+
+    const worse = applyEventBatch(dismissed, [
+      {
+        ...event(2, 'run_failed'),
+        diagnostic: {
+          id: 'failure-2',
+          code: 'gate_failed',
+          summary: 'The benchmark gate failed.',
+          scope: 'run',
+          severity: 'fatal',
+          retryability: 'never',
+        },
+      },
+    ]);
+
+    expect(worse.errorBanner).toMatchObject({
+      message: 'The benchmark gate failed.',
+      diagnosticId: 'failure-2',
+    });
+  });
+});
+
+describe('event prefix projection', () => {
+  it('surfaces a prefix identity mismatch once and suppresses its live repeat', () => {
+    const owned = applyEventBatch(
+      initialSessionState(),
+      [{...event(2, 'server_started'), run_id: 'run-a'}],
+      undefined,
+      2,
+      1,
+    );
+
+    const rejectedPrefix = applyEventPrefix(
+      owned,
+      [{...event(1, 'server_started'), run_id: 'run-b'}],
+      0,
+    );
+    expect(rejectedPrefix.errorBanner).toMatchObject({
+      diagnosticId: 'core-state:run-identity-mismatch',
+      count: 1,
+    });
+
+    const repeatedLive = applyEventBatch(rejectedPrefix, [
+      {...event(3, 'server_started'), run_id: 'run-b'},
+    ]);
+    expect(repeatedLive.errorBanner).toMatchObject({
+      diagnosticId: 'core-state:run-identity-mismatch',
+      count: 1,
+    });
+  });
+});
+
+describe('chat backfill ordering', () => {
+  it('inserts backfilled exchanges at their transcript position, not the tail', () => {
+    const live = applyEventBatch(
+      initialSessionState(),
+      [sessionChatEvent(100, 'chat', {kind: 'chat', answer: 'newest answer'})],
+      undefined,
+      100,
+      90,
+    );
+    expect(live.chatConversation.map(entry => entry.id)).toEqual(['100']);
+
+    const backfilled = applyEventPrefix(
+      live,
+      [sessionChatEvent(10, 'chat', {kind: 'chat', answer: 'older answer'})],
+      0,
+    );
+
+    const transcript = backfilled.core.chatTranscripts[backfilled.activeChatThreadId] ?? [];
+    expect(transcript.map(entry => entry.id)).toEqual(['10', '100']);
+    expect(backfilled.chatConversation.map(entry => entry.id)).toEqual(['10', '100']);
+    expect(backfilled.chatConversation.map(entry => entry.content)).toEqual([
+      'older answer',
+      'newest answer',
+    ]);
+  });
+
+  it('backfills above a local question instead of splitting it from its answer', () => {
+    const live = applyEventBatch(
+      initialSessionState(),
+      [sessionChatEvent(100, 'chat', {kind: 'chat', answer: 'newest answer'})],
+      undefined,
+      100,
+      90,
+    );
+    const asked = updateChatConversation(live, live.activeChatThreadId, entries => [
+      ...entries,
+      {id: 'chat-user-1', kind: 'user', label: 'You', content: 'why did round 2 regress?'},
+    ]);
+
+    const backfilled = applyEventPrefix(
+      asked,
+      [sessionChatEvent(10, 'chat', {kind: 'chat', answer: 'older answer'})],
+      0,
+    );
+
+    expect(backfilled.chatConversation.map(entry => entry.id)).toEqual([
+      '10',
+      '100',
+      'chat-user-1',
+    ]);
+  });
+
+  it('keeps a pending question above the fresh answer that lands after it', () => {
+    const live = applyEventBatch(
+      initialSessionState(),
+      [sessionChatEvent(100, 'chat', {kind: 'chat', answer: 'newest answer'})],
+      undefined,
+      100,
+      90,
+    );
+    const asked = updateChatConversation(live, live.activeChatThreadId, entries => [
+      ...entries,
+      {id: 'chat-user-1', kind: 'user', label: 'You', content: 'why did round 2 regress?'},
+    ]);
+
+    const answered = applyEventBatch(asked, [
+      sessionChatEvent(101, 'chat', {kind: 'chat', answer: 'follow-up answer'}),
+    ]);
+
+    expect(answered.chatConversation.map(entry => entry.id)).toEqual(['100', 'chat-user-1', '101']);
+  });
 });
 
 describe('hypothesis planning activity', () => {
@@ -290,6 +529,7 @@ describe('hypothesis planning activity', () => {
               kind,
               status: 'active',
               roundNumber: 3,
+              roundKey: {kind: 'number' as const, number: 3},
               roundLabel,
               startedAt: '2026-01-01T00:00:00Z',
             },
@@ -350,23 +590,31 @@ describe('hypothesis planning activity', () => {
   });
 
   it('keeps elapsed planning time from the earliest observed planning phase', () => {
-    const state = stateFor('orchestrator', 'round-3-plan');
-    state.core.phases = [
-      {
-        kind: 'orchestrator',
-        status: 'completed',
-        roundNumber: 3,
-        roundLabel: 'round-3-pre',
-        startedAt: '2026-01-01T00:00:00Z',
+    const base = stateFor('orchestrator', 'round-3-plan');
+    const state: SessionState = {
+      ...base,
+      core: {
+        ...base.core,
+        phases: [
+          {
+            kind: 'orchestrator',
+            status: 'completed',
+            roundNumber: 3,
+            roundKey: {kind: 'number' as const, number: 3},
+            roundLabel: 'round-3-pre',
+            startedAt: '2026-01-01T00:00:00Z',
+          },
+          {
+            kind: 'orchestrator',
+            status: 'active',
+            roundNumber: 3,
+            roundKey: {kind: 'number' as const, number: 3},
+            roundLabel: 'round-3-plan',
+            startedAt: '2026-01-01T00:01:00Z',
+          },
+        ],
       },
-      {
-        kind: 'orchestrator',
-        status: 'active',
-        roundNumber: 3,
-        roundLabel: 'round-3-plan',
-        startedAt: '2026-01-01T00:01:00Z',
-      },
-    ];
+    };
 
     expect(hypothesisPlanningActivity(state)?.startedAt).toBe('2026-01-01T00:00:00Z');
   });
@@ -381,7 +629,9 @@ describe('hypothesis planning activity', () => {
         ...stateFor('orchestrator', 'round-3-plan'),
         core: {
           ...stateFor('orchestrator', 'round-3-plan').core,
-          rounds: [{number: 3, status: 'active' as const}],
+          rounds: [
+            {key: {kind: 'number' as const, number: 3}, number: 3, status: 'active' as const},
+          ],
         },
       },
       [
@@ -410,7 +660,7 @@ describe('hypothesis planning activity', () => {
       ...stateFor('orchestrator', 'round-3-pre'),
       core: {
         ...stateFor('orchestrator', 'round-3-pre').core,
-        rounds: [{number: 3, status: 'active' as const}],
+        rounds: [{key: {kind: 'number' as const, number: 3}, number: 3, status: 'active' as const}],
       },
     };
 
@@ -423,7 +673,7 @@ describe('hypothesis planning activity', () => {
       ...stateFor('orchestrator', 'round-3-plan'),
       core: {
         ...stateFor('orchestrator', 'round-3-plan').core,
-        rounds: [{number: 3, status: 'active' as const}],
+        rounds: [{key: {kind: 'number' as const, number: 3}, number: 3, status: 'active' as const}],
       },
     };
 
@@ -441,13 +691,14 @@ describe('hypothesis planning activity', () => {
               kind: 'orchestrator',
               status: 'active' as const,
               roundNumber: 5,
+              roundKey: {kind: 'number' as const, number: 5},
               roundLabel: 'round-5-plan',
             },
           ],
           rounds: [
-            {number: 4, status: 'completed' as const},
-            {number: 2, status: 'completed' as const},
-            {number: 5, status: 'active' as const},
+            {key: {kind: 'number' as const, number: 4}, number: 4, status: 'completed' as const},
+            {key: {kind: 'number' as const, number: 2}, number: 2, status: 'completed' as const},
+            {key: {kind: 'number' as const, number: 5}, number: 5, status: 'active' as const},
           ],
         },
       },
@@ -491,7 +742,9 @@ describe('hypothesis planning activity', () => {
           ...stateFor('orchestrator', 'round-3-plan'),
           core: {
             ...stateFor('orchestrator', 'round-3-plan').core,
-            rounds: [{number: 3, status: 'active' as const}],
+            rounds: [
+              {key: {kind: 'number' as const, number: 3}, number: 3, status: 'active' as const},
+            ],
           },
         },
         [],
@@ -614,7 +867,9 @@ describe('unowned rounds', () => {
       ...initialSessionState(),
       core: {
         ...initialSessionState().core,
-        rounds: [{number: 9, status: 'completed' as const}],
+        rounds: [
+          {key: {kind: 'number' as const, number: 9}, number: 9, status: 'completed' as const},
+        ],
         transcript: [
           {id: 'r8', kind: 'assistant' as const, content: 'old', roundNumber: 8},
           {id: 'r9', kind: 'assistant' as const, content: 'kept', roundNumber: 9},
@@ -655,7 +910,187 @@ describe('unowned rounds', () => {
   });
 });
 
+describe('unnumbered round compatibility', () => {
+  it('retains fallback rows while numeric selectors and experiment joins skip them', () => {
+    const base = initialSessionState();
+    const state: SessionState = {
+      ...base,
+      core: {
+        ...base.core,
+        rounds: [
+          {key: {kind: 'number', number: 1}, number: 1, status: 'completed'},
+          {key: {kind: 'label', label: 'future-loop'}, number: null, status: 'active'},
+        ],
+      },
+    };
+
+    expect(stripRounds(state).map(round => round.key)).toEqual([
+      {kind: 'number', number: 1},
+      {kind: 'label', label: 'future-loop'},
+    ]);
+    expect(visibleRoundNumber(state)).toBe(1);
+    expect(unownedExperimentRounds(state)).toEqual([1]);
+  });
+});
+
+describe('quota pause banner', () => {
+  const paused = (fallback: boolean, resumesAt?: number): RunEvent =>
+    event(1, 'quota_paused', {
+      kind: 'quota_paused',
+      provider: 'claude',
+      condition: 'quota_exhausted',
+      detail: 'five hour limit reached',
+      resets_at: 1_800_000_000,
+      ...(resumesAt === undefined ? {} : {resumes_at: resumesAt}),
+      ...(fallback ? {fallback_provider: 'codex', fallback_model: 'gpt-5.4'} : {}),
+    });
+  const settled = (kind: 'quota_resumed' | 'quota_abandoned' | 'provider_switched'): RunEvent =>
+    event(
+      2,
+      kind,
+      kind === 'quota_resumed'
+        ? {kind, provider: 'claude'}
+        : kind === 'quota_abandoned'
+          ? {
+              kind,
+              provider: 'claude',
+              condition: 'quota_exhausted',
+              detail: 'five hour limit reached',
+              reason: 'wait budget spent',
+            }
+          : {
+              kind,
+              from_provider: 'claude',
+              to_provider: 'codex',
+              to_model: 'gpt-5.4',
+              reason: 'policy',
+              detail: 'five hour limit reached',
+            },
+    );
+
+  it('names the provider, the diagnostic and the choices, with fallback only when configured', () => {
+    const withFallback = applyEvent(initialSessionState(), paused(true));
+    expect(withFallback.errorBanner).toMatchObject({
+      titleKind: 'quota_pause',
+      severity: 'recoverable',
+      message: 'claude is out of quota. The run is paused until you decide.',
+    });
+    expect(withFallback.errorBanner?.detail).toContain('five hour limit reached');
+    expect(withFallback.errorBanner?.hint).toContain(
+      '/resume fallback: continue on codex (gpt-5.4)',
+    );
+
+    const without = applyEvent(initialSessionState(), paused(false));
+    expect(without.errorBanner?.hint).toContain('/resume: try the same provider again');
+    expect(without.errorBanner?.hint).not.toContain('fallback');
+  });
+
+  it('says when a timed policy resumes the run by itself', () => {
+    const state = applyEvent(initialSessionState(), paused(false, 1_800_000_005));
+    expect(state.errorBanner?.hint).toContain('resumes by itself at 2027-01-15 08:00 UTC');
+  });
+
+  it('retires the banner when the stop settles, however it settles', () => {
+    for (const kind of ['quota_resumed', 'quota_abandoned', 'provider_switched'] as const) {
+      const state = applyEvent(applyEvent(initialSessionState(), paused(true)), settled(kind));
+      expect(state.errorBanner).toBeNull();
+    }
+  });
+
+  it('leaves an unrelated banner alone when the stop settles', () => {
+    let state = applyEvent(initialSessionState(), paused(true));
+    state = reportError(state, 'Connection lost', {scope: 'transport'});
+    state = applyEvent(state, settled('quota_resumed'));
+    expect(state.errorBanner?.message).toBe('Connection lost');
+  });
+});
+
 describe('session event model', () => {
+  it('navigates policy roots by stable identity without inventing round numbers', () => {
+    const page: IterationPage = {
+      kind: 'page',
+      schema_version: 1,
+      run_id: 'run',
+      projection_revision: 'evolve',
+      parent_id: null,
+      from_cursor: null,
+      items: [0, 1, 2].map(generation => ({
+        id: `generation:${generation}`,
+        parent_id: null,
+        kind: 'generation',
+        label: `Generation ${generation}`,
+        ordinal: generation,
+        status: generation === 2 ? ('active' as const) : ('completed' as const),
+        child_count: 0,
+        headline_metrics: [],
+      })),
+      next_cursor: null,
+    };
+    let state = applyIterationResult(initialSessionState(), page);
+
+    state = selectIteration(state, 'generation:0');
+    expect(state).toMatchObject({selectedIterationId: 'generation:0', selectedRound: null});
+    state = selectNextRound(state);
+    expect(visibleIterationId(state)).toBe('generation:1');
+    state = selectNextRound(state);
+    expect(visibleIterationId(state)).toBe('generation:2');
+    state = selectPreviousRound(state);
+    expect(visibleIterationId(state)).toBe('generation:1');
+  });
+
+  it('retains live round timing when queried navigation supplies persisted rounds', () => {
+    const started = {
+      ...executionEvent(
+        1,
+        'agent_execution_started',
+        'impl-2',
+        {
+          kind: 'agent_execution_started',
+          stage: 'implementation',
+          attempt: 1,
+          system_prompt: '',
+          user_prompt: 'Implement round two',
+          activity: {
+            kind: 'agent_execution_activity_changed',
+            mode: 'thinking',
+            summary: 'Working',
+            tool: null,
+          },
+        },
+        'implementer',
+      ),
+      round_label: 'round-2',
+    };
+    const active = applyEvent(initialSessionState(), started);
+    const result: IterationPage = {
+      kind: 'page',
+      schema_version: 1,
+      run_id: 'run',
+      projection_revision: 'revision',
+      parent_id: null,
+      from_cursor: null,
+      items: [
+        {
+          id: 'round:1',
+          parent_id: null,
+          kind: 'round',
+          label: 'Round 1',
+          ordinal: 1,
+          status: 'completed',
+          child_count: 0,
+          headline_metrics: [],
+        },
+      ],
+      next_cursor: null,
+    };
+
+    const rows = iterationRailRounds(applyIterationResult(active, result));
+
+    expect(rows.map(round => round.number)).toEqual([1, 2]);
+    expect(rows[1]).toMatchObject({status: 'active', iterationLabel: 'Round 2'});
+    expect(Object.keys(rows[1]?.activeAgentStarts ?? {})).toEqual(['implementer:impl-2']);
+  });
+
   it('tracks concurrent agent executions independently through activity and finish events', () => {
     let state = initialSessionState();
     state = applyEvent(
@@ -773,44 +1208,6 @@ describe('session event model', () => {
     expect(disconnected.core).toBe(active.core);
     expect(disconnected.core.activeExecutions['impl-1']).toBeDefined();
     expect(visibleActiveExecutions(disconnected)).toEqual([]);
-  });
-
-  it('reconciles from a checkpoint without advancing the replay cursor', () => {
-    const state = applyActiveExecutionCheckpoint(initialSessionState(), [
-      {
-        execution_id: 'judge-2',
-        agent_kind: 'judge',
-        round_label: 'round-2-judge',
-        stage: 'evaluation',
-        attempt: 1,
-        assignment: 'Evaluate the candidate',
-        started_at: '2026-01-01T00:00:00Z',
-        activity: {
-          kind: 'agent_execution_activity_changed',
-          mode: 'thinking',
-          summary: 'Inspecting the diff',
-          tool: null,
-        },
-      },
-    ]);
-
-    expect(state.core.sequence).toBe(0);
-    expect(state.core.activeExecutions['judge-2']).toMatchObject({
-      agentKind: 'judge',
-      roundNumber: 2,
-      activity: {summary: 'Inspecting the diff'},
-    });
-
-    const newer = {
-      ...state,
-      core: {
-        ...state.core,
-        sequence: 5,
-      },
-    };
-    expect(applyActiveExecutionCheckpoint(newer, [], 4).core.activeExecutions).toEqual(
-      state.core.activeExecutions,
-    );
   });
 
   it('clears every active execution when the run is interrupted', () => {
@@ -931,6 +1328,7 @@ describe('session event model', () => {
         judge_verdict: 'skipped',
         perf_metric: null,
         perf_unit: null,
+        profile_skipped: false,
       }),
     );
 
@@ -966,7 +1364,7 @@ describe('session event model', () => {
     expect(hasRunEnded(state.core)).toBe(true);
     expect(state.overlay).toBeNull();
     expect(state.errorBanner).toMatchObject({
-      title: 'Configuration failed',
+      titleKind: 'configuration',
       severity: 'fatal',
     });
     expect(state.errorBanner?.message).toContain('This run has completed 30 rounds.');
@@ -986,7 +1384,7 @@ describe('session event model', () => {
     });
 
     expect(state.errorBanner).toMatchObject({
-      title: 'Invocation failed',
+      titleKind: 'invocation',
       severity: 'recoverable',
       invocationId: 'invocation-1',
     });
@@ -996,7 +1394,7 @@ describe('session event model', () => {
     });
 
     expect(state.errorBanner).toMatchObject({
-      title: 'Run failed',
+      titleKind: 'run',
       severity: 'fatal',
       count: 2,
     });
@@ -1086,7 +1484,7 @@ describe('session event model', () => {
     });
 
     expect(state.errorBanner).toMatchObject({
-      title: 'Invocation failed',
+      titleKind: 'invocation',
       message: 'The worker could not start.',
       detail: 'PermissionError: sandbox rejected the worker.\nExit code: 1',
       hint: 'Check the sandbox permissions.',
@@ -1121,7 +1519,7 @@ describe('session event model', () => {
     });
 
     expect(state.errorBanner).toMatchObject({
-      title: 'Invocation failed',
+      titleKind: 'invocation',
       message: 'The agent process could not start.',
     });
   });
@@ -1132,6 +1530,10 @@ describe('session event model', () => {
 
     expect(failed.errorBanner?.message).toBe('Run failed.');
     expect(interrupted.errorBanner?.message).toBe('Run interrupted.');
+    // #804: the run ends in its own status, not folded into 'failed', but it
+    // still banners its terminal diagnostic the same way a failure does.
+    expect(failed.core.status).toBe('failed');
+    expect(interrupted.core.status).toBe('interrupted');
   });
 
   it('shows structured interruption details when no event text is present', () => {
@@ -1153,7 +1555,7 @@ describe('session event model', () => {
     });
 
     expect(state.errorBanner).toMatchObject({
-      title: 'Run interrupted',
+      titleKind: 'run_interruption',
       message: 'Run interrupted',
       detail: 'RuntimeError: launcher_terminated (SIGTERM)',
       severity: 'fatal',
@@ -1207,7 +1609,7 @@ describe('session event model', () => {
     let state = initialSessionState();
     state = applyEvent(
       state,
-      chatEvent(1, 'agent_output_chunk', {
+      sessionChatEvent(1, 'agent_output_chunk', {
         kind: 'agent_output_chunk',
         channel: 'analysis',
         content: 'Inspecting the latest round',
@@ -1215,7 +1617,7 @@ describe('session event model', () => {
     );
     state = applyEvent(
       state,
-      chatEvent(2, 'tool_call', {
+      sessionChatEvent(2, 'tool_call', {
         kind: 'tool_call',
         tool: 'read_file',
         args: {path: 'progress.md'},
@@ -1224,7 +1626,7 @@ describe('session event model', () => {
     );
     state = applyEvent(
       state,
-      chatEvent(3, 'tool_result', {
+      sessionChatEvent(3, 'tool_result', {
         kind: 'tool_result',
         tool: 'read_file',
         content: 'Round 2 improved throughput.',
@@ -1233,7 +1635,7 @@ describe('session event model', () => {
     );
     state = applyEvent(
       state,
-      chatEvent(4, 'chat', {
+      sessionChatEvent(4, 'chat', {
         kind: 'chat',
         answer: 'Round 2 improved throughput.',
       }),
@@ -1474,6 +1876,7 @@ describe('session event model', () => {
         executionId: null,
         agentKind: 'judge',
         roundNumber: 1,
+        roundKey: {kind: 'number' as const, number: 1},
         items: [
           {content: 'Set up project', status: 'completed'},
           {content: 'Add tests', status: 'pending'},
@@ -1598,16 +2001,6 @@ describe('session event model', () => {
     expect(toggleTodos(toggleTodos(state)).todosExpanded).toBe(false);
   });
 
-  // The header carries exactly one status token, read from backend-owned core
-  // state. `/pause` is visible as `pausing…` until the backend says the pause
-  // landed, and the run's ended status replaces it rather than joining it.
-  it('renders one header status token per backend run status', () => {
-    expect(runStatusLabel('running')).toBe('running');
-    expect(runStatusLabel('pausing')).toBe('pausing…');
-    expect(runStatusLabel('paused')).toBe('paused');
-    expect(runStatusLabel('completed')).toBe('completed');
-  });
-
   it('reads a pause from the backend and drops it when the run ends', () => {
     const statusChange = (sequence: number, status: RunStatus, previous: RunStatus) =>
       event(sequence, 'run_status_changed', {
@@ -1691,7 +2084,9 @@ describe('session event model', () => {
       agent_kind: 'orchestrator',
     });
 
-    expect(state.core.rounds).toMatchObject([{number: 1, status: 'active'}]);
+    expect(state.core.rounds).toMatchObject([
+      {key: {kind: 'number' as const, number: 1}, number: 1, status: 'active'},
+    ]);
     expect(visiblePhases(state).map(phase => `${phase.kind}:${phase.status}`)).toEqual([
       'orchestrator:completed',
       'implementer:pending',
@@ -1702,6 +2097,7 @@ describe('session event model', () => {
       kind: 'orchestrator',
       status: 'completed',
       roundNumber: 1,
+      roundKey: {kind: 'number' as const, number: 1},
       roundLabel: 'round-1',
     });
   });
@@ -1758,6 +2154,7 @@ describe('session event model', () => {
     expect(visibleConversation(state).map(entry => entry.content)).toEqual(['judge output']);
 
     state = selectRound(state, 2);
+    expect(state.selectedIterationId).toBe('round:2');
     expect(visibleConversation(state).map(entry => entry.content)).toEqual([
       'round two judge output',
     ]);
@@ -1881,23 +2278,24 @@ describe('right pane layout', () => {
     expect(state.layout.focus).toBe('left');
   });
 
-  it('opens a pane pending, titled, and focused', () => {
+  it('opens a semantic pane pending and focused', () => {
     const state = openPane(initialSessionState(), 'perf');
 
-    expect(state.layout.right).toMatchObject({view: 'perf', title: 'Performance', pending: true});
+    expect(state.layout.right).toMatchObject({view: 'perf', data: null, pending: true});
     expect(state.layout.focus).toBe('right');
   });
 
   it('keeps the old chart on screen while the same view refreshes', () => {
-    const perf = setPaneContent(openPane(initialSessionState(), 'perf'), 'perf', 'chart');
+    const data = {performance: [], events: []};
+    const perf = setPerformancePane(openPane(initialSessionState(), 'perf'), data, null);
 
-    expect(openPane(perf, 'perf').layout.right?.content).toBe('chart');
+    expect(openPane(perf, 'perf').layout.right).toMatchObject({data});
   });
 
   it('ignores a response for a pane the operator has since closed', () => {
     const closed = closePane(openPane(initialSessionState(), 'perf'));
 
-    const stale = setPaneContent(closed, 'perf', 'late chart');
+    const stale = setPerformancePane(closed, {performance: [], events: []}, null);
 
     expect(stale).toBe(closed);
     expect(failPane(closed, 'perf', 'late failure')).toBe(closed);
@@ -1968,7 +2366,11 @@ describe('right pane layout', () => {
   });
 
   it('zooms the semantic focused pane and restores the unchanged split state', () => {
-    const split = setPaneContent(openPane(initialSessionState(), 'perf'), 'perf', 'chart');
+    const split = setPerformancePane(
+      openPane(initialSessionState(), 'perf'),
+      {performance: [], events: []},
+      null,
+    );
     const chat = focusPane(split, 'chat');
     const zoomed = togglePaneZoom(chat);
 
@@ -2007,15 +2409,13 @@ function event(
   data?: RunEvent['data'],
   invocationId?: string,
 ): RunEvent {
-  return {
-    sequence,
+  return fixtureEvent(sequence, type, {
     timestamp: '2026-01-01T00:00:00Z',
-    type,
     round_label: 'round-1',
     ...(type === 'run_started' ? {} : {agent_kind: 'judge'}),
     ...(invocationId === undefined ? {} : {invocation_id: invocationId}),
     ...(data === undefined ? {} : {data}),
-  };
+  });
 }
 
 function executionEvent(
@@ -2036,16 +2436,12 @@ function executionEvent(
   };
 }
 
-function chatEvent(
+function sessionChatEvent(
   sequence: number,
   type: RunEvent['type'],
   data: NonNullable<RunEvent['data']>,
 ): RunEvent {
-  return {
-    ...event(sequence, type, data, 'chat-1'),
-    agent_kind: 'chat',
-    round_label: 'experiment-chat',
-  };
+  return fixtureChatEvent(sequence, type, data, {invocation_id: 'chat-1'});
 }
 
 describe('theme picker', () => {
@@ -2090,6 +2486,268 @@ describe('theme picker', () => {
   });
 });
 
+describe('notepad', () => {
+  it('opens closed, empty, and unstamped', () => {
+    const state = initialSessionState();
+
+    expect(state.notepad).toEqual({
+      open: false,
+      text: '',
+      createdAt: null,
+      updatedAt: null,
+      persistence: 'pending_identity',
+      persistenceError: null,
+    });
+  });
+
+  it('opens over the palette and theme picker, leaving the run underneath alone', () => {
+    const opened = openNotepad(openThemePicker(initialSessionState()));
+
+    expect(opened.notepad.open).toBe(true);
+    expect(opened.themePicker).toBeNull();
+  });
+
+  it('is a no-op when already open', () => {
+    const opened = openNotepad(initialSessionState());
+
+    expect(openNotepad(opened)).toBe(opened);
+  });
+
+  it('closes without discarding the typed text', () => {
+    const typed = setNotepadText(
+      openNotepad(initialSessionState()),
+      'watch the retry budget',
+      't0',
+    );
+
+    const closed = closeNotepad(typed);
+
+    expect(closed.notepad.open).toBe(false);
+    expect(closed.notepad.text).toBe('watch the retry budget');
+  });
+
+  it('is a no-op when already closed', () => {
+    const state = initialSessionState();
+
+    expect(closeNotepad(state)).toBe(state);
+  });
+
+  it('stamps createdAt on the first keystroke and updatedAt on every one after', () => {
+    const first = setNotepadText(openNotepad(initialSessionState()), 'a', 't0');
+    expect(first.notepad.createdAt).toBe('t0');
+    expect(first.notepad.updatedAt).toBe('t0');
+
+    const second = setNotepadText(first, 'ab', 't1');
+    expect(second.notepad.createdAt).toBe('t0');
+    expect(second.notepad.updatedAt).toBe('t1');
+  });
+
+  it('does not touch state for a no-change keystroke', () => {
+    const first = setNotepadText(openNotepad(initialSessionState()), 'a', 't0');
+
+    expect(setNotepadText(first, 'a', 't1')).toBe(first);
+  });
+
+  it('records and clears a local persistence diagnostic without changing the draft', () => {
+    const written = setNotepadText(openNotepad(initialSessionState()), 'draft', 't0');
+    const failed = setNotepadPersistenceError(written, 'EACCES: permission denied');
+
+    expect(failed.notepad).toMatchObject({
+      text: 'draft',
+      persistenceError: 'EACCES: permission denied',
+    });
+    expect(setNotepadPersistenceError(failed, null).notepad).toMatchObject({
+      text: 'draft',
+      persistenceError: null,
+    });
+  });
+
+  it('hydrates from a saved record only when one is given', () => {
+    const opened = openNotepad(initialSessionState());
+    const record = {
+      projectScope: 'a'.repeat(64),
+      runId: 'run-1',
+      text: 'from disk',
+      createdAt: 't0',
+      updatedAt: 't1',
+    };
+
+    const hydrated = hydrateNotepad(opened, record);
+    expect(hydrated.notepad.text).toBe('from disk');
+    expect(hydrated.notepad.createdAt).toBe('t0');
+    expect(hydrated.notepad.updatedAt).toBe('t1');
+    expect(hydrated.notepad.persistence).toBe('ready');
+
+    expect(hydrateNotepad(opened, null).notepad).toEqual({
+      ...opened.notepad,
+      persistence: 'ready',
+    });
+
+    const unsaved = setNotepadPersistenceError(
+      setNotepadText(hydrated, 'newer in-memory draft', 't2'),
+      'EACCES: permission denied',
+    );
+    expect(hydrateNotepad(unsaved, record)).toBe(unsaved);
+  });
+
+  it('keeps a conflicted draft until promotion copies it to a composer', () => {
+    const drafted = setNotepadText(openNotepad(initialSessionState()), 'startup draft', 't0');
+    const conflicted = markNotepadConflict(drafted);
+
+    expect(closeNotepad(conflicted).notepad).toMatchObject({
+      open: false,
+      text: 'startup draft',
+      persistence: 'conflict',
+    });
+    expect(closeNotepadAfterPromotion(conflicted).notepad).toEqual({
+      open: false,
+      text: '',
+      createdAt: null,
+      updatedAt: null,
+      persistence: 'ready',
+      persistenceError: null,
+    });
+  });
+
+  it('promotes trimmed text, and nothing for an empty or whitespace-only note', () => {
+    expect(notepadPromotionText(initialSessionState())).toBeNull();
+
+    const blank = setNotepadText(openNotepad(initialSessionState()), '   ', 't0');
+    expect(notepadPromotionText(blank)).toBeNull();
+
+    const written = setNotepadText(openNotepad(initialSessionState()), '  fix the cache  ', 't0');
+    expect(notepadPromotionText(written)).toBe('fix the cache');
+  });
+
+  it('uses core state as the run identity owner for events and snapshots', () => {
+    expect('runId' in initialSessionState()).toBe(false);
+    const streamed = applyEvent(initialSessionState(), {
+      sequence: 1,
+      run_id: 'run-1',
+      timestamp: '2026-01-01T00:00:01Z',
+      type: 'server_started',
+    });
+    expect(streamed.core.runId).toBe('run-1');
+
+    const snapshot: RunSnapshot = {run_id: 'run-1', sequence: 1, status: 'running'};
+    const state = applySnapshot(initialSessionState(), snapshot);
+
+    expect(state.core.runId).toBe('run-1');
+
+    // A reconnect resends the same run's snapshot; the id must not move out
+    // from under an open notepad mid-session.
+    const resent: RunSnapshot = {run_id: 'run-1', sequence: 2, status: 'running'};
+    expect(applySnapshot(state, resent).core.runId).toBe('run-1');
+  });
+
+  it('surfaces one banner when a snapshot carries a foreign run identity', () => {
+    const owned = applySnapshot(initialSessionState(), {
+      run_id: 'run-a',
+      sequence: 1,
+      status: 'running',
+    });
+
+    const rejected = applySnapshot(owned, {
+      run_id: 'run-b',
+      sequence: 2,
+      status: 'running',
+    });
+
+    expect(rejected.errorBanner).toMatchObject({
+      diagnosticId: 'core-state:run-identity-mismatch',
+      message: 'Ignored data for run run-b; this projection owns run-a',
+      scope: 'run',
+      count: 1,
+    });
+    const repeated = applySnapshot(dismissErrorBanner(rejected), {
+      run_id: 'run-b',
+      sequence: 3,
+      status: 'running',
+    });
+    expect(repeated.errorBanner).toBeNull();
+  });
+
+  it('resets run-local notes and selection when rebootstrap adopts a different run', () => {
+    const established = applyEvent(initialSessionState('light'), {
+      sequence: 1,
+      run_id: 'run-a',
+      timestamp: '2026-01-01T00:00:01Z',
+      type: 'server_started',
+    });
+    const withRunLocalState = setNotepadText(
+      openNotepad({
+        ...established,
+        selectedRound: 7,
+        selectedAgentKind: 'judge',
+        selectedEntryId: 'entry-7',
+        selectedTodoIndex: 2,
+      }),
+      'old-run note',
+      't0',
+    );
+
+    const changed = applyEventRebootstrap(
+      withRunLocalState,
+      [
+        {
+          sequence: 1,
+          run_id: 'run-b',
+          timestamp: '2026-01-02T00:00:01Z',
+          type: 'server_started',
+        },
+      ],
+      [],
+      1,
+      0,
+    );
+
+    expect(changed.core.runId).toBe('run-b');
+    expect(changed.notepad).toEqual({
+      open: false,
+      text: '',
+      createdAt: null,
+      updatedAt: null,
+      persistence: 'pending_identity',
+      persistenceError: null,
+    });
+    expect(changed.selectedRound).toBeNull();
+    expect(changed.selectedAgentKind).toBeNull();
+    expect(changed.selectedEntryId).toBeNull();
+    expect(changed.selectedTodoIndex).toBeNull();
+    expect(changed.themeName).toBe('light');
+    expect('graphWidthOverride' in changed).toBe(false);
+    expect('chatWidthOverride' in changed).toBe(false);
+  });
+
+  it('preserves a note when rebootstrap replays the same run', () => {
+    const established = applyEvent(initialSessionState(), {
+      sequence: 1,
+      run_id: 'run-a',
+      timestamp: '2026-01-01T00:00:01Z',
+      type: 'server_started',
+    });
+    const noted = setNotepadText(openNotepad(established), 'same-run note', 't0');
+
+    const replayed = applyEventRebootstrap(
+      noted,
+      [
+        {
+          sequence: 1,
+          run_id: 'run-a',
+          timestamp: '2026-01-01T00:00:01Z',
+          type: 'server_started',
+        },
+      ],
+      [],
+      1,
+      0,
+    );
+
+    expect(replayed.core.runId).toBe('run-a');
+    expect(replayed.notepad).toEqual(noted.notepad);
+  });
+});
+
 describe('re-entering a round after leaving it', () => {
   const hypothesis = {
     hypothesis_id: 'H1',
@@ -2104,17 +2762,24 @@ describe('re-entering a round after leaving it', () => {
       core: {
         ...initialSessionState().core,
         rounds: [
-          {number: 1, status: 'completed'},
-          {number: 2, status: 'active'},
+          {key: {kind: 'number' as const, number: 1}, number: 1, status: 'completed'},
+          {key: {kind: 'number' as const, number: 2}, number: 2, status: 'active'},
         ],
         phases: [
           {
             kind: 'implementer',
             status: 'completed',
             roundNumber: 1,
+            roundKey: {kind: 'number' as const, number: 1},
             roundLabel: 'round-1-implementer',
           },
-          {kind: 'judge', status: 'completed', roundNumber: 1, roundLabel: 'round-1-judge'},
+          {
+            kind: 'judge',
+            status: 'completed',
+            roundNumber: 1,
+            roundKey: {kind: 'number' as const, number: 1},
+            roundLabel: 'round-1-judge',
+          },
         ],
         transcript: [
           {id: 'a', kind: 'assistant', label: 'implementer', content: 'patched', roundNumber: 1},
@@ -2206,9 +2871,9 @@ describe('scope follows round navigation', () => {
         core: {
           ...initialSessionState().core,
           rounds: [
-            {number: 1, status: 'completed' as const},
-            {number: 2, status: 'completed' as const},
-            {number: 3, status: 'active' as const},
+            {key: {kind: 'number' as const, number: 1}, number: 1, status: 'completed' as const},
+            {key: {kind: 'number' as const, number: 2}, number: 2, status: 'completed' as const},
+            {key: {kind: 'number' as const, number: 3}, number: 3, status: 'active' as const},
           ],
         },
       },

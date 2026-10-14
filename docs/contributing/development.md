@@ -6,7 +6,12 @@ bundles, and the TUI.
 
 ## Before you change code
 
-- Read [`docs/contributing/coding-best-practices.md`](coding-best-practices.md).
+- Load the `software-design` skill for every code change and the `testing` skill for
+  any test work (see [Coding best practices](coding-best-practices.md) for where they
+  live and for size limits, lint waivers, and doc links). The
+  [testing map](testing-map.md) says which layer a new test belongs in.
+- Adding or moving an example? Register it in `examples/registry.toml`; see
+  [Adding an example](examples.md).
 - Keep changes within the owning package and preserve the framework boundaries.
 - Use the repository [pull request template](https://github.com/uw-syfi/vibesys/blob/main/.github/pull_request_template.md)
   when opening a PR.
@@ -14,14 +19,16 @@ bundles, and the TUI.
 ## Repository layout
 
 ```text
-src/vibesys/             Headless optimization core and loop implementation
+src/vibesys/             Orchestration policy and thin product API/composition
 src/server/              Frontend-serving runtime and protocol
 src/entrypoints/         Process composition and command entrypoints
-clients/backend-client/  TypeScript server protocol and transport
-clients/core-state/      Pure backend-event projection
-clients/tui/             TypeScript terminal UI and launcher
+clients/libs/contracts/      TypeScript server protocol types and validator
+clients/libs/transport/      Runtime-neutral transport and the WebSocket adapter
+clients/libs/transport-node/ Node transport: the Unix-socket client
+clients/libs/run-state/      Pure backend-event projection (the run fold)
+clients/tui/                 TypeScript terminal UI and launcher
 libs/                    Reusable standalone libraries
-examples/                Candidate repositories, tasks, and legacy input bundles
+examples/                Candidate repositories, tasks, and input bundles
 resources/evaluators/    Reusable versioned evaluator packages
 resources/skills/        Bundled Agent Skills and reference material
 resources/profilers/     Profiler MCP servers and support packages
@@ -35,12 +42,25 @@ The main framework boundaries are:
   `libs/`.
 - `src/server/` owns serving and frontend-specific behavior. It may depend on
   `src/vibesys/`, but the headless core does not depend on it.
-- `src/vibesys/loops/` owns the outer-loop policies and shared loop helpers.
-- `src/vibesys/agents/` owns the agent-runner abstraction and integrations.
-- `src/vibesys/domains/` owns domain-specific prompt context and hooks.
-- `src/vibesys/backends/` owns compute and execution backends.
+- `src/vibesys/orchestration/` owns built-in orchestration plugins: agent
+  roles, prompts, reply schemas, search and selection policy, evaluation
+  cadence, and policy state. See
+  [Orchestration plugins and runtime](orchestration-runtime.md).
+- `src/vibesys/api/`, `src/vibesys/run/`, and
+  `src/vibesys/composition.py` form the thin product facade and composition
+  layer over the reusable runtime libraries.
+- `libs/` owns reusable libraries. Import each library through its public
+  `<package>.api` surface, for example `vs_agent.api` or `vs_project.api`.
+  Each library exposes its owned fakes through `<package>.api.testing` where
+  applicable. Orchestration policy normally uses
+  `vs_runtime.api.testing.FakeRun`. Tach rejects imports of root-level
+  exports and internal modules.
+- `src/vibesys/domains/` owns domain-specific prompt policy.
+  Generic execution mechanisms belong in `libs/vs-runtime/`; agent harnesses,
+  compute isolation, and project persistence belong in `libs/vs-agent/`,
+  `libs/vs-sandbox/`, and `libs/vs-project/`, respectively.
 - Candidate repositories own target-specific tasks and candidate contracts
-  below `.vibesys/tasks/`. Legacy input bundles remain under `examples/`.
+  below `.vibesys/tasks/`. Example projects live under `examples/<category>/`.
 - `resources/evaluators/` owns reusable versioned evaluator packages.
 
 ## Local development
@@ -92,12 +112,18 @@ git submodule update --init --recursive --checkout
 repository-native example's tasks skip when its submodule is absent, and CI's
 `validate-examples` job covers them instead. To get the same coverage locally
 without cloning the candidate repositories, fetch just their `.vibesys`
-overlays (a few MB and a few seconds, against hundreds of MB for a full
+directories (a few MB and a few seconds, against hundreds of MB for a full
 checkout):
 
 ```bash
 uv run python scripts/example_repositories.py
 ```
+
+The example evaluators' build-and-run tests (they compile an example's native code and
+run the real Go evaluator on it) carry the `native_build` marker and are deselected by
+default. CI's `native-evaluator-examples` job runs them when an example or the evaluator
+SDK changes; run them yourself with `uv run pytest -m native_build tests/architecture
+tests/examples`.
 
 Run the Python checks from the repository root:
 
@@ -110,26 +136,150 @@ uv run pytest
 For a focused test, use for example:
 
 ```bash
-uv run pytest tests/vibesys/loops/plain/test_plain_loop.py
+uv run pytest tests/vibesys/orchestration/issue_queue/test_stories.py
 uv run pytest -k orchestrator
 ```
+
+### Dynamic-loop smoke tier
+
+Run `./scripts/smoke_dynamic_loop.sh` before every live hardware run. It
+launches the installed `vibesys` CLI (launcher and engine) with `--outer-loop
+dynamic --headless` against the Slurm run environment on the Fake cluster
+(`vs_slurm.fake_connector` in executing mode), with real agent CLIs (Claude
+Haiku by default; `VIBESYS_SMOKE_PROVIDER=codex` selects Codex). The input is a
+small CPU task under `tests/e2e/dynamic_smoke/bundle`. A second scenario sends
+Ctrl-C mid-run.
+
+It checks loop invariants from the run's own records
+(`tests/support/loop_invariants.py`): a typed terminal status and no empty
+completion, every offered capability served or withdrawn after `unsupported`,
+no MCP tool timeout, every run path a prompt names present at turn start, no
+evaluation submitted after a stop, the stop grace bound, no Slurm job left
+behind, and recorded token usage. Each run prints one summary line (wall time,
+tokens, cost) to `smoke-summary.txt` under a fresh `vibesys-smoke-*` directory in `$TMPDIR` (or `/tmp`); set
+`VIBESYS_SMOKE_DIR` to choose another location outside the checkout. One run
+of both scenarios takes about 5 minutes and about $0.60 of Haiku tokens. It is
+opt-in (`VIBESYS_E2E_AGENTS=1`) and not in PR CI, because real agents are
+nondeterministic.
+
+### Real-cluster tier
+
+`./scripts/run_slurm_cluster_tests.sh` runs the `slurm` run environment, in four
+configurations, against a real Slurm cluster started in Docker: munge, slurmctld,
+slurmdbd (so `sacct` works), sshd and a login node in a `head` container, and one
+slurmd with four fake GPUs (GRES backed by character devices, no real hardware)
+in a `node` container. No LLM agents run. The agent is a real Docker container
+that VibeSys creates exactly as in production, and the tests drive it with
+scripted commands (`vibesys-gpu`) through the session's sandbox.
+
+The test's run directory is mounted into both cluster containers at the same
+absolute path and stands in for the shared filesystem. `slurm` reaches the head
+over SSH with a per-session key and `ssh_command` options, so nothing in
+`~/.ssh` is read or changed. The local transport needs a Slurm client on the host;
+the tier points its `shell_command` at a small shim that runs the command line in
+the head container (the login node) with the caller's working directory and
+exactly the caller's environment, so the host installs nothing.
+
+| Kind | Configuration | Tests |
+|---|---|---|
+| `slurm` | SSH transport | opening and closing, the agent surface, sockets |
+| `slurm-local` | local transport, no agent GPU commands | the same, and that the container reaches no broker |
+| `slurm-local-gpu` | local transport plus `[vibesys.agent_gpu]` | the same, plus GPU scheduling, cancellation, paths, job environment, confinement and `vibesys-gpu` |
+| `slurm-gpu-alias` | the deprecated `--run-environment slurm-gpu` file | smoke: its deprecation notice and one GPU command |
+
+Each kind is opened as a run would open it: the agents have the evaluation tool, so no gate,
+and `test_agent_surface.py` checks that no evaluation command reaches the container.
+
+The tier is marked `slurm_cluster` and skipped unless `VIBESYS_SLURM_CLUSTER=1`
+and Docker are available. CI runs it as the `real-tiers-slurm` job when the `real_tiers` change filter selects it, on every merge-queue entry, and nightly. The script sets the variable,
+removes everything it created on exit, and passes extra arguments to pytest.
+The shared directory must be on a local filesystem: set
+`VIBESYS_SLURM_CLUSTER_DIR` when `/tmp` is a network mount. The first run builds
+two small images (Ubuntu with `slurm-wlm`, about a minute); later runs reuse
+Docker's cache. Tests wait on Slurm's own state (a job running, the queue
+empty) with a hang guard, never on a fixed delay.
+
+What it does not cover: the ROCprof profiler transport, real GPU devices and
+drivers, cgroup-based resource enforcement, multi-node jobs, and Landlock
+confinement (the compute node uses bubblewrap).
+
+### Minimal-container tier
+
+`./scripts/run_minimal_container_tests.sh` starts every process that runs in the
+agent's editor container, in a real container, on a host without GPUs. For each of
+the CPU, CUDA and ROCm default base images (the ones named by the backends in
+`libs/vs-sandbox/src/vs_sandbox/*_backend.py`) it opens the editor through
+`open_run_environment`, so `docker build` of the real agent layer, the mounts, the
+environment and the uid remap are all production's. The CUDA and ROCm images are
+built and started without an accelerator; nothing runs on a GPU. No LLM is involved.
+In each container it checks that:
+
+- `claude --version` runs and `codex app-server` answers the `initialize` handshake;
+- the evaluation tool server (both the core-run and the per-role descriptor) answers
+  MCP `initialize` and lists its tools, started from the descriptor the run builds;
+- the profiler MCP server of the base's default profiler answers `initialize` and
+  lists its tools;
+- `vibesys-gpu` runs a command through a real host
+  broker (its `srun` is a local program);
+- the `agent` user has a group of its own name and the host's uid and gid.
+
+A fourth, small stand-in base (`ubuntu:24.04`, which owns uid 1000 as `ubuntu` and has
+no `python` command) runs the tool-server and identity checks, so a host that cannot
+pull the large images still covers them.
+
+Tool servers do not use the base image's `python`: the agent image installs a uv-managed
+Python at a fixed path, and the agent launcher starts every Python server on it with
+the framework's source roots on `PYTHONPATH` (`vs_agent.containerize_server`).
+
+The tier is marked `minimal_container` and skipped unless `VIBESYS_MINIMAL_CONTAINER=1`
+and Docker are available. CI runs the CPU base as the `real-tiers-minimal-container` job when the `real_tiers` change filter selects it, on every merge-queue entry, and nightly. The script sets the variable, removes
+the containers it started on exit (their run id starts with `minimal-container-`), and
+passes extra arguments to pytest. Set `VIBESYS_MINIMAL_CONTAINER_BASES` (for example
+`cpu,rocm`) to run some bases, and `VIBESYS_MINIMAL_CONTAINER_DIR` to a directory on a
+local filesystem when `/tmp` is a network mount. A base image is pulled only when the
+local store lacks it and is never removed: the CUDA and ROCm images are tens of
+gigabytes each. With the images cached, one base takes about 15 seconds after its
+agent layer is built, which takes minutes on the first run.
+
+A test that fails for a known bug is marked `expect_failure_for(...)` with the
+issue that tracks it. It is a strict expected failure, so fixing the bug fails the
+tier until the marker is removed. Run with `--runxfail` to see the failures.
+
+What it does not cover: GPU devices and drivers, profiler captures (only the server
+starts), the accelerator-attached editor of the plain Docker environment on a GPU
+host, and the SkyPilot and Modal editors.
 
 The TypeScript client has its own workflow; see
 [`clients/tui/README.md`](https://github.com/uw-syfi/vibesys/blob/main/clients/tui/README.md). The short version is:
 
 ```bash
+cd clients
 pnpm install --frozen-lockfile
-pnpm --dir clients/backend-client generate:protocol
+pnpm --dir contracts generate:protocol
 pnpm check:ts-architecture
+pnpm check:knip
 pnpm check:clients
 pnpm test:clients
 pnpm build:clients
 pnpm check:ts
 ```
 
+`check:clients`, `test:clients`, and `build:clients` run through Turborepo: packages run in
+dependency order and in parallel, and a task whose inputs are unchanged replays its cached result
+from `.turbo/cache` at the repository root. Dev, tests, and type checks read workspace dependencies from source,
+so no command needs another package built first; `pnpm turbo run test --filter @vibesys/<package>`
+checks one package. The [clients architecture](clients-architecture.md) guide describes the build
+model. `tsc -b` keeps each package's `dist` incrementally; `pnpm exec tsc -b --clean` in a package
+removes it.
+
 When Python protocol models change, regenerate the files under
-`clients/backend-client/src/generated/` and review the diff.
+`clients/libs/contracts/src/generated/` and review the diff.
 See the [TUI architecture guide](tui-architecture.md) for package ownership and dependency rules.
+TUI-specific contributor docs are indexed in [`tui/README.md`](tui/README.md).
+
+The [web UI development guide](web-development.md) covers replay mode, live
+WebSocket smoke runs, detached gateway lifecycle, and SSH access from a local
+laptop to a remote VibeSys host.
 
 ## Extend VibeSys
 
@@ -144,24 +294,15 @@ Use the guide that matches the surface you are adding:
   MCP tools, and profiler prompts.
 - [Update CLI flags and combinations](../cli-flags.md) when changing the user
   facing command contract.
-- [Update feature flags](feature-flags.md) for opt-in
-  experiments and optional framework behavior.
 
-The experimental Omnigent adapter is a developer-facing alternative to the
-standard CLI adapter. It currently supports Claude and Codex on the host path
-only; see the [agent driver guide](agent-drivers.md) before enabling it.
+See the [agent sessions guide](agent-drivers.md) before changing how agents are
+launched.
 
 Keep target-specific APIs, ABIs, ownership rules, and service protocols in the
 task's `CANDIDATE_CONTRACT.md` or design documentation rather than in the
 neutral framework prompts.
 
-## Internal tools and workflows
-
-The plain loop's issue MCP server is an internal development tool:
-
-```bash
-uv run vibesys-issue-mcp
-```
+## Internal workflows
 
 For issue forms and repository issue conventions, see
 [`docs/contributing/issue-authoring.md`](issue-authoring.md). For evolutionary search policy
@@ -172,6 +313,44 @@ work, see [`docs/contributing/openevolve.md`](openevolve.md).
 Every pull request must pass the following gates before it can be merged.
 You can run each one locally before pushing.
 
+The `changes` job reads `.repoctl/components.toml` for ownership, discovery,
+and dependency policy, and `.repoctl/checks.toml` for executable check groups
+and native commands. `support/repoctl/` provides configurable adapters for
+language and package manifests. The component graph records cross-component
+effects those manifests cannot express. The job prints each selection and its
+reason; an unowned changed path fails selection instead of silently skipping
+checks. To run the selected check groups configured for local runs, use one
+command. The wrapper runs the repository's Go tool, so install Go 1.25 first:
+
+```bash
+./support/repoctl/repoctl test
+```
+
+This does not run every CI check. Browser end-to-end tests (`tui_e2e`) are
+CI-only by default: Playwright needs Chromium and its system libraries as well
+as the client and Python environments, so making the normal local command
+acquire or require them would make it unexpectedly heavyweight. Run that group
+explicitly when browser coverage is needed. Local port 5173 must be free or
+already serve this checkout's web app: Playwright reuses a local listener, so
+an unrelated listener would run the wrong app.
+
+```bash
+uv sync --dev
+pnpm --dir clients install --frozen-lockfile
+(cd clients && pnpm --filter @vibesys/app-web exec playwright install --with-deps chromium)
+./support/repoctl/repoctl run-checks --group tui_e2e
+```
+
+The CI-only decision is specific to `tui_e2e`. It does not change the
+selection policy for the other check groups without local-selection keys; each
+has its own prerequisites and needs its own policy decision.
+
+Use `./support/repoctl/repoctl plan` to inspect the selection without running checks.
+The workflow runs named check groups from `.repoctl/checks.toml`. Run
+`./support/repoctl/repoctl verify-policy --cases tests/repoctl/cases.toml` after
+changing component ownership or dependencies; CI runs this contract check before
+selecting jobs.
+
 ### Format
 
 ```bash
@@ -180,11 +359,11 @@ You can run each one locally before pushing.
 
 Runs `ruff format --check` (whitespace, line length, blank lines) and
 `ruff check --select I` (import order) across `src`, `tests`, `examples`,
-`resources`, and `libs`. To auto-fix locally:
+`resources`, `libs`, and `support`. To auto-fix locally:
 
 ```bash
-uv run ruff format src tests examples resources libs
-uv run ruff check --select I --fix src tests examples resources libs
+uv run ruff format src tests examples resources libs support
+uv run ruff check --select I --fix src tests examples resources libs support
 ```
 
 ### Lint
@@ -197,8 +376,11 @@ Runs `ruff check .` across the whole repository. Fix automatically where
 possible with `--fix`; the remaining errors need manual attention. Test
 files that trigger false-positive rules (e.g. `S106` on fixture arguments,
 `ANN001`/`ANN201` on helpers, `PLR0913` on builder functions) can suppress
-them with a file-level `# ruff: noqa: <codes>` comment at the top of the
-file.
+them at the site with `# noqa: <code>` only when reasonable lint-compliant
+alternatives would make the design more hacky. List those alternatives and why
+each is worse in the source rationale. Every suppression, including a
+file-level `# ruff: noqa`, needs a `LW-` waiver ID and that rationale; see
+[Ratchets](coding-best-practices.md#ratchets).
 
 ### Coverage
 
@@ -207,8 +389,10 @@ The test job enforces two independent coverage floors:
 **Repo-wide floor — 75 %**  
 `uv run pytest` (with `--cov` already wired in via `pyproject.toml`) must
 reach 75 % combined statement + branch coverage across the tracked packages
-(`vibesys`, `vs_evaluator_protocol`, `vs_feature_flags`, `vs_github`,
-`vs_issue_board`, `vs_loop_state`, `vs_project`, `vs_sandbox`, and `vs_bench`).
+(`entrypoints`, `server`, `vibesys`, `vs_agent`, `vs_bench`,
+`vs_evaluator_protocol`, `vs_github`, `vs_issue_tracker`, `vs_core`,
+`vs_project`, `vs_prompts`, `vs_runtime`, and `vs_sandbox`; the list is
+`[tool.coverage.run] source` in `pyproject.toml`).
 
 **Per-module floor — 40 %**  
 `scripts/check_coverage_floor.py` reads `coverage.json` and rejects any

@@ -1,0 +1,213 @@
+"""Assemble the single search as a core run from a run's resolved resources.
+
+The search itself is `orchestration/single/search`: one flow, its roles and its pure helpers.
+This module does the effects the search cannot: store the evaluation recipe, read the evaluation
+identity, resolve the task's terms from the input bundle and the plan, bind the search's
+operations to the runtime's production owners and read a run's committed record.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from vibesys.candidates.api import (
+    Gates,
+    Measuring,
+    limits_for,
+    run_deadline_at,
+    terms_of,
+    workspace_mode_for,
+)
+from vibesys.core_wiring import (
+    EvaluationInputs,
+    ResolvedRun,
+    agent_evaluation_policy,
+    domain_prompt_sections,
+    evaluation_inputs,
+    operation_catalog,
+)
+from vibesys.hypothesis import HypothesisState
+from vibesys.orchestration.single.core_policy.api import (
+    project_run_snapshot,
+    prompts,
+    requirements_for,
+    run_prompt_variables,
+)
+from vibesys.orchestration.single.launch import ProfileGuidedSingleLaunch, SingleLaunch
+from vibesys.orchestration.single.search.api import OPERATIONS, budget, single
+from vibesys.plugin_registration import (
+    IterationSupport,
+    OrchestrationRegistration,
+    RuntimeRecordProjector,
+)
+from vibesys.prompts import CORE_PROTOCOL_DIR
+from vibesys.run.contracts import IterationTree, PluginProjection
+from vibesys.serial_search.api import PROMPTS_DIR as SERIAL_SEARCH_PROMPTS
+from vibesys.single_roles import CORE_ROLES
+from vs_core.api import FlowDriver, FlowState, MeasurementRecipe, RevisionRef
+from vs_core.api import RunFacts as CoreRunFacts
+from vs_runtime.api import CoreOperation, CorePlan, CorePolicy, OrchestrationPlugin
+from vs_runtime.api.core import (
+    OperationCatalog,
+    OperationPorts,
+    RuntimeRecord,
+    operation_roles,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from vs_core.api import TaskTerms
+    from vs_runtime.api import CoreRunContext
+
+type SingleRunLaunch = SingleLaunch | ProfileGuidedSingleLaunch
+
+# The label of the snapshot that retains a verified revision.
+RETENTION_LABEL = "verified"
+# The directories the designer's run-scoped turn may write.
+ARTIFACT_DIRECTORIES = ("roadmap",)
+
+
+def single_operation_catalog(ports: OperationPorts) -> OperationCatalog:
+    """The operations the single search requires, each owned by the production owner of its role."""
+    return operation_catalog(OPERATIONS, ports)
+
+
+def single_projector(plugin_id: str) -> RuntimeRecordProjector[FlowState]:
+    """Read a single run's published record from its committed runtime record."""
+
+    def project(state: FlowState, revision: int) -> PluginProjection:
+        record = FlowDriver.published(state, HypothesisState)
+        if record is None:
+            return PluginProjection(payload={}, iterations=IterationTree.from_nodes(()), rounds=())
+        return project_run_snapshot(record, experiment_revision=revision)
+
+    return RuntimeRecordProjector(
+        plugin_id=plugin_id,
+        state_type=FlowState,
+        record_type=RuntimeRecord[FlowState],
+        operations=OPERATIONS.registry(),
+        project=project,
+    )
+
+
+def _task_terms(
+    evaluation: EvaluationInputs, context: CoreRunContext, launch: SingleRunLaunch
+) -> TaskTerms:
+    """What the task fixes: resolved from the evaluation plan, the metric space and the domain."""
+    return terms_of(
+        evaluation.recipe,
+        Gates(accuracy=evaluation.accuracy_configured, benchmark=evaluation.benchmark_configured),
+        launch.metric_space,
+        Measuring(
+            stage_seconds={
+                "accuracy": evaluation.accuracy_seconds,
+                "benchmark": evaluation.benchmark_seconds,
+                "profile": evaluation.profile_seconds,
+            },
+            queue_allowance=float(context.queue_allowance_seconds),
+            benchmark_needs_accuracy=evaluation.benchmark_needs_accuracy,
+            profile_fields=(
+                tuple(item.value for item in evaluation.profile_fields)
+                if evaluation.profile_measurement
+                else ()
+            ),
+        ),
+    )
+
+
+def _plan_for(launch_type: type[SingleRunLaunch]) -> Callable[[CoreRunContext], CorePlan]:
+    def plan(context: CoreRunContext) -> CorePlan:
+        launch = launch_type.model_validate(context.options)
+        commit = context.baseline.git_commit
+        if commit is None:
+            message = "the single core policy needs a Git baseline revision"
+            raise ValueError(message)
+        evaluation = evaluation_inputs(
+            ResolvedRun(
+                facts=context.facts,
+                evaluation_plan=context.evaluation_plan,
+                environment=context.environment,
+                baseline_commit=commit,
+                artifacts=context.artifacts,
+            )
+        )
+        terms = _task_terms(evaluation, context, launch)
+        facts = CoreRunFacts(
+            objective=context.facts.objective,
+            baseline=RevisionRef.of_git_commit(commit),
+            evaluator_digest=evaluation.evaluator_digest,
+            workload_digest=evaluation.workload_digest,
+            environment_digest=evaluation.environment_digest,
+            task=terms,
+        )
+        config = launch.search_config(
+            workspace_mode=workspace_mode_for(
+                isolated_candidates=context.environment.parallel_candidate_obstacle is None
+            )
+        )
+        models = {single.ids.role_id(role.identity).root: role.identity for role in single.roles}
+        chosen = {
+            models[role]: model for role, model in context.role_models.items() if role in models
+        }
+        return CorePlan(
+            search=single.with_models(chosen),
+            config=config,
+            facts=facts,
+            limits=limits_for(budget(config), context),
+            deadline_seconds=run_deadline_at(context.max_run_seconds),
+            prompt_variables=run_prompt_variables(
+                objective=facts.objective,
+                environment_notes=context.facts.environment_notes,
+                agent_evaluation=True,
+                domain_sections=domain_prompt_sections(
+                    context.facts, modality=None, interface=launch.interface
+                ),
+                profiler_id=context.facts.profiler_id,
+            ),
+            requirements=requirements_for(terms),
+            agent_evaluation=agent_evaluation_policy(
+                MeasurementRecipe.of(facts),
+                accuracy="accuracy" in terms.measured,
+                benchmark="benchmark" in terms.measured,
+            ),
+        )
+
+    return plan
+
+
+def single_core_policy(launch_type: type[SingleRunLaunch]) -> CorePolicy:
+    """The single search as a core run: its plan, operations and the roles that perform them."""
+    return CorePolicy(
+        plan=_plan_for(launch_type),
+        operations=tuple(
+            CoreOperation(role, registration)
+            for role, registration in operation_roles(OPERATIONS).items()
+        ),
+        retention_label=RETENTION_LABEL,
+        prompt_templates=Path(prompts.__file__).parent,
+        prompt_fallback_roots=(SERIAL_SEARCH_PROMPTS, CORE_PROTOCOL_DIR),
+        artifact_directories=ARTIFACT_DIRECTORIES,
+    )
+
+
+def single_core_registration(
+    plugin_id: str, launch_type: type[SingleRunLaunch]
+) -> OrchestrationRegistration:
+    """One single preset registered as a core run."""
+    plugin = OrchestrationPlugin(
+        id=plugin_id,
+        agents=CORE_ROLES,
+        options=launch_type,
+        core=single_core_policy(launch_type),
+    )
+    return OrchestrationRegistration(
+        plugin=plugin,
+        projector=single_projector(plugin_id),
+        iteration_support=IterationSupport.PROJECTED,
+        project_max_rounds=lambda options: launch_type.model_validate(options).max_rounds,
+    )
+
+
+__all__ = ["single_core_registration"]

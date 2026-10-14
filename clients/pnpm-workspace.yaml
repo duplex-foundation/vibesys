@@ -1,0 +1,13 @@
+packages:
+  - "tui"
+  - "libs/*"
+  - "features/*"
+  - "apps/*"
+
+injectWorkspacePackages: true
+nodeLinker: hoisted
+
+allowBuilds:
+  # Electron 44 fetches its binary on first launch, so its build script stays off.
+  electron: false
+  esbuild: true

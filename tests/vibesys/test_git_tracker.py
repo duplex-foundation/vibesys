@@ -3,20 +3,26 @@
 from __future__ import annotations
 
 import os
-import subprocess
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
+from tests.support import run_test_command
 
-from vibesys.run.git_events import NullGitTrackerEvents
-from vibesys.run.git_tracker import GitTracker
 from vibesys.run.project_policy import trusted_project_input_paths
-from vs_project import PlainRunConfiguration, Project, RunEnvironmentRecord
+from vs_project.api import (
+    GitTracker,
+    NullGitTrackerEvents,
+    OrchestrationDescriptor,
+    Project,
+    RunEnvironmentRecord,
+)
+from vs_project.api.testing import run_execution_record
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from vs_project import StateSnapshot
+    from vs_project.api import StateSnapshot
 
 _IDENTITY = {
     "GIT_AUTHOR_NAME": "test",
@@ -27,8 +33,8 @@ _IDENTITY = {
 
 
 def _git(root: Path, *args: str, check: bool = True) -> str:
-    return subprocess.run(  # noqa: S603  # tracked: #288
-        ["git", *args],  # noqa: S607  # tracked: #288
+    return run_test_command(
+        ["git", *args],
         cwd=root,
         check=check,
         capture_output=True,
@@ -55,7 +61,7 @@ def _initialized_tracker(root: Path, run_id: str = "test-run") -> GitTracker:
 
 def _project(root: Path, tracker: GitTracker, run_id: str = "test-run") -> Project:
     project = Project.open(root)
-    project.state.create_project("Git tracker test")
+    project.state.create_project("Git tracker test", now=datetime(2026, 1, 1, tzinfo=UTC))
     assert tracker.project_branch is not None
     assert tracker.trusted_input_baseline is not None
     project.state.create_run(
@@ -65,15 +71,10 @@ def _project(root: Path, tracker: GitTracker, run_id: str = "test-run") -> Proje
             branch=tracker.project_branch,
             vibesys_version="test",
             trusted_input_baseline=tracker.trusted_input_baseline,
-            configuration=PlainRunConfiguration(
-                outer_loop="plain",
-                run_environment=RunEnvironmentRecord(name="local"),
-                agent_backend="stub",
-                compute_backend="cpu",
-                max_rounds=2,
-                max_attempts_per_issue=1,
-                max_issues_per_perf_eval=1,
-            ),
+            run_environment=RunEnvironmentRecord(name="docker"),
+            execution=run_execution_record(),
+            orchestration=OrchestrationDescriptor(id="plain", config_version=1, options={}),
+            now=datetime(2026, 1, 1, tzinfo=UTC),
         )
     )
     tracker.snapshot_with_framework_metadata(
@@ -195,14 +196,13 @@ def test_run_branch_does_not_conflict_with_repository_vibesys_branch(tmp_path: P
     assert _git(tmp_path, "branch", "--show-current") == "vibesys-runs/test-run"
 
 
-def test_resume_accepts_legacy_vibesys_run_branch(tmp_path: Path) -> None:
+def test_resume_rejects_old_vibesys_run_branch(tmp_path: Path) -> None:
     baseline = _initialize_existing_repository(tmp_path)
     _git(tmp_path, "switch", "-q", "-c", "vibesys/test-run")
 
     tracker = _tracker(tmp_path)
-    tracker.init(existing=True, trusted_input_baseline=baseline)
-
-    assert tracker.project_branch == "vibesys/test-run"
+    with pytest.raises(ValueError, match="does not exist"):
+        tracker.init(existing=True, trusted_input_baseline=baseline)
 
 
 def test_resume_requires_repository_and_existing_run_branch(tmp_path: Path) -> None:
@@ -444,6 +444,34 @@ def test_checkout_restores_candidate_tree_and_preserves_framework_state(tmp_path
     assert not (tmp_path / "scratch.txt").exists()
 
 
+def test_unversioned_paths_collapse_directories_without_tracked_files(tmp_path: Path) -> None:
+    tracker = _initialized_tracker(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/tracked.py").write_text("X = 1\n", encoding="utf-8")
+    _git(tmp_path, "add", "src/tracked.py")
+    _git(tmp_path, "commit", "-m", "tracked")
+    (tmp_path / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    for name in (
+        ".venv/bin/python",
+        ".venv/lib/a.py",
+        "src/new.py",
+        "src/odd[1]*.txt",
+        "n/d/e.txt",
+    ):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text("x\n", encoding="utf-8")
+
+    kept = tracker.unversioned_paths()
+
+    assert kept == (".gitignore", ".venv/", "n/", "src/new.py", "src/odd[1]*.txt")
+    (tmp_path / "src/stray.txt").write_text("s\n", encoding="utf-8")
+    assert tracker.checkout_tree("HEAD", clean=True, clean_ignored=True, keep_paths=kept)
+    assert not (tmp_path / "src/stray.txt").exists()
+    assert (tmp_path / ".venv/lib/a.py").read_text(encoding="utf-8") == "x\n"
+    assert (tmp_path / "src/odd[1]*.txt").exists()
+    assert (tmp_path / "n/d/e.txt").exists()
+
+
 def test_trusted_input_changes_compare_against_branch_point(tmp_path: Path) -> None:
     (tmp_path / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
     objective = tmp_path / "OBJECTIVE.md"
@@ -496,7 +524,7 @@ def test_candidate_worktree_is_local_and_retained_by_durable_ref(tmp_path: Path)
     _git(worktree, "commit", "-q", "-m", "candidate")
     candidate_sha = _git(worktree, "rev-parse", "HEAD")
 
-    ref = tracker.retain_worktree(worktree, "candidate-1")
+    ref = tracker.retain_candidate("candidate-1", candidate_sha)
     tracker.remove_worktree(worktree)
     _git(tmp_path, "reflog", "expire", "--expire=now", "--all")
     _git(tmp_path, "gc", "--prune=now")
@@ -583,17 +611,19 @@ def test_events_report_unreadable_path_exclusions(tmp_path: Path) -> None:
     tracker, events = _recording_tracker(tmp_path)
     unreadable = tmp_path / "system_profile.json"
     unreadable.write_text("{}", encoding="utf-8")
-    os.chmod(unreadable, 0o000)  # noqa: PTH101
+    unreadable.chmod(0o000)
     try:
         tracker.snapshot("round-1")
     finally:
-        os.chmod(unreadable, 0o644)  # noqa: PTH101
+        unreadable.chmod(0o644)
 
     assert any("/system_profile.json" in paths for paths in events.excluded)
 
 
-def test_events_report_failed_tree_restore_as_warning(tmp_path: Path) -> None:
+def test_unknown_revision_reports_failed_tree_restore_as_warning(tmp_path: Path) -> None:
     tracker, events = _recording_tracker(tmp_path)
+    unknown = "f" * 40
 
-    assert tracker.checkout_tree("f" * 40) is False
+    assert tracker.has_revision(unknown) is False
+    assert tracker.checkout_tree(unknown) is False
     assert any(warning.startswith("git tree restore") for warning in events.warnings)

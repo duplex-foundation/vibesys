@@ -1,34 +1,43 @@
 # vs-sandbox
 
-Reusable host and Docker sandbox backends for agent workspaces, plus Modal
-model-weight volume provisioning.
+## Responsibility
 
-This is an internal import package shipped by the `vibesys` distribution. It
-is not published as a separate Python distribution.
-
-`vs-sandbox` owns the sandbox execution backends that do not depend on
-VibeSys: container-backed workspaces implementing the `deepagents`
-`BaseSandbox` protocol, host process confinement, plus Modal model-weight volume provisioning.
-Applications wire these into their own run-environment policy.
+This package provides compute backend implementations, accelerator discovery
+and monitoring, command runners, agent confinement backends, host resource and
+path policies, lifecycle hooks, Modal model-weight volume provisioning and
+evaluator helpers, SkyPilot, and the Slurm broker and executor. See
+[Sandboxing and confinement](../../docs/contributing/sandboxing.md) for the
+vocabulary. Applications
+select a compute stack and profiler policy, then declare the resources their
+agents need.
 
 ## Concepts
 
-- `DockerSandbox` runs agent operations in a local Docker container with
-  host bind mounts, and cleans up tracked containers on exit or SIGINT.
+- `CommandRunner` is the command-execution protocol (`id`, `execute`) every
+  `SandboxKind` satisfies; `CommandResult` is its bounded result. It executes
+  a shell command and isolates nothing. "Sandbox" in a name means agent
+  confinement (`WorkspaceSandbox` and its backends, `DockerSandbox`).
+- `ComputeBackendImpl.make_sandbox` constructs a command runner (a
+  `DockerSandbox` also confines) for one compute stack. The public
+  registry supplies CUDA, ROCm, Trainium, Metal, and CPU implementations;
+  application code retains the policy for choosing among them.
+- `AcceleratorDiscovery` and the GPU contention monitor isolate host hardware
+  inspection from orchestration. Their deterministic Fakes are public through
+  `vs_sandbox.api.testing`.
+- `LocalShellRunner` runs shell commands directly on the host with no
+  isolation, for backends that have no container.
+- `DockerSandbox` runs commands in a local Docker container with host bind
+  mounts, and also confines the agent CLI (`wrap`, `agent_path`). It cleans up
+  tracked containers on process exit (an interrupt reaches it through the
+  interpreter's normal unwinding).
 - `HostResource` and related declaration types form a backend-neutral SDK for
   describing which host paths an application needs to import. `agent_path`
-  names the path the confined process should see when it differs from the
-  host path; leave it unset unless a resource is presented at a fixed
-  container path. Host backends cannot remap, so `build_host_sandbox` rejects
-  a resource whose `agent_path` disagrees with its host path.
+  identifies the path the agent sees when a container remaps a host resource.
 - `HostSandbox`, `LandlockSandbox`, and `SeatbeltSandbox` consume those
   declarations to confine a local process with bubblewrap, Landlock, or
-  Seatbelt. Applications own their resource lists; this package owns
-  validation and import mechanics. Every `WorkspaceSandbox` exposes
-  `agent_path(host_path)` (identity on host backends) and an `env` property
-  (the environment the confined process runs with, guaranteed to carry HOME
-  and PATH) so callers do not need backend-specific branches to answer either
-  question.
+  Seatbelt. Landlock cannot enforce read-only or hidden project paths. Applications own their resource lists; this package owns
+  validation and import mechanics. `WorkspaceSandbox` exposes a common path
+  mapping and environment interface to callers.
 - `ProjectPathPolicy` protects workspace-relative files and directories inside
   an otherwise writable project. It supports read-only paths and hidden paths,
   validates containment and overlap, and can require the host backend to fail
@@ -40,3 +49,22 @@ Applications wire these into their own run-environment policy.
   a raised exception aborts startup and triggers backend-owned cleanup.
 - `ensure_model_volume` provisions a per-model Modal Volume populated with
   HuggingFace model weights, reusing already-populated volumes.
+- `vs_sandbox.api.skypilot` owns the optional SkyPilot cluster profile, CLI,
+  evaluator bridge, wire protocol, and durable invocation-recovery mechanics.
+  Applications select and compose that backend without carrying its
+  implementation in product policy code.
+- Modal and Slurm support lives here too: `modal_evaluator`,
+  `modal_model_setup`, and the `slurm_*` modules (broker, executor, policy,
+  profile). They are evaluator dispatch, not `SandboxKind`s; run environments
+  in `vs_runtime` select them.
+- Raw status of an external system is interpreted in exactly one translator
+  per system, and every other module reads its typed life: `skypilot_states`
+  (cluster and queued-job status, `sky logs` exit codes), `docker_states`
+  (the result of `docker rm -f`), and the translator section of
+  `modal_evaluator` (container listings, the exec exit-code marker, health).
+  Each is pure and total, never guesses (an unrecognised or missing status is
+  `Unknown(raw)`, never a near match or a default), and the job and container
+  lives only move forward, with the end final. Modal's lives sit inside the
+  helper because it is mounted into the runtime as a single stdlib-only file.
+- `vs_sandbox.api.evaluator_helpers` locates the installed Modal and SkyPilot
+  helper programs that runtime composition mounts into remote sandboxes.

@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
+from vs_sandbox import api as sandbox_api
 from vs_sandbox import host_sandbox
+from vs_sandbox.api import HostSandbox
+from vs_sim.api import ProbeResult
+from vs_sim.api.testing import ScriptedProbe
+
+_WORKING_BWRAP = ScriptedProbe(lambda _argv: ProbeResult(0, ""))
 
 
 def _host_devices(pattern: str) -> list[Path]:
     dev = Path("/dev")
     return sorted(dev.glob(pattern)) if dev.exists() else []
+
+
+def _build_host_sandbox(monkeypatch: pytest.MonkeyPatch, workspace: Path) -> HostSandbox:
+    monkeypatch.setattr(host_sandbox.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/bwrap")
+    sandbox = sandbox_api.build_host_sandbox(workspace, env={}, probe=_WORKING_BWRAP)
+    assert isinstance(sandbox, HostSandbox)
+    return sandbox
 
 
 class TestAcceleratorDeviceNodes:
@@ -22,15 +36,59 @@ class TestAcceleratorDeviceNodes:
     """
 
     @pytest.mark.parametrize("pattern", ["neuron*", "nvidia*"])
-    def test_host_accelerator_devices_are_passed_through(self, pattern: str) -> None:
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="host backend is Linux-only")
+    def test_host_accelerator_devices_are_passed_through(
+        self,
+        pattern: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
         devices = _host_devices(pattern)
         if not devices:
             pytest.skip(f"host has no /dev/{pattern} devices")
 
-        nodes = host_sandbox._gpu_device_nodes()  # noqa: SLF001
+        sandbox = _build_host_sandbox(monkeypatch, tmp_path)
+        command = sandbox.wrap(["true"])
+        nodes = {
+            Path(command[index + 1])
+            for index, argument in enumerate(command[:-1])
+            if argument == "--dev-bind-try"
+        }
 
-        assert set(devices).issubset(set(nodes))
+        assert set(devices).issubset(nodes)
 
-    def test_returns_paths_that_exist(self) -> None:
-        nodes = host_sandbox._gpu_device_nodes()  # noqa: SLF001
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="host backend is Linux-only")
+    def test_bound_accelerator_paths_exist(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        sandbox = _build_host_sandbox(monkeypatch, tmp_path)
+        command = sandbox.wrap(["true"])
+        nodes = [
+            Path(command[index + 1])
+            for index, argument in enumerate(command[:-1])
+            if argument == "--dev-bind-try"
+        ]
         assert all(node.exists() for node in nodes)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="host backend is Linux-only")
+    def test_gpu_devices_none_withholds_every_accelerator_node(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        # test-isolation: the host may lack bwrap and GPUs; pin both to reach the GPU branch.
+        monkeypatch.setattr(
+            host_sandbox.shutil, "which", lambda *_args, **_kwargs: "/usr/bin/bwrap"
+        )
+        # test-isolation: the host may lack GPUs; pin them to reach the GPU branch.
+        monkeypatch.setattr(host_sandbox, "_gpu_device_nodes", lambda: [Path("/dev/nvidia0")])
+        sandbox = sandbox_api.build_host_sandbox(
+            tmp_path,
+            env={sandbox_api.SANDBOX_GPU_DEVICES_ENV: "none"},
+            probe=_WORKING_BWRAP,
+        )
+
+        assert isinstance(sandbox, HostSandbox)
+        assert "--dev-bind-try" not in sandbox.wrap(["true"])

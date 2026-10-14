@@ -42,7 +42,7 @@ revision:
 [tools.request-factory]
 kind = "cargo-git"
 git = "https://github.com/uw-syfi/request-factory"
-rev = "118da6137275fda3a290e9012853214dc437c6c0"
+rev = "89dce4a64ae12e7084fbe464ddda882fa0a4c482"
 package = "req-frontend"
 bins = ["session_runner"]
 
@@ -82,13 +82,24 @@ needed to install the declared tool. Cargo Git tools cause VibeSys to install a
 compatible Rust toolchain when necessary, then run `cargo install` at the
 pinned revision with `--locked`. Target images and remote clusters therefore
 need outbound package access and a working native linker during first-time
-setup. They must also provide any native build dependencies required by the
-declared Cargo package. The currently pinned Request Factory revision uses
-`openssl-sys`; Debian and Ubuntu targets need `pkg-config` and `libssl-dev`.
+setup. A cargo-git tool declares the Debian/Ubuntu packages its build needs in
+`system_packages` (the pinned Request Factory revision uses `openssl-sys` and
+declares `pkg-config` and `libssl-dev`). A Docker target installs exactly those
+with `apt-get` as root before building, so the agent image need not carry them.
+Rootless remote targets and the local host cannot install packages and must
+already provide the declared ones.
 
-The bundled Request Factory evaluator exposes two entrypoints. The low-level
+The bundled Request Factory evaluator exposes three entrypoints. The low-level
 `request-factory-engine` entrypoint resolves directly to the pinned binary.
 Experiments that need task-owned orchestration use `request-factory-adapter`
 and pass a Python script as the first argument; the evaluator invokes that
 script with `--request-factory-engine <trusted-path>` before the task's
-remaining arguments.
+remaining arguments. It also exports
+`VIBESYS_REQUEST_FACTORY_FIXED_TEXT_DRIVER` with the installed path of the
+versioned fixed-text driver, so model-specific preparation wrappers can
+delegate the generic workload and result behavior instead of copying it.
+Fixed independent `/v1/completions` workloads use
+`request-factory-fixed-text-v1`; its typed CLI owns deterministic trace and
+corpus generation, strict RF summary validation, and protocol-v2 metric output.
+The version suffix keeps this workload and result contract explicit while the
+generic adapter remains backward compatible.

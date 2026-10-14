@@ -4,33 +4,51 @@ from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock
 
 import pytest
+from tests.support.task_project import task_path, write_task
 
-from vibesys.input_manifest import (
+from vibesys.inputs import (
+    MANIFEST_NAME,
     InputBundle,
     WorkspaceSource,
-    load_input_bundle,
     load_project_task,
+    load_task,
 )
-from vibesys.run import Workspace
-from vs_project import Project
+from vibesys.run.workspace_policy import materialization_source
+from vs_project.api import Project, ProjectLayoutError
+from vs_runtime.api.infrastructure import ProjectMaterializer, SDKRoots
+from vs_runtime.api.testing import FakeGitRunner, FakeProjectMaterializationEffects
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _write_bundle(project_root: Path, manifest_blocks: str = "") -> Path:
-    bundle = project_root / "examples" / "data-structures" / "queue-spsc"
-    bundle.mkdir(parents=True)
-    (bundle / "OBJECTIVE.md").write_text("Build a queue.\n")
-    (bundle / "vibesys.input.toml").write_text(
+@pytest.fixture(scope="session")
+def example_input_bundles(repo_root: Path) -> tuple[InputBundle, ...]:
+    manifests = sorted((repo_root / "examples").glob(f"**/{MANIFEST_NAME}"))
+    bundles: list[InputBundle] = []
+    for manifest in manifests:
+        project = Project.discover(manifest)
+        task = next(
+            task for task in project.discover_tasks() if task.manifest_path == manifest.resolve()
+        )
+        bundles.append(load_project_task(project, task))
+
+    assert bundles, f"No example input bundles found under {repo_root / 'examples'}"
+    return tuple(bundles)
+
+
+def _write_bundle(project_root: Path, manifest_blocks: str = "", domain: str = "generic") -> Path:
+    """Write a one-task project; return its root, where candidate files live."""
+    project_root.mkdir(parents=True)
+    write_task(
+        project_root,
         f"""
 version = 1
 
 [agent]
-domain = "generic"
+domain = "{domain}"
 
 [accuracy]
 command = ["accuracy-checker"]
@@ -39,19 +57,20 @@ command = ["accuracy-checker"]
 command = ["benchmark"]
 
 {manifest_blocks}
-""".lstrip()
+""".lstrip(),
+        objective="Build a queue.\n",
     )
-    return bundle
+    return project_root
 
 
-def _workspace(root: Path, *, excluded_dirs: set[str] | None = None) -> Workspace:
-    return Workspace(
+def _materializer(root: Path, *, excluded_dirs: set[str] | None = None) -> ProjectMaterializer:
+    return ProjectMaterializer(
         root,
-        run_environment=MagicMock(isolated=False),
-        backend=MagicMock(),
-        log=MagicMock(),
-        project_root=root.parent,
+        effects=FakeProjectMaterializationEffects(),
+        log=lambda _message: None,
+        sdk_roots=SDKRoots(checkout=root.parent / "sdk", packaged=root.parent / "sdk"),
         excluded_dirs=excluded_dirs or set(),
+        git_runner=FakeGitRunner(head="0123456"),
     )
 
 
@@ -66,7 +85,7 @@ def test_manifest_without_external_sources_is_valid(tmp_path: Path) -> None:
     project_root = tmp_path / "project"
     bundle = _write_bundle(project_root)
 
-    loaded = load_input_bundle(bundle)
+    loaded = load_task(bundle)
 
     assert loaded.workspace_sources == ()
     assert loaded.evaluator_path is None
@@ -101,16 +120,6 @@ command = ["benchmark"]
     assert loaded.dockerfile_path == dockerfile.resolve()
 
 
-def test_legacy_bundle_does_not_discover_dockerfile(tmp_path: Path) -> None:
-    project_root = tmp_path / "project"
-    bundle = _write_bundle(project_root)
-    (bundle / "Dockerfile").write_text("FROM ubuntu:24.04\n", encoding="utf-8")
-
-    loaded = load_input_bundle(bundle)
-
-    assert loaded.dockerfile_path is None
-
-
 def test_manifest_resolves_modal_entrypoint_from_project_root(tmp_path: Path) -> None:
     project_root = tmp_path / "project"
     bundle = _write_bundle(
@@ -121,7 +130,7 @@ def test_manifest_resolves_modal_entrypoint_from_project_root(tmp_path: Path) ->
     entrypoint.parent.mkdir()
     entrypoint.write_text("app = object()\n")
 
-    loaded = load_input_bundle(bundle)
+    loaded = load_task(bundle)
 
     assert loaded.modal_entrypoint == "deploy/service.py"
 
@@ -132,7 +141,7 @@ def test_manifest_resolves_modal_entrypoint_from_project_root(tmp_path: Path) ->
         ("", "non-empty path"),
         (".", "current, or parent"),
         ("../service.py", "current, or parent"),
-        ("/tmp/service.py", "relative to the project root"),  # noqa: S108
+        ("/absolute/service.py", "relative to the project root"),
         ("missing.py", "does not exist"),
     ],
 )
@@ -148,7 +157,7 @@ def test_manifest_rejects_invalid_modal_entrypoint(
     )
 
     with pytest.raises((FileNotFoundError, ValueError), match=error):
-        load_input_bundle(bundle)
+        load_task(bundle)
 
 
 def test_manifest_rejects_modal_entrypoint_directory_and_escape(tmp_path: Path) -> None:
@@ -160,7 +169,7 @@ def test_manifest_rejects_modal_entrypoint_directory_and_escape(tmp_path: Path) 
     (directory_bundle / "deploy").mkdir()
 
     with pytest.raises(ValueError, match="is not a file"):
-        load_input_bundle(directory_bundle)
+        load_task(directory_bundle)
 
     escaping_bundle = tmp_path / "escaping"
     _write_bundle(
@@ -169,11 +178,10 @@ def test_manifest_rejects_modal_entrypoint_directory_and_escape(tmp_path: Path) 
     )
     outside = tmp_path / "outside.py"
     outside.write_text("app = object()\n")
-    task = escaping_bundle / "examples" / "data-structures" / "queue-spsc"
-    (task / "service.py").symlink_to(outside)
+    (escaping_bundle / "service.py").symlink_to(outside)
 
     with pytest.raises(ValueError, match="escapes the project"):
-        load_input_bundle(task)
+        load_task(escaping_bundle)
 
 
 def test_manifest_allows_contained_modal_entrypoint_symlink(tmp_path: Path) -> None:
@@ -187,7 +195,7 @@ def test_manifest_allows_contained_modal_entrypoint_symlink(tmp_path: Path) -> N
     target.write_text("app = object()\n")
     (bundle / "service.py").symlink_to(target.relative_to(bundle))
 
-    assert load_input_bundle(bundle).modal_entrypoint == "service.py"
+    assert load_task(bundle).modal_entrypoint == "service.py"
 
 
 def test_manifest_rejects_unknown_modal_environment_keys(tmp_path: Path) -> None:
@@ -199,7 +207,45 @@ def test_manifest_rejects_unknown_modal_environment_keys(tmp_path: Path) -> None
     (bundle / "service.py").write_text("app = object()\n")
 
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        load_input_bundle(bundle)
+        load_task(bundle)
+
+
+def test_manifest_without_docker_in_docker_declares_none(tmp_path: Path) -> None:
+    bundle = _write_bundle(tmp_path / "project", domain="microservices")
+
+    assert load_task(bundle).docker_in_docker is False
+
+
+def test_manifest_declares_docker_in_docker(tmp_path: Path) -> None:
+    bundle = _write_bundle(
+        tmp_path / "project", "[environment]\ndocker_in_docker = true", domain="microservices"
+    )
+
+    assert load_task(bundle).docker_in_docker is True
+
+
+@pytest.mark.parametrize("value", ['"true"', '"yes"', "1", '""'])
+def test_manifest_rejects_a_non_boolean_docker_in_docker(tmp_path: Path, value: str) -> None:
+    bundle = _write_bundle(
+        tmp_path / "project",
+        f"[environment]\ndocker_in_docker = {value}",
+        domain="microservices",
+    )
+
+    with pytest.raises(ValueError, match="docker_in_docker"):
+        load_task(bundle)
+
+
+@pytest.mark.parametrize(
+    "key", ["container_runtime", "docker-in-docker", "dind", "docker_in_dockr"]
+)
+def test_manifest_rejects_unknown_environment_keys_naming_the_key(tmp_path: Path, key: str) -> None:
+    bundle = _write_bundle(
+        tmp_path / "project", f"[environment]\n{key} = true", domain="microservices"
+    )
+
+    with pytest.raises(ValueError, match=key):
+        load_task(bundle)
 
 
 def test_manifest_resolves_workspace_sources(tmp_path: Path) -> None:
@@ -217,7 +263,7 @@ dest = "vllm"
 """,
     )
 
-    loaded = load_input_bundle(bundle)
+    loaded = load_task(bundle)
 
     assert loaded.workspace_sources == (
         WorkspaceSource(
@@ -266,7 +312,7 @@ def test_manifest_rejects_invalid_workspace_sources(
     )
 
     with pytest.raises(ValueError, match=error):
-        load_input_bundle(bundle)
+        load_task(bundle)
 
 
 def test_manifest_rejects_duplicate_workspace_source_destinations(tmp_path: Path) -> None:
@@ -291,27 +337,16 @@ dest = "src"
     )
 
     with pytest.raises(ValueError, match="duplicate workspace source destination"):
-        load_input_bundle(bundle)
-
-
-def test_manifest_resolves_evaluator_relative_to_bundle(tmp_path: Path) -> None:
-    project_root = tmp_path / "project"
-    evaluator = project_root / "examples" / "evaluators" / "queue"
-    evaluator.mkdir(parents=True)
-    bundle = _write_bundle(project_root, '[evaluator]\nsource = "../../evaluators/queue"')
-
-    loaded = load_input_bundle(bundle)
-
-    assert loaded.evaluator_path == evaluator.resolve()
+        load_task(bundle)
 
 
 def test_manifest_resolves_bundle_local_evaluator(tmp_path: Path) -> None:
     project_root = tmp_path / "project"
     bundle = _write_bundle(project_root, '[evaluator]\nsource = "_evaluator_src"')
-    evaluator = bundle / "_evaluator_src"
+    evaluator = task_path(bundle) / "_evaluator_src"
     evaluator.mkdir()
 
-    loaded = load_input_bundle(bundle)
+    loaded = load_task(bundle)
 
     assert loaded.evaluator_path == evaluator.resolve()
 
@@ -321,73 +356,57 @@ def test_manifest_rejects_removed_workspace_seed(tmp_path: Path) -> None:
     bundle = _write_bundle(project_root, '[workspace]\nseed = "_seed"')
 
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        load_input_bundle(bundle)
+        load_task(bundle)
 
 
 @pytest.mark.parametrize(
-    ("source_value", "error"),
+    "source_value",
     [
-        ("/tmp/evaluator", "source must be relative"),  # noqa: S108
-        ("../../../outside", "path does not exist"),
-        ("../../evaluators/missing", "path does not exist"),
+        "/absolute/evaluator",
+        "../outside",
+        "../../../outside",
+        "../../evaluators/missing",
+        "missing",
     ],
 )
-def test_manifest_rejects_invalid_evaluator_paths(
+def test_manifest_rejects_evaluator_paths_that_leave_the_task_or_are_missing(
     tmp_path: Path,
     source_value: str,
-    error: str,
 ) -> None:
     project_root = tmp_path / "project"
-    bundle = _write_bundle(project_root, f'[evaluator]\nsource = "{source_value}"')
+    (project_root / "outside").mkdir(parents=True)
+    bundle = _write_bundle(project_root / "inner", f'[evaluator]\nsource = "{source_value}"')
 
-    with pytest.raises((FileNotFoundError, ValueError), match=error):
-        load_input_bundle(bundle)
+    with pytest.raises((FileNotFoundError, ValueError, ProjectLayoutError)):
+        load_task(bundle)
 
 
 def test_manifest_rejects_evaluator_file(tmp_path: Path) -> None:
     project_root = tmp_path / "project"
-    evaluator = project_root / "examples" / "evaluators" / "not-a-directory"
-    evaluator.parent.mkdir(parents=True)
-    evaluator.write_text("not a directory\n")
-    bundle = _write_bundle(
-        project_root,
-        '[evaluator]\nsource = "../../evaluators/not-a-directory"',
-    )
+    bundle = _write_bundle(project_root, '[evaluator]\nsource = "not-a-directory"')
+    (task_path(bundle) / "not-a-directory").write_text("not a directory\n")
 
     with pytest.raises(ValueError, match="path is not a directory"):
-        load_input_bundle(bundle)
-
-
-def test_manifest_allows_explicit_relative_evaluator_outside_example_tree(tmp_path: Path) -> None:
-    project_root = tmp_path / "project"
-    outside = project_root / "outside"
-    outside.mkdir(parents=True)
-    bundle = _write_bundle(
-        project_root,
-        '[evaluator]\nsource = "../../../outside"',
-    )
-
-    assert load_input_bundle(bundle).evaluator_path == outside.resolve()
+        load_task(bundle)
 
 
 def test_manifest_rejects_unknown_evaluator_keys(tmp_path: Path) -> None:
     project_root = tmp_path / "project"
-    evaluator = project_root / "examples" / "evaluators" / "queue"
-    evaluator.mkdir(parents=True)
     bundle = _write_bundle(
         project_root,
-        '[evaluator]\nsource = "../../evaluators/queue"\nmutable = false',
+        '[evaluator]\nsource = "queue"\nmutable = false',
     )
+    (task_path(bundle) / "queue").mkdir()
 
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        load_input_bundle(bundle)
+        load_task(bundle)
 
 
 def test_manifest_accepts_benchmark_result_protocol(tmp_path: Path) -> None:
     project_root = tmp_path / "project"
     bundle_path = _write_bundle(project_root, "result_protocol = 2")
 
-    bundle = load_input_bundle(bundle_path)
+    bundle = load_task(bundle_path)
 
     assert bundle.benchmark_result_protocol == 2
     assert bundle.benchmark_result is None
@@ -405,7 +424,7 @@ def test_manifest_rejects_both_benchmark_result_contracts(tmp_path: Path) -> Non
         ValueError,
         match=re.escape("benchmark.result and benchmark.result_protocol are mutually exclusive"),
     ):
-        load_input_bundle(bundle)
+        load_task(bundle)
 
 
 @pytest.mark.parametrize("version", ["1", "3"])
@@ -417,7 +436,7 @@ def test_manifest_rejects_unsupported_benchmark_result_protocol(
     bundle = _write_bundle(project_root, f"result_protocol = {version}")
 
     with pytest.raises(ValueError, match="result_protocol"):
-        load_input_bundle(bundle)
+        load_task(bundle)
 
 
 def test_manifest_rejects_unknown_top_level_tables(tmp_path: Path) -> None:
@@ -425,13 +444,13 @@ def test_manifest_rejects_unknown_top_level_tables(tmp_path: Path) -> None:
     bundle = _write_bundle(project_root, "[unknown]\nvalue = true")
 
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        load_input_bundle(bundle)
+        load_task(bundle)
 
 
 def test_workspace_source_destination_collision_is_rejected(tmp_path: Path) -> None:
     root = tmp_path / "project"
-    workspace = _workspace(root)
-    workspace.create()
+    materializer = _materializer(root)
+    materializer.create()
     (root / "library").mkdir()
     source = WorkspaceSource(
         name="library",
@@ -441,13 +460,13 @@ def test_workspace_source_destination_collision_is_rejected(tmp_path: Path) -> N
     )
 
     with pytest.raises(ValueError, match="destination already exists"):
-        workspace.materialize_git_source(source)
+        materializer.materialize_git_source(materialization_source(source))
 
 
 def test_workspace_source_destination_cannot_use_excluded_path(tmp_path: Path) -> None:
     root = tmp_path / "project"
-    workspace = _workspace(root, excluded_dirs={"repos", "target"})
-    workspace.create()
+    materializer = _materializer(root, excluded_dirs={"repos", "target"})
+    materializer.create()
     source = WorkspaceSource(
         name="library",
         repo="https://example.invalid/library.git",
@@ -456,6 +475,6 @@ def test_workspace_source_destination_cannot_use_excluded_path(tmp_path: Path) -
     )
 
     with pytest.raises(ValueError, match="excluded path component"):
-        workspace.materialize_git_source(source)
+        materializer.materialize_git_source(materialization_source(source))
 
     assert not (root / "repos").exists()

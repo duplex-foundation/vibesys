@@ -1,5 +1,7 @@
 """Serialization tests for the run-event wire contract."""
 
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import ValidationError
 
@@ -17,6 +19,10 @@ from server.events import (
     GateKind,
     GateStartedData,
     JsonResultPayload,
+    ProviderSwitchedData,
+    QuotaPausedData,
+    QuotaResumedData,
+    RateLimitUpdateData,
     RoundFinishedData,
     RunConfiguredData,
     RunEvent,
@@ -35,7 +41,7 @@ def _round_trip(event: RunEvent) -> RunEvent:
 
 
 class TestNewEventDataRoundTrip:
-    def test_tool_call(self):  # noqa: ANN201  # tracked: #288
+    def test_tool_call(self) -> None:
         status = AgentStatusData(
             progress="Round 1/2",
             agent_label="Implementer",
@@ -46,6 +52,7 @@ class TestNewEventDataRoundTrip:
         event = make_event(
             EventType.TOOL_CALL,
             data=ToolCallData(tool="shell", args={"cmd": "ls", "count": 3}, status=status),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, ToolCallData)
@@ -53,21 +60,23 @@ class TestNewEventDataRoundTrip:
         assert restored.data.args == {"cmd": "ls", "count": 3}
         assert restored.data.status == status
 
-    def test_tool_result(self):  # noqa: ANN201  # tracked: #288
+    def test_tool_result(self) -> None:
         event = make_event(
             EventType.TOOL_RESULT,
             data=ToolResultData(tool="shell", content="out", is_error=True),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, ToolResultData)
         assert restored.data.is_error is True
         assert restored.data.payload is None
 
-    def test_tool_result_with_command_payload(self):  # noqa: ANN201  # tracked: #288
+    def test_tool_result_with_command_payload(self) -> None:
         payload = CommandResultPayload(stdout="out", stderr="warn", exit_code=2, duration=1.5)
         event = make_event(
             EventType.TOOL_RESULT,
             data=ToolResultData(tool="shell", content="out", payload=payload),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, ToolResultData)
@@ -75,58 +84,116 @@ class TestNewEventDataRoundTrip:
         assert restored.data.payload == payload
         assert restored.data.content == "out"
 
-    def test_tool_result_with_json_payload(self):  # noqa: ANN201  # tracked: #288
+    def test_tool_result_with_json_payload(self) -> None:
         payload = JsonResultPayload(value={"rows": [1, 2], "ok": True})
         event = make_event(
             EventType.TOOL_RESULT,
             data=ToolResultData(
                 tool="query", content='{"rows": [1, 2], "ok": true}', payload=payload
             ),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, ToolResultData)
         assert isinstance(restored.data.payload, JsonResultPayload)
         assert restored.data.payload.value == {"rows": [1, 2], "ok": True}
 
-    def test_tool_result_payload_rejects_unknown_kind(self):  # noqa: ANN201  # tracked: #288
+    def test_tool_result_payload_rejects_unknown_kind(self) -> None:
         with pytest.raises(ValidationError):
             ToolResultData.model_validate(
                 {"tool": "shell", "content": "out", "payload": {"kind": "mystery"}}
             )
 
-    def test_json_payload_rejects_scalar_value(self):  # noqa: ANN201  # tracked: #288
+    def test_json_payload_rejects_scalar_value(self) -> None:
         with pytest.raises(ValidationError):
             JsonResultPayload.model_validate({"value": 42})
 
-    def test_tool_result_without_payload_field_still_validates(self):  # noqa: ANN201  # tracked: #288
+    def test_tool_result_without_payload_field_still_validates(self) -> None:
         # Old event logs predate the payload field and must keep replaying.
         restored = ToolResultData.model_validate(
             {"kind": "tool_result", "tool": "t", "content": "c"}
         )
         assert restored.payload is None
 
-    def test_todo_update(self):  # noqa: ANN201  # tracked: #288
+    def test_todo_update(self) -> None:
         event = make_event(
             EventType.TODO_UPDATE,
             data=TodoUpdateData(todos=[TodoItemData(content="a", status="pending")]),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, TodoUpdateData)
         assert restored.data.todos == [TodoItemData(content="a", status="pending")]
 
-    def test_usage_update(self):  # noqa: ANN201  # tracked: #288
+    def test_usage_update(self) -> None:
         event = make_event(
             EventType.USAGE_UPDATE,
             data=UsageUpdateData(input_tokens=5_000, context_window=1_000_000, model="m"),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, UsageUpdateData)
         assert restored.data.input_tokens == 5_000
 
-    def test_agent_output_chunk_status_is_optional_and_round_trips(self):  # noqa: ANN201  # tracked: #288
+    def test_rate_limit_update(self) -> None:
+        event = make_event(
+            EventType.RATE_LIMIT_UPDATE,
+            data=RateLimitUpdateData(
+                provider="claude", window="five_hour", used_fraction=0.5, exhausted=False
+            ),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        restored = _round_trip(event)
+        assert isinstance(restored.data, RateLimitUpdateData)
+        assert restored.data.window == "five_hour"
+        assert restored.data.resets_at is None
+
+    def test_quota_events(self) -> None:
+        paused = _round_trip(
+            make_event(
+                EventType.QUOTA_PAUSED,
+                data=QuotaPausedData(
+                    provider="claude",
+                    condition="rate_limited",
+                    detail="429",
+                    resets_at=1.5e9,
+                ),
+                timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+        resumed = _round_trip(
+            make_event(
+                EventType.QUOTA_RESUMED,
+                data=QuotaResumedData(provider="claude"),
+                timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+        assert isinstance(paused.data, QuotaPausedData)
+        assert (paused.data.condition, paused.data.resets_at) == ("rate_limited", 1.5e9)
+        assert isinstance(resumed.data, QuotaResumedData)
+
+    def test_provider_switched(self) -> None:
+        restored = _round_trip(
+            make_event(
+                EventType.PROVIDER_SWITCHED,
+                data=ProviderSwitchedData(
+                    from_provider="claude",
+                    to_provider="codex",
+                    to_model="gpt-5",
+                    reason="operator",
+                    detail="the operator resumed with the fallback",
+                ),
+                timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+        assert isinstance(restored.data, ProviderSwitchedData)
+        assert (restored.data.to_provider, restored.data.reason) == ("codex", "operator")
+
+    def test_agent_output_chunk_status_is_optional_and_round_trips(self) -> None:
         bare = make_event(
             EventType.AGENT_OUTPUT_CHUNK,
             data=AgentOutputChunkData(channel="assistant", content="hi"),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(bare)
         assert isinstance(restored.data, AgentOutputChunkData)
@@ -136,6 +203,7 @@ class TestNewEventDataRoundTrip:
         rich = make_event(
             EventType.AGENT_OUTPUT_CHUNK,
             data=AgentOutputChunkData(channel="assistant", content="hi", status=status),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(rich)
         assert isinstance(restored.data, AgentOutputChunkData)
@@ -143,7 +211,7 @@ class TestNewEventDataRoundTrip:
 
 
 class TestBackwardCompatibility:
-    def test_chunk_without_status_field_still_parses(self):  # noqa: ANN201  # tracked: #288
+    def test_chunk_without_status_field_still_parses(self) -> None:
         """Events recorded by older backends omit the new optional fields."""
         raw = (
             '{"protocol_version": 1, "sequence": 3, "run_id": "r", '
@@ -154,34 +222,35 @@ class TestBackwardCompatibility:
         assert isinstance(event.data, AgentOutputChunkData)
         assert event.data.status is None
 
-    def test_unknown_data_kind_rejected(self):  # noqa: ANN201  # tracked: #288
+    def test_unknown_data_kind_rejected(self) -> None:
         raw = (
             '{"protocol_version": 1, "timestamp": "2026-01-01T00:00:00Z", '
             '"type": "output", "data": {"kind": "not_a_kind"}}'
         )
-        with pytest.raises(ValueError):  # noqa: PT011  # tracked: #288
+        with pytest.raises(ValueError, match="not_a_kind"):
             RunEvent.model_validate_json(raw)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_benchmark_result_rejects_non_finite_value(value):  # noqa: ANN001, ANN201  # tracked: #288
+def test_benchmark_result_rejects_non_finite_value(value: float) -> None:
     with pytest.raises(ValidationError, match="finite number"):
         BenchmarkResultData(metric="throughput", value=value, unit="req/s")
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_round_finished_rejects_non_finite_perf_metric(value):  # noqa: ANN001, ANN201  # tracked: #288
+def test_round_finished_rejects_non_finite_perf_metric(value: float) -> None:
     with pytest.raises(ValidationError, match="finite number"):
         RoundFinishedData(
             attempts=1,
             judge_verdict="pass",
             perf_metric=value,
             perf_unit="req/s",
+            profile_skipped=False,
         )
 
 
 class TestRoundFinishedProfileSkipped:
-    def test_flag_round_trips_when_true(self):  # noqa: ANN201  # tracked: #288
+    def test_flag_round_trips_when_true(self) -> None:
         event = make_event(
             EventType.ROUND_FINISHED,
             data=RoundFinishedData(
@@ -191,26 +260,25 @@ class TestRoundFinishedProfileSkipped:
                 perf_unit="req/s",
                 profile_skipped=True,
             ),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, RoundFinishedData)
         assert restored.data.profile_skipped is True
 
-    def test_payload_without_flag_defaults_false(self):  # noqa: ANN201  # tracked: #288
-        """Events recorded before the field existed must keep replaying."""
+    def test_payload_without_flag_is_rejected(self) -> None:
         raw = (
             '{"protocol_version": 1, "sequence": 7, "run_id": "r", '
             '"timestamp": "2026-01-01T00:00:00Z", "type": "round_finished", '
             '"data": {"kind": "round_finished", "attempts": 2, "judge_verdict": "pass", '
             '"perf_metric": 100.0, "perf_unit": "req/s"}}'
         )
-        event = RunEvent.model_validate_json(raw)
-        assert isinstance(event.data, RoundFinishedData)
-        assert event.data.profile_skipped is False
+        with pytest.raises(ValidationError, match="profile_skipped"):
+            RunEvent.model_validate_json(raw)
 
 
 class TestFrameworkEventRoundTrip:
-    def test_gate_started(self):  # noqa: ANN201
+    def test_gate_started(self) -> None:
         event = make_event(
             EventType.GATE_STARTED,
             status=EventStatus.ACTIVE,
@@ -220,6 +288,7 @@ class TestFrameworkEventRoundTrip:
                 recipe="focused-tests",
                 command="uv run pytest -q",
             ),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, GateStartedData)
@@ -230,7 +299,7 @@ class TestFrameworkEventRoundTrip:
         assert restored.status is EventStatus.ACTIVE
         assert restored.round_label == "round-3"
 
-    def test_gate_finished_pass_with_metric(self):  # noqa: ANN201
+    def test_gate_finished_pass_with_metric(self) -> None:
         event = make_event(
             EventType.GATE_FINISHED,
             status=EventStatus.COMPLETED,
@@ -240,6 +309,7 @@ class TestFrameworkEventRoundTrip:
                 value=42.5,
                 unit="tok/s",
             ),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, GateFinishedData)
@@ -250,7 +320,7 @@ class TestFrameworkEventRoundTrip:
         assert restored.data.reused is False
         assert restored.status is EventStatus.COMPLETED
 
-    def test_gate_finished_failure_with_output_tail(self):  # noqa: ANN201
+    def test_gate_finished_failure_with_output_tail(self) -> None:
         event = make_event(
             EventType.GATE_FINISHED,
             status=EventStatus.FAILED,
@@ -258,6 +328,7 @@ class TestFrameworkEventRoundTrip:
                 gate=GateKind.ACCURACY,
                 output_tail="assertion mismatch",
             ),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, GateFinishedData)
@@ -267,14 +338,15 @@ class TestFrameworkEventRoundTrip:
         assert restored.diagnostic is None
 
     @pytest.mark.parametrize("value", [float("nan"), float("inf")])
-    def test_gate_finished_rejects_non_finite_value(self, value):  # noqa: ANN001, ANN201
+    def test_gate_finished_rejects_non_finite_value(self, value: float) -> None:
         with pytest.raises(ValidationError, match="finite"):
             GateFinishedData(gate=GateKind.BENCHMARK, metric="m", value=value)
 
-    def test_workspace_snapshot(self):  # noqa: ANN201
+    def test_workspace_snapshot(self) -> None:
         event = make_event(
             EventType.WORKSPACE_SNAPSHOT,
             data=WorkspaceSnapshotData(label="round-2", commit="a" * 40),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, WorkspaceSnapshotData)
@@ -284,7 +356,7 @@ class TestFrameworkEventRoundTrip:
         assert restored.data.excluded_paths == ()
         assert restored.data.source is FrameworkSource.GIT_TRACKING
 
-    def test_run_configured(self):  # noqa: ANN201
+    def test_run_configured(self) -> None:
         event = make_event(
             EventType.RUN_CONFIGURED,
             data=RunConfiguredData(
@@ -296,6 +368,7 @@ class TestFrameworkEventRoundTrip:
                 benchmark_contract=True,
                 pareto_objectives="[latency(min)], frontier_bias=0.5",
             ),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, RunConfiguredData)
@@ -303,7 +376,7 @@ class TestFrameworkEventRoundTrip:
         assert restored.data.search_policy == "pareto-ucb"
         assert restored.data.benchmark_contract is True
 
-    def test_framework_warning_with_diagnostic(self):  # noqa: ANN201
+    def test_framework_warning_with_diagnostic(self) -> None:
         """The projection lifts the payload into the wire diagnostic field."""
         event = make_event(
             EventType.FRAMEWORK_WARNING,
@@ -320,6 +393,7 @@ class TestFrameworkEventRoundTrip:
                 severity=DiagnosticSeverity.WARNING,
                 source="loop",
             ),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
         restored = _round_trip(event)
         assert isinstance(restored.data, FrameworkWarningData)
@@ -329,7 +403,7 @@ class TestFrameworkEventRoundTrip:
         assert restored.diagnostic.severity is DiagnosticSeverity.WARNING
         assert restored.diagnostic.source == "loop"
 
-    def test_diagnostic_without_source_still_parses(self):  # noqa: ANN201
+    def test_diagnostic_without_source_still_parses(self) -> None:
         """`source` is additive: persisted diagnostics without it stay valid."""
         raw = '{"code": "framework_warning", "summary": "s", "scope": "run", "severity": "warning"}'
         diagnostic = Diagnostic.model_validate_json(raw)

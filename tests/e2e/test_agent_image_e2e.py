@@ -18,11 +18,19 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
+import sys
+from typing import TYPE_CHECKING
 
 import pytest
+from tests.support import run_test_command
 
-from vibesys.sandbox.images import agent_image
+from vs_agent.api import CONTAINER_PYTHON
+from vs_agent.api.images import agent_image, build_task_image
+from vs_runtime.api.infrastructure import image_features
+from vs_sim.api import MonotonicClock
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 ENABLE_ENV = "VIBESYS_E2E_DOCKER"
 
@@ -35,11 +43,12 @@ _RUN_TIMEOUT_S = 120.0
 
 #: Proves the image runs as the non-root ``agent`` user with the fixed uid
 #: the sandbox remaps to the host uid at container start (see
-#: ``agent.Dockerfile``), then that every shipped CLI, both optional
-#: toolchains, ripgrep, and the ``mcp`` package are all reachable.
+#: the ``vibesys-agent`` Feature), then that every shipped CLI, both optional
+#: toolchains, ripgrep, and VibeSys's own Python with the ``mcp`` package are all reachable.
 _CHECK_SCRIPT = (
     "set -e; "
     "id -u; "
+    "pwd; "
     "claude --version; "
     "codex --version; "
     "gemini --version; "
@@ -47,7 +56,7 @@ _CHECK_SCRIPT = (
     "cargo --version; "
     "go version; "
     "rg --version; "
-    'python3 -c "import mcp"'
+    f'{CONTAINER_PYTHON} -c "import mcp, sys; assert sys.version_info >= (3, 12)"'
 )
 
 
@@ -62,20 +71,152 @@ def _enabled() -> bool:
 def test_cpu_agent_image_runs_every_shipped_cli_as_the_agent_user() -> None:
     image_id = agent_image(
         "python:3.12-bookworm",
-        toolchains=("rust", "go"),
+        features=image_features(("rust", "go")),
         timeout=_BUILD_TIMEOUT_S,
+        clock=MonotonicClock(),
     )
 
-    result = subprocess.run(  # noqa: S603
-        ("docker", "run", "--rm", image_id, "bash", "-lc", _CHECK_SCRIPT),  # noqa: S607
+    result = run_test_command(
+        ("docker", "run", "--rm", image_id, "bash", "-lc", _CHECK_SCRIPT),
         capture_output=True,
         check=False,
         text=True,
         timeout=_RUN_TIMEOUT_S,
     )
 
-    print(result.stdout)  # noqa: T201  # -s surfaces this for a human reading the e2e run
-    print(result.stderr)  # noqa: T201
+    sys.stdout.write(result.stdout + "\n")
+    sys.stderr.write(result.stderr + "\n")
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
     output_lines = [line for line in result.stdout.splitlines() if line.strip()]
-    assert output_lines[0] == "1000", output_lines
+    assert output_lines[:2] == ["1000", "/workspace"], output_lines
+
+
+@pytest.mark.skipif(
+    not _enabled() or shutil.which("docker") is None,
+    reason=f"set {ENABLE_ENV}=1 with docker on PATH to build and run the agent image",
+)
+def test_container_runtime_and_pip_extras_features_install_everything_they_use() -> None:
+    """The opt-in Features add their tools, and the agent user can use the ``docker`` group."""
+    image_id = agent_image(
+        "python:3.12-bookworm",
+        features=image_features(("container-runtime",), ("modal>=0.66",)),
+        timeout=_BUILD_TIMEOUT_S,
+        clock=MonotonicClock(),
+    )
+
+    result = run_test_command(
+        (
+            "docker",
+            "run",
+            "--rm",
+            image_id,
+            "bash",
+            "-lc",
+            "set -e; id -nG | tr ' ' '\\n' | grep -x docker; docker --version; "
+            "kind version; kubectl version --client; python3 -c 'import modal'",
+        ),
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=_RUN_TIMEOUT_S,
+    )
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+
+
+def _task_dockerfile(tmp_path: Path) -> Path:
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nRUN echo task-layer > /task-marker\n",
+        encoding="utf-8",
+    )
+    return dockerfile
+
+
+@pytest.mark.skipif(
+    not _enabled() or shutil.which("docker") is None,
+    reason=f"set {ENABLE_ENV}=1 with docker on PATH to build the task and agent images",
+)
+@pytest.mark.parametrize("flow", ["task-dockerfile", "recorded-id"])
+def test_agent_layer_builds_on_a_task_image_end_to_end(tmp_path: Path, flow: str) -> None:
+    """The agent layer builds on a task image without contacting a registry.
+
+    Regression for #1520: BuildKit resolves ``FROM sha256:<id>`` as a registry
+    reference and fails on Docker 29's containerd image store. ``recorded-id``
+    is the headless entrypoint's flow (it builds the task image, records its
+    ID, and hands that ID to ``agent_image`` as the base).
+    """
+    dockerfile = _task_dockerfile(tmp_path)
+    if flow == "recorded-id":
+        task_id = build_task_image(
+            dockerfile,
+            base_image="python:3.12-bookworm",
+            timeout=_BUILD_TIMEOUT_S,
+            clock=MonotonicClock(),
+        )
+        image_id = agent_image(task_id, timeout=_BUILD_TIMEOUT_S, clock=MonotonicClock())
+    else:
+        image_id = agent_image(
+            "python:3.12-bookworm",
+            task_dockerfile=dockerfile,
+            timeout=_BUILD_TIMEOUT_S,
+            clock=MonotonicClock(),
+        )
+
+    result = run_test_command(
+        ("docker", "run", "--rm", image_id, "cat", "/task-marker"),
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=_RUN_TIMEOUT_S,
+    )
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.strip() == "task-layer"
+
+
+@pytest.mark.skipif(
+    not _enabled() or shutil.which("docker") is None,
+    reason=f"set {ENABLE_ENV}=1 with docker on PATH to build the task and agent images",
+)
+def test_agent_user_and_group_are_both_named_agent_over_a_uid_1000_base(tmp_path: Path) -> None:
+    """The sandbox runs ``chown agent:agent``, so the group must carry the name too.
+
+    Regression: the ROCm PyTorch image has a ``jenkins`` user and group at id
+    1000; renaming only the user left ``chown agent:agent`` failing with
+    ``invalid group`` before the first agent turn.
+    """
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n"
+        "RUN groupadd --gid 1000 jenkins && "
+        "useradd --uid 1000 --gid 1000 --create-home jenkins\n",
+        encoding="utf-8",
+    )
+    image_id = agent_image(
+        "python:3.12-bookworm",
+        task_dockerfile=dockerfile,
+        timeout=_BUILD_TIMEOUT_S,
+        clock=MonotonicClock(),
+    )
+
+    result = run_test_command(
+        (
+            "docker",
+            "run",
+            "--rm",
+            "-u",
+            "root",
+            image_id,
+            "sh",
+            "-c",
+            "chown agent:agent /home/agent && id -un agent && id -gn agent",
+        ),
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=_RUN_TIMEOUT_S,
+    )
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.split() == ["agent", "agent"]

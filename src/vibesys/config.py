@@ -12,21 +12,29 @@ rather than being silently dropped, which is the failure mode the previous
 allowlist loader suffered from.
 """
 
-import os
 import tomllib
-from collections.abc import Mapping  # noqa: TC003  # tracked: #288
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from vibesys.constants import DEFAULT_COMPUTE_BACKEND, PROJECT_ROOT, ComputeBackend
-from vibesys.features import FeatureFlag
 from vibesys.repository import REPOSITORY_COMPONENT, RepositoryVisibility
-from vs_feature_flags import parse_feature_flag_overrides
+from vs_agent.api import SHIPPED_PROVIDERS, validate_env_names
+from vs_core.api import MAX_REQUEST_RETRIES, MAX_SUBMISSIONS_PER_MEASUREMENT, RequestRetries
+from vs_runtime.api import AgentRoleId, EvaluationRetries
+from vs_runtime.api.infrastructure import (
+    BundledResources,
+    FallbackTarget,
+    QuotaAction,
+    QuotaPolicy,
+)
 
-Provider = Literal["vertex-ai", "anthropic", "google-genai", "openai", "openai-compatible"]
+BUNDLED_RESOURCES = BundledResources(PROJECT_ROOT / "resources", package="vibesys")
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class _Strict(BaseModel):
@@ -35,19 +43,15 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ModelCfg(_Strict):  # noqa: D101  # tracked: #288
+class ModelCfg(_Strict):
+    """Model identifier from agent.toml."""
+
     name: str = Field(description="Model identifier, e.g. 'claude-sonnet-4-6'. Required.")
-    provider: Provider | None = Field(
-        default=None,
-        description=(
-            "Provider override. When omitted, auto-detected from the model-name "
-            "prefix: claude-* → anthropic, gpt-*/o1/o3/o4 → openai, "
-            "gemini-*/gemma-* → google-genai."
-        ),
-    )
 
 
-class ThinkingCfg(_Strict):  # noqa: D101  # tracked: #288
+class ThinkingCfg(_Strict):
+    """Optional reasoning-effort level or token budget."""
+
     level: str | None = Field(
         default=None,
         description=(
@@ -67,88 +71,14 @@ class ThinkingCfg(_Strict):  # noqa: D101  # tracked: #288
     @model_validator(mode="after")
     def _one_thinking_control(self) -> Self:
         if self.level is not None and self.budget is not None:
-            raise ValueError("thinking.level and thinking.budget are mutually exclusive")  # noqa: TRY003  # tracked: #288
+            message = "thinking.level and thinking.budget are mutually exclusive"
+            raise ValueError(message)
         return self
 
 
-class VertexCfg(_Strict):  # noqa: D101  # tracked: #288
-    # The attribute is ``json_path`` to avoid shadowing ``BaseModel.json``; the
-    # TOML key stays ``json`` via the alias.
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+class BackendCfg(_Strict):
+    """Compute backend selected for the run."""
 
-    json_path: str | None = Field(
-        default=None,
-        alias="json",
-        description=(
-            "Path to the Vertex AI service-account JSON key file. Overridable via "
-            "$VERTEX_SERVICE_ACCOUNT_JSON."
-        ),
-    )
-    project: str | None = Field(
-        default=None,
-        description=(
-            "GCP project id. Falls back to the key file's project_id when unset. "
-            "Overridable via $VERTEX_PROJECT."
-        ),
-    )
-    region: str = Field(
-        default="us-east5",
-        description="Vertex AI region/location. Overridable via $VERTEX_REGION.",
-    )
-
-
-class OpenAICompatCfg(_Strict):  # noqa: D101  # tracked: #288
-    base_url: str | None = Field(
-        default=None,
-        description=(
-            "Base URL of the OpenAI-compatible endpoint "
-            "(e.g. 'http://localhost:8000/v1'). Required for this provider."
-        ),
-    )
-    api_key: str = Field(
-        default="no-key",
-        description="API key for the endpoint; 'no-key' for unauthenticated local servers.",
-    )
-
-
-class _CredEnvProviderCfg(_Strict):
-    """A provider whose credentials come from the environment (``.env``).
-
-    The ``[providers.<name>]`` table carries no keys; it exists only as a marker.
-    Declared so the table validates under ``extra="forbid"`` while still
-    rejecting stray keys placed under it.
-    """
-
-
-class ProvidersCfg(_Strict):  # noqa: D101  # tracked: #288
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
-
-    vertex_ai: VertexCfg | None = Field(
-        default=None,
-        alias="vertex-ai",
-        description="Vertex AI provider settings ([providers.vertex-ai]).",
-    )
-    openai_compatible: OpenAICompatCfg | None = Field(
-        default=None,
-        alias="openai-compatible",
-        description=("OpenAI-compatible endpoint settings ([providers.openai-compatible])."),
-    )
-    anthropic: _CredEnvProviderCfg | None = Field(
-        default=None,
-        description="Anthropic provider marker; credentials from $ANTHROPIC_API_KEY.",
-    )
-    google_genai: _CredEnvProviderCfg | None = Field(
-        default=None,
-        alias="google-genai",
-        description="Google GenAI provider marker; credentials from $GOOGLE_API_KEY.",
-    )
-    openai: _CredEnvProviderCfg | None = Field(
-        default=None,
-        description="OpenAI provider marker; credentials from $OPENAI_API_KEY.",
-    )
-
-
-class BackendCfg(_Strict):  # noqa: D101  # tracked: #288
     name: ComputeBackend = Field(
         default=DEFAULT_COMPUTE_BACKEND,
         description=(
@@ -163,10 +93,14 @@ class AgentRoleCfg(_Strict):
 
     model: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=256,
         description="CLI model override for this role. None uses [model].name.",
     )
     reasoning_effort: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=256,
         description=(
             "CLI reasoning-effort override for this role (for Codex, for example "
             "'low'/'medium'/'high'/'xhigh'). None uses [thinking].level."
@@ -174,21 +108,111 @@ class AgentRoleCfg(_Strict):
     )
 
 
-class AgentCfg(_Strict):  # noqa: D101  # tracked: #288
-    driver: Literal["agentshim", "omnigent", "mock"] | None = Field(
+class QuotaCfg(_Strict):
+    """What the run does, unattended, when a provider has no capacity left.
+
+    ``pause`` (the default) pauses the run and waits for the operator. ``wait``
+    pauses it and resumes it by itself when capacity should have returned, using
+    the provider's reported reset time or ``retry_seconds`` when it gave none,
+    for at most ``wait_seconds`` per turn (no limit when omitted); once that
+    budget is spent the turn fails with the quota error. ``fail`` does not pause:
+    the turn fails with the quota error at once. ``fallback`` waits like ``wait``
+    (not at all when ``wait_seconds`` is omitted) and then switches the run to
+    ``fallback_provider`` and ``fallback_model``: the turn in flight ends with the
+    quota error and sessions opened afterwards are fresh conversations on the
+    fallback. Any policy may name a fallback, which an operator can then choose
+    when resuming a paused run.
+    """
+
+    policy: Literal["pause", "wait", "fail", "fallback"] = Field(
+        default="pause", description="pause | wait | fail | fallback."
+    )
+    wait_seconds: int | None = Field(
         default=None,
+        strict=True,
+        gt=0,
         description=(
-            "Optional agent execution driver override. When omitted, VibeSys "
-            "uses its current default driver. This is independent of the "
-            "agent provider selected below. 'mock' is test infrastructure: it "
-            "streams a deterministic playbook instead of running an agent."
+            "Total seconds one turn may wait for capacity. Only for policy = 'wait' or 'fallback'."
         ),
     )
+    retry_seconds: int = Field(
+        default=300,
+        strict=True,
+        gt=0,
+        description="Seconds between attempts when the provider gave no reset time.",
+    )
+    fallback_provider: str | None = Field(
+        default=None,
+        description=f"Provider to switch to ({' | '.join(SHIPPED_PROVIDERS)}). Needs fallback_model.",
+    )
+    fallback_model: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        description="Model to use on the fallback provider. Needs fallback_provider.",
+    )
+
+    @field_validator("fallback_provider")
+    @classmethod
+    def _known_fallback_provider(cls, value: str | None) -> str | None:
+        if value is not None and value not in SHIPPED_PROVIDERS:
+            message = (
+                f"fallback_provider {value!r} is not supported; "
+                f"supported providers: {', '.join(SHIPPED_PROVIDERS)}"
+            )
+            raise ValueError(message)
+        return value
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if (self.fallback_provider is None) != (self.fallback_model is None):
+            message = "fallback_provider and fallback_model must be set together"
+            raise ValueError(message)
+        if self.wait_seconds is not None and self.policy not in ("wait", "fallback"):
+            message = (
+                f"wait_seconds applies only to policy = 'wait' or 'fallback', not {self.policy!r}"
+            )
+            raise ValueError(message)
+        if self.policy == "fallback" and self.fallback_provider is None:
+            message = "policy = 'fallback' needs fallback_provider and fallback_model"
+            raise ValueError(message)
+        return self
+
+    def to_policy(self) -> QuotaPolicy:
+        """The runtime policy this section declares."""
+        fallback = (
+            None
+            if self.fallback_provider is None or self.fallback_model is None
+            else FallbackTarget(self.fallback_provider, self.fallback_model)
+        )
+        return QuotaPolicy(
+            action=QuotaAction(self.policy),
+            wait_seconds=self.wait_seconds,
+            retry_seconds=self.retry_seconds,
+            fallback=fallback,
+        )
+
+
+class AgentCfg(_Strict):
+    """Agent backend, provider, and role-specific model controls."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_driver(cls, data: object) -> object:
+        """Name the removed ``driver`` key instead of a generic unknown-key error."""
+        if isinstance(data, dict) and "driver" in data:
+            message = (
+                "agent.driver: this key was removed because AgentShim is the only agent "
+                f"driver (got {data['driver']!r}); delete the key"
+            )
+            raise ValueError(message)
+        return data
+
     backend: str | None = Field(
         default=None,
         description=(
-            "Agent runner backend: 'cli' (drive an external coding-agent CLI) or "
-            "'deepagents'. The --agent-backend flag overrides; defaults to 'cli'."
+            "Agent runner backend: 'cli' (drive an external coding-agent CLI). "
+            "The --agent-backend flag overrides; defaults to 'cli'."
         ),
     )
     cli_provider: str | None = Field(
@@ -202,20 +226,169 @@ class AgentCfg(_Strict):  # noqa: D101  # tracked: #288
         default=None,
         gt=0,
         description=(
-            "Per-invocation timeout for the CLI agent, in seconds. None → the runner default."
+            "Per-invocation timeout for the CLI agent, in seconds. None → the agent "
+            "runner's hang guard, vs_agent's DEFAULT_TURN_TIMEOUT_S (six hours)."
         ),
     )
-    outer: AgentRoleCfg = Field(
-        default_factory=AgentRoleCfg,
-        description="[agent.outer] — model controls for orchestrator invocations.",
+    env_passthrough: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Launcher environment variable names an agent session inherits beyond "
+            "VibeSys's allowlist (PATH, HOME, locale, TERM, proxy and CA variables, "
+            "and the selected provider's credential variables)."
+        ),
     )
-    inner: AgentRoleCfg = Field(
-        default_factory=AgentRoleCfg,
-        description="[agent.inner] — model controls for implementer invocations.",
+
+    quota: QuotaCfg = Field(
+        default_factory=QuotaCfg,
+        description="[agent.quota] — unattended policy for a provider quota or rate-limit stop.",
+    )
+    roles: dict[AgentRoleId, AgentRoleCfg] = Field(
+        default_factory=dict,
+        description=(
+            "Sparse model overrides keyed by plugin-declared agent role ID. "
+            "Omitted roles inherit [model] and [thinking]."
+        ),
+    )
+
+    @field_validator("env_passthrough")
+    @classmethod
+    def _env_passthrough_names(cls, names: tuple[str, ...]) -> tuple[str, ...]:
+        try:
+            return validate_env_names(names)
+        except ValueError as exc:
+            message = f"agent.env_passthrough: {exc}"
+            raise ValueError(message) from exc
+
+
+class EvaluationCfg(_Strict):
+    """Bounds for evaluation suspension, independent of execution backend."""
+
+    queue_allowance_seconds: int = Field(
+        default=900,
+        strict=True,
+        gt=0,
+        description="Queue allowance added to declared execution budgets for suspension deadlines.",
+    )
+    observe_interval_seconds: int = Field(
+        default=10,
+        strict=True,
+        gt=0,
+        description="How often the core polls a running evaluation job, in seconds.",
+    )
+    observe_backoff_cap_seconds: int = Field(
+        default=120,
+        strict=True,
+        gt=0,
+        description=(
+            "Upper bound of the poll delay, in seconds, after the job's state could not be "
+            "read. Must be at least the observe interval."
+        ),
+    )
+
+    infrastructure_attempts: int = Field(
+        default=3,
+        strict=True,
+        ge=1,
+        le=MAX_SUBMISSIONS_PER_MEASUREMENT,
+        description=(
+            "How many times the backend measures a candidate in all when a try fails for a "
+            "reason in the machinery (a node fault, a lost job). The search sees only the last."
+        ),
+    )
+    ambiguous_attempts: int = Field(
+        default=2,
+        strict=True,
+        ge=1,
+        le=MAX_SUBMISSIONS_PER_MEASUREMENT,
+        description=(
+            "How many times the backend measures a candidate in all when a try fails and the "
+            "evidence cannot say whose fault it is. At most infrastructure_attempts."
+        ),
+    )
+    request_retry_limit: int = Field(
+        default=3,
+        strict=True,
+        ge=0,
+        le=MAX_REQUEST_RETRIES,
+        description="How often a request the executor did not run is sent again.",
+    )
+    request_backoff_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        description="Wait before the first re-send of a request; each further wait doubles.",
+    )
+    request_backoff_cap_seconds: float = Field(
+        default=30.0, gt=0, description="The longest wait between two sends of one request."
+    )
+
+    @model_validator(mode="after")
+    def _cap_covers_interval(self) -> Self:
+        if self.observe_backoff_cap_seconds < self.observe_interval_seconds:
+            message = "observe_backoff_cap_seconds must be at least observe_interval_seconds"
+            raise ValueError(message)
+        if self.ambiguous_attempts > self.infrastructure_attempts:
+            message = "ambiguous_attempts must be at most infrastructure_attempts"
+            raise ValueError(message)
+        if self.request_backoff_cap_seconds < self.request_backoff_seconds:
+            message = "request_backoff_cap_seconds must be at least request_backoff_seconds"
+            raise ValueError(message)
+        return self
+
+    def request_retries(self) -> RequestRetries:
+        """The backend's declaration for core's re-sends of requests the executor did not run."""
+        return RequestRetries(
+            limit=self.request_retry_limit,
+            backoff=self.request_backoff_seconds,
+            backoff_cap=self.request_backoff_cap_seconds,
+        )
+
+    def evaluation_retries(self) -> EvaluationRetries:
+        """The backend's declaration for measuring again after a failure that is not the candidate's."""
+        return EvaluationRetries(
+            infrastructure_attempts=self.infrastructure_attempts,
+            ambiguous_attempts=self.ambiguous_attempts,
+        )
+
+
+class RunCfg(_Strict):
+    """Bounds on one whole run, independent of the orchestration."""
+
+    max_run_seconds: int | None = Field(
+        default=None,
+        strict=True,
+        gt=0,
+        description=(
+            "Optional wall-clock budget for one run, in seconds. When omitted the run is "
+            "bounded only by its round budget."
+        ),
+    )
+    cancellation_bound_seconds: int = Field(
+        default=60,
+        strict=True,
+        gt=0,
+        description="The longest core waits for a cancelled job to be confirmed gone.",
+    )
+    cleanup_bound_seconds: int = Field(
+        default=60,
+        strict=True,
+        gt=0,
+        description=(
+            "The least time core gives its own cleanup and inspection requests, even once "
+            "the run deadline has passed."
+        ),
+    )
+    reconciliation_bound_seconds: int = Field(
+        default=60,
+        strict=True,
+        gt=0,
+        description="The longest core waits to learn what became of a request it could not read.",
     )
 
 
-class RepositoryCfg(_Strict):  # noqa: D101  # tracked: #288
+class RepositoryCfg(_Strict):
+    """Default GitHub owner and repository visibility."""
+
     owner: str | None = Field(
         default=None,
         description=(
@@ -235,41 +408,19 @@ class RepositoryCfg(_Strict):  # noqa: D101  # tracked: #288
             return None
         owner = value.strip()
         if not REPOSITORY_COMPONENT.fullmatch(owner):
-            raise ValueError("repository owner must be one GitHub user or organization name")  # noqa: TRY003  # tracked: #288
+            message = "repository owner must be one GitHub user or organization name"
+            raise ValueError(message)
         return owner
 
 
-class LoadLevelCfg(_Strict):
-    """One benchmark load level fed to the perf_eval prompt template.
+class Config(_Strict):
+    """Validated project configuration for one VibeSys run."""
 
-    Distinct from the ``LoadLevelMetrics`` *output* schema in ``schemas.py``.
-    """
-
-    rate: int = Field(gt=0, description="Request rate (requests/sec) for this load level.")
-    duration: int = Field(gt=0, description="Benchmark duration in seconds at this load level.")
-    max_tokens: int = Field(gt=0, description="Max output tokens per request at this load level.")
-
-
-class PerfEvalCfg(_Strict):  # noqa: D101  # tracked: #288
-    load_levels: list[LoadLevelCfg] | None = Field(
-        default=None,
-        description=(
-            "Benchmark load levels handed to the perf evaluator. None → the "
-            "evaluator uses its built-in default ladder."
-        ),
-    )
-
-
-class Config(_Strict):  # noqa: D101  # tracked: #288
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     model: ModelCfg = Field(description="[model] — model name and provider. Required.")
     thinking: ThinkingCfg = Field(
         default_factory=ThinkingCfg, description="[thinking] — reasoning/thinking controls."
-    )
-    providers: ProvidersCfg = Field(
-        default_factory=ProvidersCfg,
-        description="[providers.*] — per-provider credentials and endpoints.",
     )
     backend: BackendCfg = Field(
         default_factory=BackendCfg, description="[backend] — compute backend selection."
@@ -278,23 +429,18 @@ class Config(_Strict):  # noqa: D101  # tracked: #288
         default_factory=AgentCfg,
         description="[agent] — agent runner backend and CLI-agent settings.",
     )
+    evaluation: EvaluationCfg = Field(
+        default_factory=EvaluationCfg,
+        description="[evaluation] — evaluation suspension bounds.",
+    )
+    run: RunCfg = Field(
+        default_factory=RunCfg,
+        description="[run] — whole-run bounds.",
+    )
     repository: RepositoryCfg = Field(
         default_factory=RepositoryCfg,
         description="[repository] — defaults for remote experiment repositories.",
     )
-    perf_eval: PerfEvalCfg = Field(
-        default_factory=PerfEvalCfg,
-        description="[perf_eval] — performance-evaluation settings.",
-    )
-    feature_flags: dict[FeatureFlag, bool] = Field(
-        default_factory=dict,
-        description="[feature_flags] — typed feature-flag overrides.",
-    )
-
-    @field_validator("feature_flags", mode="before")
-    @classmethod
-    def _parse_feature_flags(cls, value: object) -> dict[FeatureFlag, bool]:
-        return parse_feature_flag_overrides(value, FeatureFlag)
 
 
 def as_config(config: "Config | Mapping[str, Any]") -> "Config":
@@ -317,22 +463,6 @@ def _load_dotenv_file(path: Path = PROJECT_ROOT / ".env") -> None:
     load_dotenv(path, override=False)
 
 
-def _apply_vertex_env_overrides(config: Config) -> None:
-    """Let ``VERTEX_*`` env vars override the ``[providers.vertex-ai]`` table.
-
-    Only applied when the section is present, matching prior behavior.
-    """
-    vx = config.providers.vertex_ai
-    if vx is None:
-        return
-    if env_json := os.environ.get("VERTEX_SERVICE_ACCOUNT_JSON"):
-        vx.json_path = env_json
-    if env_project := os.environ.get("VERTEX_PROJECT"):
-        vx.project = env_project
-    if env_region := os.environ.get("VERTEX_REGION"):
-        vx.region = env_region
-
-
 def load_config(path: Path, *, ignored_sections: frozenset[str] = frozenset()) -> Config:
     """Load and validate core configuration from a shared TOML file.
 
@@ -342,9 +472,7 @@ def load_config(path: Path, *, ignored_sections: frozenset[str] = frozenset()) -
     """
     _load_dotenv_file()
     path = Path(path)
-    with open(path, "rb") as f:  # noqa: PTH123  # tracked: #288
+    with path.open("rb") as f:
         raw = {key: value for key, value in tomllib.load(f).items() if key not in ignored_sections}
 
-    config = Config.model_validate(raw)
-    _apply_vertex_env_overrides(config)
-    return config
+    return Config.model_validate(raw)

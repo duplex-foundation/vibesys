@@ -4,72 +4,87 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypedDict
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from tests.support import run_test_command
+from tests.support.task_project import task_path, write_task
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
-from entrypoints.headless import (
+from entrypoints import cli
+from entrypoints.cli import (
     _extract_flag,
     _extract_loop_selection,
     _load_metric_space_toml,
     _parse_cli_objective,
     _prepare_experiment_repository,
     _render_configuration_error,
-    _run_migrate_run_environment,
-    _validate_target_inputs,
     _with_operator_constraints,
+    build_run_request,
     load_config_and_skills,
-    main,
     parse_cli_invocation,
     run_environment_spec_from_args,
 )
+from entrypoints.headless import main
+from vibesys.api.metrics import MetricSpace, Objective
 from vibesys.config import Config
-from vibesys.constants import ComputeBackend
-from vibesys.domains.base import DomainName
+from vibesys.constants import ComputeBackend, DomainName
 from vibesys.errors import ConfigurationDiagnostic, ConfigurationError
-from vibesys.input_manifest import load_input_bundle
-from vibesys.loops.metrics import MetricSpace, Objective
-from vibesys.loops.roles import EXPECTED_AGENT_ROLES
-from vibesys.profilers import ProfilerKind
-from vibesys.run.events import CoreEventType, RunStartedData
-from vibesys.run.integration import LocalRunIntegration
-from vibesys.sandbox.run_environment import run_environment_record
-from vs_project import (
-    RUN_SCHEMA_VERSION,
-    AgentRunConfiguration,
-    EvolveRunConfiguration,
-    PlainRunConfiguration,
-    Project,
-    RunConfiguration,
-    RunEnvironmentRecord,
+from vibesys.events import CoreEventType
+from vibesys.inputs import ProfileGuidedInput, load_task
+from vibesys.orchestration.agent_options import (
+    AgentOrchestrationOptions,
 )
+from vibesys.orchestration.evolve import PLUGIN as EVOLVE_PLUGIN
+from vibesys.orchestration.evolve.launch import EvolveLaunch
+from vibesys.orchestration.issue_queue import PLUGIN as ISSUE_QUEUE_PLUGIN
+from vibesys.orchestration.issue_queue.launch import IssueQueueLaunch
+from vibesys.orchestration.profilers import ProfilerKind
+from vibesys.run.core_run import RunEnd
+from vs_project.api import (
+    AgentRoleExecutionRecord,
+    OrchestrationDescriptor,
+    OrchestrationRunManifest,
+    Project,
+    RunEnvironmentRecord,
+    RunExecutionRecord,
+)
+from vs_runtime.api import RunStatus as PluginRunStatus
+from vs_runtime.api.infrastructure import RunEnvironmentSpec, run_environment_record
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+_LOOP_RUN_TARGETS = {
+    "agent": "vibesys.api._session.run_plugin",
+    "plain": "vibesys.api._session.run_plugin",
+    "evolve": "vibesys.api._session.run_plugin",
+}
 
 
-def _patch_loop_runner(loop_name: str, runner: Mock):  # noqa: ANN202
-    """Replace one immutable CLI dispatch record's runner."""
-    import dataclasses  # noqa: PLC0415
+def agent_descriptor(
+    options: AgentOrchestrationOptions, *, orchestration_id: str
+) -> OrchestrationDescriptor:
+    """Build the persisted descriptor at the product composition boundary.
 
-    import entrypoints.headless as cli  # noqa: PLC0415
-
-    command = cli._LOOP_COMMANDS[loop_name]  # noqa: SLF001
-    return patch.dict(
-        cli._LOOP_COMMANDS,  # noqa: SLF001
-        {loop_name: dataclasses.replace(command, run=runner)},
-    )
+    The serial searches read only their own knobs: only the multi search has a judge to ask
+    every so often, and neither retries a dropped turn (the roles' policies do).
+    """
+    recorded = options.model_dump(mode="json")
+    recorded.pop("turn_drop_backoff_seconds")
+    if "multi" not in orchestration_id:
+        recorded.pop("judge_every")
+    return OrchestrationDescriptor(id=orchestration_id, config_version=1, options=recorded)
 
 
 def _write_input_project(parent: Path, name: str = "queue-spsc") -> Path:
     project = parent / name
     (project / "src").mkdir(parents=True)
-    (project / "OBJECTIVE.md").write_text("Make the queue faster.\n")
-    (project / "vibesys.input.toml").write_text(
+    write_task(
+        project,
         """\
 version = 1
 
@@ -81,7 +96,8 @@ command = ["uv", "run", "python", "accuracy_checker/checker.py"]
 
 [benchmark]
 command = ["uv", "run", "python", "benchmark/benchmark.py"]
-"""
+""",
+        objective="Make the queue faster.\n",
     )
     (project / "src" / "queue.py").write_text("class Queue: pass\n")
     return project
@@ -113,11 +129,10 @@ def test_run_environment_spec_uses_task_modal_entrypoint(tmp_path: Path) -> None
     entrypoint = project / "deploy" / "service.py"
     entrypoint.parent.mkdir()
     entrypoint.write_text("app = object()\n")
-    with (project / "vibesys.input.toml").open("a") as manifest:
+    with (task_path(project) / "vibesys.input.toml").open("a") as manifest:
         manifest.write('\n[environment.modal]\nentrypoint = "deploy/service.py"\n')
     args = argparse.Namespace(
-        input_bundle=load_input_bundle(project),
-        docker=False,
+        input_bundle=load_task(project),
         docker_image=None,
         modal=True,
         modal_gpu="H100!",
@@ -133,7 +148,7 @@ def test_run_environment_spec_uses_task_modal_entrypoint(tmp_path: Path) -> None
 
 def test_cli_selects_documented_skypilot_environment(tmp_path: Path) -> None:
     project = _write_input_project(tmp_path)
-    with (project / "vibesys.input.toml").open("a") as manifest:
+    with (task_path(project) / "vibesys.input.toml").open("a") as manifest:
         manifest.write(
             """
 [resources]
@@ -161,30 +176,54 @@ accelerator_backend = "rocm"
     assert spec.resources.accelerators_per_node == 4
 
 
+def _write_slurm_operator_config(path: Path) -> Path:
+    """Write the smallest operator file that the CLI's profiler validation can load."""
+    path.write_text(
+        '[slurm]\nname = "cluster"\nremote_workspace_root = "/remote/runs"\n'
+        '[slurm.transport]\nkind = "ssh"\nhost = "cluster"\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_cli_selects_slurm_with_external_operator_config(tmp_path: Path) -> None:
+    project = _write_input_project(tmp_path)
+    config_path = _write_slurm_operator_config(tmp_path / "operator-slurm.toml")
+
+    invocation = parse_cli_invocation(["--input", str(project), "--slurm-config", str(config_path)])
+    spec = run_environment_spec_from_args(invocation.args)
+
+    assert spec.name == "slurm"
+    assert spec.options == {"config_path": str(config_path)}
+
+
+def test_cli_rejects_slurm_config_with_another_environment(tmp_path: Path) -> None:
+    project = _write_input_project(tmp_path)
+    with pytest.raises(ValueError, match="slurm-config cannot be combined"):
+        parse_cli_invocation(
+            ["--input", str(project), "--slurm-config", str(tmp_path / "slurm.toml"), "--modal"]
+        )
+
+
 def test_cli_rejects_mixed_generic_and_compatibility_environment_flags(tmp_path: Path) -> None:
     project = _write_input_project(tmp_path)
     with pytest.raises(ValueError, match="cannot be combined"):
-        parse_cli_invocation(["--input", str(project), "--run-environment", "local", "--modal"])
+        parse_cli_invocation(["--input", str(project), "--run-environment", "docker", "--modal"])
 
 
 class _CommonConfiguration(TypedDict):
-    run_environment: RunEnvironmentRecord
     model: str
     agent_backend: str
-    agent_driver: str
     cli_provider: str
     cli_timeout: int
     compute_backend: str
     profiler: str
     modality: str
     default_reasoning_effort: str
-    outer_model: str
-    outer_reasoning_effort: str
-    inner_model: str
-    inner_reasoning_effort: str
 
 
-_LOCAL_ENVIRONMENT = RunEnvironmentRecord(name="local")
+_DOCKER_ENVIRONMENT = RunEnvironmentRecord(name="docker")
+_RETIRED_LOCAL_ENVIRONMENT = RunEnvironmentRecord(name="local")
 _MODAL_ENVIRONMENT = RunEnvironmentRecord(
     name="modal",
     gpu="A100-80GB",
@@ -193,60 +232,98 @@ _MODAL_ENVIRONMENT = RunEnvironmentRecord(
 )
 
 
-def _common_configuration(
-    run_environment: RunEnvironmentRecord | None = None,
-) -> _CommonConfiguration:
+def _common_configuration() -> _CommonConfiguration:
     return {
-        "run_environment": run_environment or _LOCAL_ENVIRONMENT,
         "model": "gpt-recorded",
         "agent_backend": "cli",
-        "agent_driver": "omnigent",
         "cli_provider": "claude",
         "cli_timeout": 321,
         "compute_backend": "cpu",
         "profiler": "none",
-        "modality": "kv_store",
+        "modality": "image_generation",
         "default_reasoning_effort": "high",
-        "outer_model": "gpt-outer",
-        "outer_reasoning_effort": "medium",
-        "inner_model": "gpt-inner",
-        "inner_reasoning_effort": "low",
     }
+
+
+def _execution_record(
+    role_ids: tuple[str, ...] = ("orchestrator", "implementer"),
+) -> RunExecutionRecord:
+    common = _common_configuration()
+    return RunExecutionRecord(
+        model=common["model"],
+        agent_backend=common["agent_backend"],
+        cli_provider=common["cli_provider"],
+        cli_timeout=common["cli_timeout"],
+        compute_backend=common["compute_backend"],
+        requested_profiler=common["profiler"],
+        resolved_profiler=common["profiler"],
+        default_reasoning_effort=common["default_reasoning_effort"],
+        agent_roles={
+            role_id: AgentRoleExecutionRecord(
+                model=f"gpt-{role_id}",
+                reasoning_effort="medium" if role_id == "orchestrator" else "low",
+            )
+            for role_id in role_ids
+        },
+    )
+
+
+@dataclass(frozen=True)
+class _RecordedRun:
+    orchestration: OrchestrationDescriptor
+    run_environment: RunEnvironmentRecord = _DOCKER_ENVIRONMENT
+
+    @property
+    def execution(self) -> RunExecutionRecord:
+        roles = {
+            "single-agent": ("orchestrator", "implementer"),
+            "profile-guided-single-agent": ("orchestrator", "implementer"),
+            "plain": ("implementer", "judge", "perf_eval"),
+            "evolve": ("implementer", "judge", "profiler"),
+        }.get(self.orchestration.id, ("orchestrator", "implementer"))
+        return _execution_record(roles)
 
 
 def _agent_configuration(
     *,
     max_rounds: int = 7,
     run_environment: RunEnvironmentRecord | None = None,
-) -> AgentRunConfiguration:
-    return AgentRunConfiguration(
-        **_common_configuration(run_environment),
-        outer_loop="agent",
-        inner_loop="single-agent",
+    orchestration_id: str = "single-agent",
+    profile_guided: ProfileGuidedInput | None = None,
+) -> _RecordedRun:
+    options = AgentOrchestrationOptions(
         interface="service",
         max_rounds=max_rounds,
         max_retries_per_round=4,
         judge_every=2,
         official_eval_every=5,
-        memory_layout="directories",
         operator_constraints=("Preserve the ABI.",),
+        profile_guided=profile_guided,
+    )
+    return _RecordedRun(
+        agent_descriptor(options, orchestration_id=orchestration_id),
+        run_environment or _DOCKER_ENVIRONMENT,
     )
 
 
-def _plain_configuration(*, max_rounds: int = 6) -> PlainRunConfiguration:
-    return PlainRunConfiguration(
-        **_common_configuration(),
-        outer_loop="plain",
+def _plain_configuration(*, max_rounds: int = 6) -> _RecordedRun:
+    options = IssueQueueLaunch(
         max_rounds=max_rounds,
         max_attempts_per_issue=4,
         max_issues_per_perf_eval=2,
+        max_issues_per_round=3,
+    )
+    return _RecordedRun(
+        OrchestrationDescriptor(
+            id=ISSUE_QUEUE_PLUGIN.id,
+            config_version=ISSUE_QUEUE_PLUGIN.config_version,
+            options=options.model_dump(mode="json"),
+        )
     )
 
 
-def _evolve_configuration(*, max_generations: int = 5) -> EvolveRunConfiguration:
-    return EvolveRunConfiguration(
-        **_common_configuration(),
-        outer_loop="evolve",
+def _evolve_configuration(*, max_generations: int = 5) -> _RecordedRun:
+    options = EvolveLaunch(
         max_generations=max_generations,
         children_per_generation=3,
         k_top_inspirations=4,
@@ -261,40 +338,60 @@ def _evolve_configuration(*, max_generations: int = 5) -> EvolveRunConfiguration
         openevolve_migration_rate=0.25,
         frontier_bias=0.6,
         bootstrap_max_attempts=7,
-        keep_deployments=True,
         max_parallelism=2,
-        objectives=("latency:min", "throughput:max"),
+        metric_space=MetricSpace(
+            objectives=(
+                Objective(name="latency", direction="min"),
+                Objective(name="throughput", direction="max"),
+            )
+        ),
+    )
+    return _RecordedRun(
+        OrchestrationDescriptor(
+            id=EVOLVE_PLUGIN.id,
+            config_version=EVOLVE_PLUGIN.config_version,
+            # What the host decides is not a launch option (it follows the environment and plan).
+            options=options.model_dump(mode="json", exclude={"profiling", "exclusive_root"}),
+        )
     )
 
 
-def _write_project_run(  # noqa: PLR0913
+@dataclass(frozen=True)
+class _RunFixtureOptions:
+    make_current: bool = True
+    task_name: str | None = None
+
+
+def _write_project_run(
     project: Path,
     run_id: str,
     *,
-    configuration: RunConfiguration,
+    configuration: _RecordedRun,
     created_at: datetime,
-    make_current: bool = True,
-    task_name: str | None = None,
+    options: _RunFixtureOptions | None = None,
 ) -> Project:
+    fixture_options = options or _RunFixtureOptions()
     vibesys_project = Project.open(project)
     store = vibesys_project.state
-    store.create_project(project.name)
+    store.create_project(project.name, now=datetime(2026, 1, 1, tzinfo=UTC))
     manifest = store.new_run_manifest(
         project.name,
         run_id=run_id,
         branch=f"vibesys-runs/{run_id}",
         vibesys_version="0.2.0-test",
-        configuration=configuration,
+        run_environment=configuration.run_environment,
+        execution=configuration.execution,
+        orchestration=configuration.orchestration,
         trusted_input_baseline="0" * 40,
-        task_name=task_name,
+        task_name=fixture_options.task_name,
         now=created_at,
     )
-    store.create_run(manifest, make_current=make_current)
+    store.create_run(manifest, make_current=fixture_options.make_current)
     return vibesys_project
 
 
 def _git(project: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=project, check=True)  # noqa: S603, S607
+    run_test_command(["git", *args], cwd=project, check=True)
 
 
 def test_extract_flag_accepts_space_and_equals_forms() -> None:
@@ -313,7 +410,7 @@ def test_extract_flag_rejects_a_missing_value() -> None:
     assert exc.value.diagnostic.code == "invalid_arguments"
 
 
-@pytest.mark.parametrize("loop", ["agent", "plain", "evolve"])
+@pytest.mark.parametrize("loop", ["agent", "profile-guided", "dynamic", "plain", "evolve"])
 def test_extract_loop_selection(loop: str) -> None:
     selected, rest = _extract_loop_selection(["--outer-loop", loop, "--input", "x"])
     assert selected == loop
@@ -327,7 +424,21 @@ def test_extract_loop_selection_defaults_to_agent_and_rejects_unknown() -> None:
     assert exc.value.diagnostic.stage == "argument_parsing"
 
 
-@pytest.mark.parametrize("loop", ["agent", "plain", "evolve"])
+def test_profile_guided_loop_requires_and_accepts_manifest_capability(tmp_path: Path) -> None:
+    project = _write_input_project(tmp_path)
+    command = ["--outer-loop", "profile-guided", "--input", str(project)]
+    with pytest.raises(ConfigurationError) as exc:
+        parse_cli_invocation(command)
+    assert exc.value.diagnostic.code == "missing_profile_guided_input"
+
+    with (task_path(project) / "vibesys.input.toml").open("a") as manifest:
+        manifest.write('\n[profile_guided]\ncommand = ["python", "profile.py"]\n')
+    invocation = parse_cli_invocation(command)
+    assert invocation.loop_kind == "profile-guided"
+    assert invocation.args.input_bundle.manifest.profile_guided is not None
+
+
+@pytest.mark.parametrize("loop", ["agent", "dynamic", "plain", "evolve"])
 def test_all_loops_run_directly_in_a_canonical_project(
     loop: str,
     tmp_path: Path,
@@ -340,6 +451,28 @@ def test_all_loops_run_directly_in_a_canonical_project(
     assert invocation.args.runs_dir is None
     assert invocation.args.input == project
     assert invocation.args.input_bundle.root == project.resolve()
+
+
+def test_dynamic_builds_an_independent_descriptor_with_parallelism(
+    tmp_path: Path,
+) -> None:
+    project = _write_input_project(tmp_path)
+
+    invocation = parse_cli_invocation(
+        [
+            "--outer-loop",
+            "dynamic",
+            "--input",
+            str(project),
+            "--max-in-flight",
+            "3",
+        ]
+    )
+    request = build_run_request(invocation)
+
+    assert request.orchestration.id == "dynamic"
+    assert request.orchestration.options["max_in_flight"] == 3
+    assert request.orchestration.options["profile_guided"] is None
 
 
 def test_current_directory_is_the_default_direct_project(
@@ -370,7 +503,7 @@ def test_repository_native_project_selects_a_named_task(tmp_path: Path) -> None:
     assert invocation.args.input_bundle.task_root == selected.resolve()
 
 
-@pytest.mark.parametrize("environment_flag", [[], ["--docker"], ["--run-environment", "docker"]])
+@pytest.mark.parametrize("environment_flag", [[], ["--run-environment", "docker"]])
 def test_task_dockerfile_selects_docker_without_building_during_validation(
     environment_flag: list[str],
     tmp_path: Path,
@@ -381,7 +514,7 @@ def test_task_dockerfile_selects_docker_without_building_during_validation(
     dockerfile = task / "Dockerfile"
     dockerfile.write_text("FROM python:3.12-bookworm\n")
 
-    with patch("entrypoints.headless.build_task_image") as build:
+    with patch("entrypoints.cli.environment.build_task_image") as build:
         invocation = parse_cli_invocation(
             ["--project", str(project), "--task", "latency", *environment_flag]
         )
@@ -401,7 +534,7 @@ def test_task_dockerfile_builds_once_for_a_launch(tmp_path: Path) -> None:
     invocation = parse_cli_invocation(["--project", str(project), "--task", "latency"])
     image_id = f"sha256:{'a' * 64}"
 
-    with patch("entrypoints.headless.build_task_image", return_value=image_id) as build:
+    with patch("entrypoints.cli.environment.build_task_image", return_value=image_id) as build:
         spec = run_environment_spec_from_args(
             invocation.args,
             build_task_docker_image=True,
@@ -409,23 +542,18 @@ def test_task_dockerfile_builds_once_for_a_launch(tmp_path: Path) -> None:
 
     assert spec.name == "docker"
     assert spec.options["image"] == image_id
-    build.assert_called_once_with(dockerfile.resolve())
+    build.assert_called_once()
+    assert build.call_args.args == (dockerfile.resolve(),)
 
 
 @pytest.mark.parametrize(
-    ("loop_name", "runner_path"),
-    [
-        ("agent", "vibesys.loops.agent.loop.run_agent_loop"),
-        ("plain", "vibesys.loops.plain.loop.run_plain_loop"),
-        ("evolve", "vibesys.loops.evolve.loop.run_evolve_loop"),
-    ],
+    "loop_name",
+    ["agent", "plain", "evolve"],
 )
 def test_each_outer_loop_builds_the_task_image_once(
     loop_name: str,
-    runner_path: str,
     tmp_path: Path,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = tmp_path / "repository"
     project.mkdir()
@@ -436,27 +564,32 @@ def test_each_outer_loop_builds_the_task_image_once(
         ["--outer-loop", loop_name, "--project", str(project), "--task", "latency"]
     )
     image_id = f"sha256:{'a' * 64}"
-    run = getattr(cli, f"_run_{loop_name}")
+    config = Config.model_validate({"model": {"name": "gpt-5.4"}})
+    # `load_config_and_skills`/`_prepare_experiment_repository` normally fill
+    # these in as side effects on `args`; both are mocked away here, so set
+    # them explicitly to satisfy `RunRequest`'s validation.
+    invocation.args.repo_visibility = config.repository.visibility
+    invocation.args.exp_name = "test-run"
 
     with (
-        patch("entrypoints.headless.build_task_image", return_value=image_id) as build,
+        patch("entrypoints.cli.environment.build_task_image", return_value=image_id) as build,
         patch(
-            "entrypoints.headless.load_config_and_skills",
-            return_value=(Mock(), (), ComputeBackend.CPU),
+            "entrypoints.cli.load_config_and_skills",
+            return_value=(config, (), ComputeBackend.CPU),
         ),
-        patch("entrypoints.headless._prepare_experiment_repository"),
-        patch(runner_path, return_value=True) as loop_runner,
+        patch("entrypoints.cli._prepare_experiment_repository"),
     ):
-        run(invocation.args, Mock())
+        request = cli.build_run_request(invocation)
 
-    build.assert_called_once_with(dockerfile.resolve())
-    assert loop_runner.call_args.kwargs["run_environment"].options["image"] == image_id
+    build.assert_called_once()
+    assert build.call_args.args == (dockerfile.resolve(),)
+    assert request.run_environment is not None
+    assert request.run_environment.options["image"] == image_id
 
 
 @pytest.mark.parametrize(
     "flags",
     [
-        ["--run-environment", "local"],
         ["--modal"],
         ["--skypilot"],
         ["--docker-image", "custom:latest"],
@@ -472,6 +605,45 @@ def test_fresh_task_dockerfile_rejects_conflicting_environment_flags(
     (task / "Dockerfile").write_text("FROM python:3.12-bookworm\n")
 
     with pytest.raises(ValueError, match="task Dockerfile"):
+        parse_cli_invocation(["--project", str(project), "--task", "latency", *flags])
+
+
+def _declare_docker_in_docker(task: Path) -> None:
+    manifest = task / "vibesys.input.toml"
+    manifest.write_text(
+        manifest.read_text().replace(
+            '[agent]\ndomain = "generic"\n',
+            '[agent]\ndomain = "generic"\n\n[environment]\ndocker_in_docker = true\n',
+        )
+    )
+
+
+@pytest.mark.parametrize("environment_flag", [[], ["--run-environment", "docker"]])
+def test_docker_in_docker_task_selects_docker(environment_flag: list[str], tmp_path: Path) -> None:
+    project = tmp_path / "repository"
+    project.mkdir()
+    _declare_docker_in_docker(_write_repository_task(project, "latency"))
+
+    invocation = parse_cli_invocation(
+        ["--project", str(project), "--task", "latency", *environment_flag]
+    )
+
+    assert invocation.args.input_bundle.docker_in_docker is True
+    assert run_environment_spec_from_args(invocation.args).name == "docker"
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [["--modal"], ["--skypilot"], ["--docker-image", "custom:1"]],
+)
+def test_docker_in_docker_task_rejects_conflicting_environment_flags_naming_the_key(
+    flags: list[str], tmp_path: Path
+) -> None:
+    project = tmp_path / "repository"
+    project.mkdir()
+    _declare_docker_in_docker(_write_repository_task(project, "latency"))
+
+    with pytest.raises(ValueError, match="docker_in_docker"):
         parse_cli_invocation(["--project", str(project), "--task", "latency", *flags])
 
 
@@ -539,7 +711,6 @@ def test_runs_dir_rejects_the_python_installation_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
     prefix = tmp_path / ".venv"
@@ -554,7 +725,7 @@ def test_direct_project_rejects_materialization_inputs_but_copy_accepts_them(
     tmp_path: Path,
 ) -> None:
     project = _write_input_project(tmp_path)
-    with (project / "vibesys.input.toml").open("a") as manifest:
+    with (task_path(project) / "vibesys.input.toml").open("a") as manifest:
         manifest.write(
             """
 [[workspace.sources]]
@@ -577,12 +748,11 @@ def test_direct_runs_default_to_local_and_copied_runs_default_to_a_remote(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
     github = Mock()
     github.current_user.return_value = "octocat"
-    monkeypatch.setattr(cli, "GitHubCLI", Mock(return_value=github))
+    monkeypatch.setattr("entrypoints.cli.config.GitHubCLI", Mock(return_value=github))
     config = Config.model_validate({"model": {"name": "gpt-5.4"}})
 
     direct = parse_cli_invocation(["--input", str(project)])
@@ -597,68 +767,55 @@ def test_direct_runs_default_to_local_and_copied_runs_default_to_a_remote(
 
 
 def test_short_repository_name_uses_the_configured_owner(tmp_path: Path) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
+    project = _write_input_project(tmp_path)
     config_path = tmp_path / "agent.toml"
     config_path.write_text('[model]\nname = "gpt-5.5"\n[repository]\nowner = "my-lab"\n')
-    args = cli._build_agent_parser().parse_args(  # noqa: SLF001
-        ["--repo", "trial", "--config", str(config_path), "--no-skills"]
-    )
+    args = parse_cli_invocation(
+        ["--input", str(project), "--repo", "trial", "--config", str(config_path), "--no-skills"]
+    ).args
 
     load_config_and_skills(args, domain=DomainName.GENERIC)
 
     assert args.repo == "my-lab/trial"
 
 
-def test_local_and_repo_are_mutually_exclusive() -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
-
-    args = cli._build_agent_parser().parse_args(  # noqa: SLF001
-        ["--local", "--repo", "owner/trial", "--no-skills"]
-    )
+def test_local_and_repo_are_mutually_exclusive(tmp_path: Path) -> None:
+    project = _write_input_project(tmp_path)
+    args = parse_cli_invocation(
+        ["--input", str(project), "--local", "--repo", "owner/trial", "--no-skills"]
+    ).args
     with pytest.raises(ConfigurationError, match="--local cannot be combined"):
         load_config_and_skills(args, domain=DomainName.GENERIC)
 
 
-@pytest.mark.parametrize(
-    ("builder", "validator"),
-    [
-        ("_build_agent_parser", "_validate_agent"),
-        ("_build_plain_parser", "_validate_plain"),
-        ("_build_evolve_parser", "_validate_evolve"),
-    ],
-)
+@pytest.mark.parametrize("loop_kind", ["agent", "plain", "evolve"])
 def test_all_loops_accept_modal_without_a_profiler(
-    builder: str,
-    validator: str,
+    loop_kind: str,
     tmp_path: Path,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
-    args = getattr(cli, builder)().parse_args(
-        ["--input", str(project), "--modal", "--profiler", "none"]
+    invocation = parse_cli_invocation(
+        ["--outer-loop", loop_kind, "--input", str(project), "--modal", "--profiler", "none"]
     )
 
-    getattr(cli, validator)(args)
-    assert args.profiler is ProfilerKind.NONE
+    assert invocation.args.profiler is ProfilerKind.NONE
 
 
 def test_profiler_validation_uses_the_selected_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
-    args = cli._build_agent_parser().parse_args(  # noqa: SLF001
-        ["--input", str(project), "--profiler", "nsys"]
+    monkeypatch.setattr(
+        "entrypoints.cli.environment.supported_profilers",
+        Mock(return_value=frozenset({ProfilerKind.TORCH, ProfilerKind.NONE})),
     )
-    environment = Mock(supported_profiler_kinds=frozenset({ProfilerKind.TORCH, ProfilerKind.NONE}))
-    monkeypatch.setattr(cli, "build_run_environment", Mock(return_value=environment))
 
-    with pytest.raises(ConfigurationError, match="run environment 'local'"):
-        cli._validate_agent(args)  # noqa: SLF001
+    with pytest.raises(ConfigurationError, match="run environment 'docker'"):
+        parse_cli_invocation(["--input", str(project), "--profiler", "nsys"])
 
 
 @pytest.mark.parametrize(
@@ -678,60 +835,50 @@ def test_evolve_rejects_invalid_search_settings(
     value: str,
     tmp_path: Path,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
-    args = cli._build_evolve_parser().parse_args(  # noqa: SLF001
-        ["--input", str(project), flag, value]
-    )
     with pytest.raises(ConfigurationError):
-        cli._validate_evolve(args)  # noqa: SLF001
+        parse_cli_invocation(["--outer-loop", "evolve", "--input", str(project), flag, value])
 
 
 def test_openevolve_knobs_select_openevolve_for_a_new_run(tmp_path: Path) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
-    args = cli._build_evolve_parser().parse_args(  # noqa: SLF001
-        ["--input", str(project), "--openevolve-num-islands", "3"]
+    invocation = parse_cli_invocation(
+        ["--outer-loop", "evolve", "--input", str(project), "--openevolve-num-islands", "3"]
     )
+    request = build_run_request(invocation)
 
-    policy, config = cli._resolve_openevolve_options(args)  # noqa: SLF001
-
-    assert policy == "openevolve"
-    assert config is not None
-    assert config.num_islands == 3
+    assert request.orchestration.options["search_policy"] == "openevolve"
+    assert request.orchestration.options["openevolve_num_islands"] == 3
 
 
 def test_openevolve_knobs_cannot_be_combined_with_vibesys_policy(tmp_path: Path) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
-    args = cli._build_evolve_parser().parse_args(  # noqa: SLF001
-        [
-            "--input",
-            str(project),
-            "--search-policy",
-            "vibesys",
-            "--openevolve-num-islands",
-            "3",
-        ]
-    )
+    argv = [
+        "--outer-loop",
+        "evolve",
+        "--input",
+        str(project),
+        "--search-policy",
+        "vibesys",
+        "--openevolve-num-islands",
+        "3",
+    ]
     with pytest.raises(ConfigurationError):
-        cli._validate_evolve(args)  # noqa: SLF001
+        parse_cli_invocation(argv)
 
 
 def test_target_validation_loads_the_manifest_contract(tmp_path: Path) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
-    with (project / "vibesys.input.toml").open("a") as manifest:
+    with (task_path(project) / "vibesys.input.toml").open("a") as manifest:
         manifest.write(
             '\n[benchmark.result]\njson_argument = "--output-json"\nmetric = "ops_per_sec"\n'
         )
-    args = cli._build_agent_parser().parse_args(["--input", str(project)])  # noqa: SLF001
 
-    _validate_target_inputs(args)
+    args = parse_cli_invocation(["--input", str(project)]).args
 
     assert args.input_bundle.domain is DomainName.GENERIC
     assert args.input_bundle.benchmark_result.metric == "ops_per_sec"
@@ -743,14 +890,11 @@ def test_target_validation_reports_missing_required_files(
     missing: str,
     tmp_path: Path,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
-    (project / missing).unlink()
-    args = cli._build_agent_parser().parse_args(["--input", str(project)])  # noqa: SLF001
-
+    (task_path(project) / missing).unlink()
     with pytest.raises(ConfigurationError) as exc:
-        _validate_target_inputs(args)
+        parse_cli_invocation(["--input", str(project)])
     assert missing in exc.value.diagnostic.message
 
 
@@ -758,13 +902,10 @@ def test_target_validation_explains_an_invalid_launch_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     monkeypatch.chdir(tmp_path)
-    args = cli._build_agent_parser().parse_args([])  # noqa: SLF001
-
     with pytest.raises(ConfigurationError) as exc:
-        _validate_target_inputs(args)
+        parse_cli_invocation([])
 
     assert "Current directory is not a VibeSys project" in exc.value.diagnostic.message
     assert "Launch VibeSys from the project or pass --project PATH" in (
@@ -781,14 +922,10 @@ def test_agent_rejects_nonpositive_round_settings(
     value: str,
     tmp_path: Path,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
-    args = cli._build_agent_parser().parse_args(  # noqa: SLF001
-        ["--input", str(project), flag, value]
-    )
     with pytest.raises(ConfigurationError):
-        cli._validate_agent(args)  # noqa: SLF001
+        parse_cli_invocation(["--input", str(project), flag, value])
 
 
 def test_operator_constraints_are_repeatable_and_do_not_mutate_the_objective() -> None:
@@ -807,15 +944,12 @@ def test_omitted_config_uses_builtin_defaults(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
     launch = tmp_path / "launch"
     launch.mkdir()
     monkeypatch.chdir(launch)
-    args = cli._build_agent_parser().parse_args(  # noqa: SLF001
-        ["--input", str(project), "--no-skills"]
-    )
+    args = parse_cli_invocation(["--input", str(project), "--no-skills"]).args
 
     config, skills, _ = load_config_and_skills(args, domain=DomainName.GENERIC)
 
@@ -827,14 +961,13 @@ def test_omitted_config_loads_only_the_launch_directory_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_input_project(tmp_path)
     launch = tmp_path / "launch"
     launch.mkdir()
     (tmp_path / "agent.toml").write_text('[model]\nname = "parent-model"\n')
     monkeypatch.chdir(launch)
-    args = cli._build_agent_parser().parse_args(["--input", str(project)])  # noqa: SLF001
+    args = parse_cli_invocation(["--input", str(project)]).args
 
     config, _, _ = load_config_and_skills(args, domain=DomainName.GENERIC)
     assert config.model.name == "gpt-5.4"
@@ -845,11 +978,11 @@ def test_omitted_config_loads_only_the_launch_directory_config(
 
 
 def test_missing_explicit_config_is_a_configuration_error(tmp_path: Path) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
 
-    args = cli._build_agent_parser().parse_args(  # noqa: SLF001
-        ["--config", str(tmp_path / "missing.toml")]
-    )
+    project = _write_input_project(tmp_path)
+    args = parse_cli_invocation(
+        ["--input", str(project), "--config", str(tmp_path / "missing.toml")]
+    ).args
     with pytest.raises(ConfigurationError) as exc:
         load_config_and_skills(args, domain=DomainName.GENERIC)
     assert exc.value.diagnostic.code == "config_load_failed"
@@ -876,19 +1009,15 @@ def test_validate_command_reports_an_invalid_project_without_running_a_loop(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project = _write_input_project(tmp_path)
-    (project / "OBJECTIVE.md").unlink()
-    runner = Mock()
-
+    (task_path(project) / "OBJECTIVE.md").unlink()
     with (
         patch.object(sys, "argv", ["vibesys", "validate", str(project)]),
-        _patch_loop_runner("agent", runner),
         pytest.raises(SystemExit) as exc,
     ):
         main()
 
     assert exc.value.code == 1
-    assert "OBJECTIVE.md not found" in capsys.readouterr().err
-    runner.assert_not_called()
+    assert "missing required file OBJECTIVE.md" in capsys.readouterr().err
 
 
 def test_direct_resume_selects_an_explicit_run_id(
@@ -927,7 +1056,7 @@ def test_repository_resume_restores_the_recorded_task(
         run_id,
         configuration=_agent_configuration(),
         created_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
-        task_name="latency",
+        options=_RunFixtureOptions(task_name="latency"),
     )
     monkeypatch.chdir(project)
 
@@ -937,7 +1066,7 @@ def test_repository_resume_restores_the_recorded_task(
     assert invocation.args.input_bundle.task_root == selected.resolve()
 
 
-def test_repository_resume_keeps_a_recorded_local_environment_despite_task_dockerfile(
+def test_repository_resume_migrates_a_recorded_local_environment_to_docker_without_building(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -949,17 +1078,18 @@ def test_repository_resume_keeps_a_recorded_local_environment_despite_task_docke
     _write_project_run(
         project,
         run_id,
-        configuration=_agent_configuration(run_environment=_LOCAL_ENVIRONMENT),
+        configuration=_agent_configuration(run_environment=_RETIRED_LOCAL_ENVIRONMENT),
         created_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
-        task_name="latency",
+        options=_RunFixtureOptions(task_name="latency"),
     )
     monkeypatch.chdir(project)
 
     args = parse_cli_invocation(["--resume", run_id]).args
-    with patch("entrypoints.headless.build_task_image") as build:
+    with patch("entrypoints.cli.environment.build_task_image") as build:
         spec = run_environment_spec_from_args(args, build_task_docker_image=True)
 
-    assert spec.name == "local"
+    assert spec.name == "docker"
+    assert spec.options["image"] is None
     build.assert_not_called()
 
 
@@ -982,17 +1112,18 @@ def test_repository_resume_rebuilds_a_recorded_task_docker_environment(
             run_environment=RunEnvironmentRecord(name="docker", image=recorded_image)
         ),
         created_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
-        task_name="latency",
+        options=_RunFixtureOptions(task_name="latency"),
     )
     monkeypatch.chdir(project)
 
     args = parse_cli_invocation(["--resume", run_id]).args
-    with patch("entrypoints.headless.build_task_image", return_value=rebuilt_image) as build:
+    with patch("entrypoints.cli.environment.build_task_image", return_value=rebuilt_image) as build:
         spec = run_environment_spec_from_args(args, build_task_docker_image=True)
 
     assert spec.name == "docker"
     assert spec.options["image"] == rebuilt_image
-    build.assert_called_once_with(dockerfile.resolve())
+    build.assert_called_once()
+    assert build.call_args.args == (dockerfile.resolve(),)
 
 
 def test_repository_resume_rejects_a_different_task(tmp_path: Path) -> None:
@@ -1006,7 +1137,7 @@ def test_repository_resume_rejects_a_different_task(tmp_path: Path) -> None:
         run_id,
         configuration=_agent_configuration(),
         created_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
-        task_name="latency",
+        options=_RunFixtureOptions(task_name="latency"),
     )
 
     with pytest.raises(ConfigurationError) as exc:
@@ -1035,7 +1166,7 @@ def test_direct_resume_prefers_current_then_latest_run(
         latest,
         configuration=_agent_configuration(),
         created_at=datetime(2026, 8, 11, 13, tzinfo=UTC),
-        make_current=False,
+        options=_RunFixtureOptions(make_current=False),
     )
     monkeypatch.chdir(project)
 
@@ -1121,15 +1252,15 @@ def test_remote_resume_selects_run_branch_before_reading_project_state(
     project = runs_dir / "remote"
     assert invocation.args.input == project.resolve()
     assert invocation.args.resume == run_id
-    branch = subprocess.run(
-        ["git", "branch", "--show-current"],  # noqa: S607
+    branch = run_test_command(
+        ["git", "branch", "--show-current"],
         cwd=project,
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    upstream = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "@{upstream}"],  # noqa: S607
+    upstream = run_test_command(
+        ["git", "rev-parse", "--abbrev-ref", "@{upstream}"],
         cwd=project,
         check=True,
         capture_output=True,
@@ -1138,9 +1269,9 @@ def test_remote_resume_selects_run_branch_before_reading_project_state(
     assert branch == f"vibesys-runs/{run_id}"
     assert upstream == f"origin/vibesys-runs/{run_id}"
 
-    Project.open(source).state.update_run_configuration(
+    Project.open(source).state.update_run_orchestration(
         run_id,
-        _agent_configuration(max_rounds=8),
+        _agent_configuration(max_rounds=8).orchestration,
     )
     _git(source, "add", ".vibesys/state")
     _git(
@@ -1161,15 +1292,15 @@ def test_remote_resume_selects_run_branch_before_reading_project_state(
     assert advanced.args.resume == run_id
     assert advanced.args.max_rounds == 8
     assert (
-        subprocess.run(
-            ["git", "rev-parse", "HEAD"],  # noqa: S607
+        run_test_command(
+            ["git", "rev-parse", "HEAD"],
             cwd=project,
             check=True,
             capture_output=True,
             text=True,
         ).stdout
-        == subprocess.run(  # noqa: S603
-            ["git", "rev-parse", "origin/vibesys-runs/" + run_id],  # noqa: S607
+        == run_test_command(
+            ["git", "rev-parse", "origin/vibesys-runs/" + run_id],
             cwd=project,
             check=True,
             capture_output=True,
@@ -1205,8 +1336,8 @@ def test_remote_resume_selects_run_branch_before_reading_project_state(
 
     assert resumed.args.input == project.resolve()
     assert resumed.args.resume == newer_run_id
-    selected = subprocess.run(
-        ["git", "branch", "--show-current"],  # noqa: S607
+    selected = run_test_command(
+        ["git", "branch", "--show-current"],
         cwd=project,
         check=True,
         capture_output=True,
@@ -1295,7 +1426,7 @@ def test_resume_switches_to_the_recorded_run_branch(
     )
     run_id = "20260811-120000-11111111-agent"
     _git(project, "switch", "-q", "-c", f"vibesys-runs/{run_id}")
-    (project / "OBJECTIVE.md").write_text("Objective on the run branch.\n")
+    (task_path(project) / "OBJECTIVE.md").write_text("Objective on the run branch.\n")
     store = _write_project_run(
         project,
         run_id,
@@ -1307,7 +1438,7 @@ def test_resume_switches_to_the_recorded_run_branch(
         .resolve_snapshot(store.state.initialization_snapshot(run_id))
         .scope_pathspec
     )
-    _git(project, "add", "OBJECTIVE.md", state_pathspec)
+    _git(project, "add", ".vibesys/tasks/default/OBJECTIVE.md", state_pathspec)
     _git(
         project,
         "-c",
@@ -1325,8 +1456,8 @@ def test_resume_switches_to_the_recorded_run_branch(
     invocation = parse_cli_invocation(["--resume", run_id])
 
     assert invocation.args.input_bundle.objective == "Objective on the run branch.\n"
-    branch = subprocess.run(
-        ["git", "branch", "--show-current"],  # noqa: S607
+    branch = run_test_command(
+        ["git", "branch", "--show-current"],
         cwd=project,
         check=True,
         capture_output=True,
@@ -1354,20 +1485,75 @@ def test_agent_resume_restores_its_configuration(
 
     assert args.max_rounds == 7
     assert args.max_retries_per_round == 4
-    assert args.judge_every == 2
     assert args.official_eval_every == 5
     assert args.inner_loop == "single-agent"
     assert args.interface == "service"
-    assert args.memory_layout == "directories"
     assert args.constraint == ["Preserve the ABI."]
     assert args.profiler is ProfilerKind.NONE
     assert args.cli_provider == "claude"
     assert backend is ComputeBackend.CPU
     assert config.model.name == "gpt-recorded"
     assert config.agent.cli_timeout == 321
-    assert config.agent.driver == "omnigent"
-    assert config.agent.outer.model == "gpt-outer"
-    assert config.agent.inner.model == "gpt-inner"
+    assert config.agent.roles["orchestrator"].model == "gpt-orchestrator"
+    assert config.agent.roles["implementer"].model == "gpt-implementer"
+
+
+@pytest.mark.parametrize("loop_kind", ["agent", "profile-guided"])
+def test_v5_agent_resume_restores_config_constraints_and_budget(
+    loop_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _write_input_project(tmp_path)
+    if loop_kind == "profile-guided":
+        with (task_path(project) / "vibesys.input.toml").open("a") as input_manifest:
+            input_manifest.write('\n[profile_guided]\ncommand = ["python", "profile.py"]\n')
+    run_id = f"20260811-120000-11111111-{loop_kind}-v5"
+    configuration = _agent_configuration(
+        orchestration_id=(
+            "profile-guided-single-agent" if loop_kind == "profile-guided" else "single-agent"
+        ),
+        profile_guided=(
+            ProfileGuidedInput(command=("python", "profile.py"))
+            if loop_kind == "profile-guided"
+            else None
+        ),
+    )
+    store = Project.open(project).state
+    store.create_project(project.name, now=datetime(2026, 1, 1, tzinfo=UTC))
+    manifest = store.new_run_manifest(
+        project.name,
+        run_id=run_id,
+        branch=f"vibesys-runs/{run_id}",
+        vibesys_version="0.2.0-test",
+        run_environment=configuration.run_environment,
+        execution=configuration.execution,
+        orchestration=configuration.orchestration,
+        trusted_input_baseline="0" * 40,
+        now=datetime(2026, 8, 11, 12, tzinfo=UTC),
+    )
+    store.create_run(manifest)
+    monkeypatch.chdir(project)
+
+    args = parse_cli_invocation(["--outer-loop", loop_kind, "--resume", run_id]).args
+    config, _, backend = load_config_and_skills(args, domain=DomainName.GENERIC)
+    raised = parse_cli_invocation(
+        ["--outer-loop", loop_kind, "--resume", run_id, "--max-rounds", "8"]
+    ).args
+
+    assert args.max_rounds == 7
+    assert args.constraint == ["Preserve the ABI."]
+    assert args.inner_loop == "single-agent"
+    assert args.profiler is ProfilerKind.NONE
+    assert backend is ComputeBackend.CPU
+    assert config.model.name == "gpt-recorded"
+    assert raised.max_rounds == 8
+    with pytest.raises(ConfigurationError, match="operator_constraints"):
+        parse_cli_invocation(
+            ["--outer-loop", loop_kind, "--resume", run_id, "--constraint", "Change the ABI."]
+        )
+    with pytest.raises(ConfigurationError, match="unrecognized arguments: --stub-agent"):
+        parse_cli_invocation(["--outer-loop", loop_kind, "--resume", run_id, "--stub-agent"])
 
 
 def test_plain_resume_restores_its_configuration(
@@ -1389,10 +1575,49 @@ def test_plain_resume_restores_its_configuration(
     assert args.max_rounds == 6
     assert args.max_attempts_per_issue == 4
     assert args.max_issues_per_perf_eval == 2
+    assert args.max_issues_per_round == 3
     assert args.agent_backend == "cli"
     assert args.cli_provider == "claude"
     assert args.backend is ComputeBackend.CPU
     assert args.profiler is ProfilerKind.NONE
+
+
+def test_v5_plain_resume_restores_options_and_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _write_input_project(tmp_path)
+    run_id = "20260811-120000-11111111-plain-v5"
+    configuration = _plain_configuration()
+    store = Project.open(project).state
+    store.create_project(project.name, now=datetime(2026, 1, 1, tzinfo=UTC))
+    manifest = store.new_run_manifest(
+        project.name,
+        run_id=run_id,
+        branch=f"vibesys-runs/{run_id}",
+        vibesys_version="0.2.0-test",
+        run_environment=configuration.run_environment,
+        execution=configuration.execution,
+        orchestration=configuration.orchestration,
+        trusted_input_baseline="0" * 40,
+        now=datetime(2026, 8, 11, 12, tzinfo=UTC),
+    )
+    store.create_run(manifest)
+    assert isinstance(store.load_run(run_id), OrchestrationRunManifest)
+    monkeypatch.chdir(project)
+
+    args = parse_cli_invocation(["--outer-loop", "plain", "--resume", run_id]).args
+    raised = parse_cli_invocation(
+        ["--outer-loop", "plain", "--resume", run_id, "--max-rounds", "7"]
+    ).args
+
+    assert args.max_rounds == 6
+    assert args.max_attempts_per_issue == 4
+    assert args.max_issues_per_perf_eval == 2
+    assert args.cli_provider == "claude"
+    assert raised.max_rounds == 7
+    with pytest.raises(ConfigurationError, match="cannot decrease"):
+        parse_cli_invocation(["--outer-loop", "plain", "--resume", run_id, "--max-rounds", "5"])
 
 
 def test_evolve_resume_restores_its_configuration(
@@ -1425,12 +1650,63 @@ def test_evolve_resume_restores_its_configuration(
     assert args.openevolve_migration_rate == 0.25
     assert args.frontier_bias == 0.6
     assert args.bootstrap_max_attempts == 7
-    assert args.keep_deployments is True
+    assert args.keep_deployments is False
     assert args.max_parallelism == 2
     assert [(item.name, item.direction) for item in args.objective] == [
         ("latency", "min"),
         ("throughput", "max"),
     ]
+
+
+def test_v5_evolve_resume_restores_openevolve_settings_and_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _write_input_project(tmp_path)
+    run_id = "20260811-120000-11111111-evolve-v5"
+    configuration = _evolve_configuration()
+    store = Project.open(project).state
+    store.create_project(project.name, now=datetime(2026, 1, 1, tzinfo=UTC))
+    manifest = store.new_run_manifest(
+        project.name,
+        run_id=run_id,
+        branch=f"vibesys-runs/{run_id}",
+        vibesys_version="0.2.0-test",
+        run_environment=configuration.run_environment,
+        execution=configuration.execution,
+        orchestration=configuration.orchestration,
+        trusted_input_baseline="0" * 40,
+        now=datetime(2026, 8, 11, 12, tzinfo=UTC),
+    )
+    store.create_run(manifest)
+    monkeypatch.chdir(project)
+
+    args = parse_cli_invocation(["--outer-loop", "evolve", "--resume", run_id]).args
+    config, _, backend = load_config_and_skills(args, domain=DomainName.GENERIC)
+    raised = parse_cli_invocation(
+        ["--outer-loop", "evolve", "--resume", run_id, "--max-generations", "6"]
+    ).args
+
+    assert args.max_generations == 5
+    assert args.search_policy == "openevolve"
+    assert args.openevolve_population_size == 40
+    assert args.openevolve_num_islands == 3
+    assert args.openevolve_migration_rate == 0.25
+    assert [(item.name, item.direction) for item in args.objective] == [
+        ("latency", "min"),
+        ("throughput", "max"),
+    ]
+    assert backend is ComputeBackend.CPU
+    assert config.model.name == "gpt-recorded"
+    assert raised.max_generations == 6
+    with pytest.raises(ConfigurationError, match="cannot decrease"):
+        parse_cli_invocation(
+            ["--outer-loop", "evolve", "--resume", run_id, "--max-generations", "4"]
+        )
+    with pytest.raises(ConfigurationError, match="objective"):
+        parse_cli_invocation(
+            ["--outer-loop", "evolve", "--resume", run_id, "--objective", "latency:max"]
+        )
 
 
 @pytest.mark.parametrize(
@@ -1442,7 +1718,7 @@ def test_evolve_resume_restores_its_configuration(
     ],
 )
 def test_resume_budgets_can_only_increase(
-    case: tuple[str, RunConfiguration, str, int, int],
+    case: tuple[str, _RecordedRun, str, int, int],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1503,17 +1779,16 @@ def test_resume_rejects_changes_to_immutable_configuration(
     monkeypatch.chdir(project)
 
     with pytest.raises(ConfigurationError) as exc:
-        parse_cli_invocation(["--resume", run_id, "--judge-every", "3"])
+        parse_cli_invocation(["--resume", run_id, "--official-eval-every", "3"])
     assert exc.value.diagnostic.code == "project_resume_configuration_mismatch"
-    assert "judge_every" in exc.value.diagnostic.message
+    assert "official_eval_every" in exc.value.diagnostic.message
 
 
-def _write_pre_migration_run(project: Path, run_id: str) -> None:
-    """Rewrite a run manifest as a schema version 1 recording."""
+def _write_unsupported_schema_run(project: Path, run_id: str) -> None:
+    """Rewrite a v5 manifest with an unsupported schema version."""
     path = project / ".vibesys" / "state" / "runs" / run_id / "run.json"
     raw = json.loads(path.read_text())
-    raw["schema_version"] = 1
-    del raw["configuration"]["run_environment"]
+    raw["schema_version"] = 4
     path.write_text(json.dumps(raw, indent=2, sort_keys=True))
 
 
@@ -1534,8 +1809,7 @@ def _modal_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, s
 def test_fresh_run_records_the_selected_run_environment(tmp_path: Path) -> None:
     project = _write_input_project(tmp_path)
     args = argparse.Namespace(
-        input_bundle=load_input_bundle(project),
-        docker=False,
+        input_bundle=load_task(project),
         docker_image=None,
         modal=True,
         modal_gpu="A100-80GB",
@@ -1557,11 +1831,40 @@ def test_resume_without_run_environment_flags_restores_the_recorded_environment(
     args = parse_cli_invocation(["--resume", run_id]).args
 
     assert args.modal is True
-    assert args.docker is False
     assert args.modal_gpu == "A100-80GB"
     assert args.modal_model_volume == "weights"
     assert args.modal_app == "run-app"
     assert run_environment_record(run_environment_spec_from_args(args)) == _MODAL_ENVIRONMENT
+
+
+def test_resume_restores_the_external_slurm_config_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _write_input_project(tmp_path)
+    slurm_config = _write_slurm_operator_config(tmp_path / "operator-slurm.toml")
+    run_id = "20260811-120000-11111111-agent"
+    _write_project_run(
+        project,
+        run_id,
+        configuration=_agent_configuration(
+            run_environment=RunEnvironmentRecord(name="slurm", config_path=str(slurm_config))
+        ),
+        created_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
+    )
+    monkeypatch.chdir(project)
+
+    args = parse_cli_invocation(["--resume", run_id]).args
+    spec = run_environment_spec_from_args(args)
+
+    assert args.slurm_config == slurm_config
+    assert spec == RunEnvironmentSpec("slurm", {"config_path": str(slurm_config)})
+
+    matching = parse_cli_invocation(["--resume", run_id, "--slurm-config", str(slurm_config)]).args
+    assert run_environment_spec_from_args(matching) == spec
+
+    with pytest.raises(ConfigurationError, match=r"run_environment\.config_path"):
+        parse_cli_invocation(["--resume", run_id, "--slurm-config", "/different/operator.toml"])
 
 
 def test_resume_with_matching_run_environment_flags_is_accepted(
@@ -1590,7 +1893,7 @@ def test_resume_with_matching_run_environment_flags_is_accepted(
 @pytest.mark.parametrize(
     ("flags", "field"),
     [
-        (["--docker"], "run_environment"),
+        (["--run-environment", "docker"], "run_environment"),
         (["--modal", "--modal-gpu", "H100!"], "run_environment.gpu"),
     ],
 )
@@ -1608,66 +1911,19 @@ def test_resume_rejects_run_environment_flags_that_contradict_the_recording(
     assert field in exc.value.diagnostic.message
 
 
-def test_resume_rejects_a_recording_without_a_run_environment(
+def test_resume_rejects_an_unsupported_run_schema(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, run_id = _modal_run(tmp_path, monkeypatch)
-    _write_pre_migration_run(project, run_id)
+    _write_unsupported_schema_run(project, run_id)
 
     with pytest.raises(ConfigurationError) as exc:
         parse_cli_invocation(["--resume", run_id])
 
-    assert exc.value.diagnostic.code == "project_run_schema_migration_required"
-    assert "migrate-run-environment" in exc.value.diagnostic.message
+    assert exc.value.diagnostic.code == "unsupported_run_schema"
+    assert "requires version 5" in exc.value.diagnostic.message
     assert run_id in exc.value.diagnostic.message
-
-
-def test_migrated_recording_resumes_with_the_supplied_run_environment(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project, run_id = _modal_run(tmp_path, monkeypatch)
-    _write_pre_migration_run(project, run_id)
-
-    _run_migrate_run_environment(
-        [
-            "--project",
-            str(project),
-            "--run",
-            run_id,
-            "--run-environment",
-            "modal",
-            "--modal-gpu",
-            "A100-80GB",
-            "--modal-model-volume",
-            "weights",
-            "--modal-app",
-            "run-app",
-        ]
-    )
-
-    args = parse_cli_invocation(["--resume", run_id]).args
-    assert args.modal is True
-    assert run_environment_record(run_environment_spec_from_args(args)) == _MODAL_ENVIRONMENT
-    recorded = Project.open(project).state.load_run(run_id)
-    assert recorded.schema_version == RUN_SCHEMA_VERSION
-    assert recorded.configuration.run_environment == _MODAL_ENVIRONMENT
-
-
-def test_migration_rejects_an_already_migrated_recording(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project, run_id = _modal_run(tmp_path, monkeypatch)
-
-    with pytest.raises(ConfigurationError) as exc:
-        _run_migrate_run_environment(
-            ["--project", str(project), "--run", run_id, "--run-environment", "modal"]
-        )
-
-    assert exc.value.diagnostic.code == "migration_failed"
-    assert "already at run schema version" in exc.value.diagnostic.message
 
 
 @pytest.mark.parametrize(
@@ -1679,7 +1935,7 @@ def test_migration_rejects_an_already_migrated_recording(
     ],
 )
 def test_parse_cli_objective_rejects_malformed_specs(spec: str, message: str) -> None:
-    with pytest.raises(Exception) as exc:  # noqa: PT011
+    with pytest.raises(argparse.ArgumentTypeError, match=message) as exc:
         _parse_cli_objective(spec)
     assert message in str(exc.value)
 
@@ -1725,74 +1981,79 @@ def test_render_configuration_error_prints_usage(
 def test_main_routes_to_the_selected_loop(
     loop: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The selected descriptor reaches the shared orchestration runner."""
     project = _write_input_project(tmp_path)
-    runner = Mock()
+    runner = AsyncMock(return_value=RunEnd(PluginRunStatus.SUCCEEDED))
+    monkeypatch.setattr(_LOOP_RUN_TARGETS[loop], runner)
     argv = ["vibesys", "--outer-loop", loop, "--input", str(project)]
 
-    with patch.object(sys, "argv", argv), _patch_loop_runner(loop, runner):
+    with patch.object(sys, "argv", argv):
         main()
 
-    runner.assert_called_once()
-    assert runner.call_args.args[0].input_bundle.root == project.resolve()
+    runner.assert_awaited_once()
+    assert runner.await_args is not None
+    assert runner.await_args.args[0].input_bundle.root == project.resolve()
 
 
-def test_dispatch_owns_headless_rendering_and_local_integration(
+def test_dispatch_owns_headless_rendering(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
+
+    headless_run_module = sys.modules["headless.execute"]
 
     project = _write_input_project(tmp_path)
-    integration = LocalRunIntegration()
-    integration.close = Mock()  # type: ignore[method-assign]
     renderer = Mock()
-    runner = Mock()
-    monkeypatch.setattr(cli, "LocalRunIntegration", lambda: integration)
-    monkeypatch.setattr(cli, "HeadlessRenderer", lambda: renderer)
+    monkeypatch.setattr(headless_run_module, "HeadlessRenderer", lambda: renderer)
+    monkeypatch.setattr(
+        _LOOP_RUN_TARGETS["agent"], AsyncMock(return_value=RunEnd(PluginRunStatus.SUCCEEDED))
+    )
 
-    with _patch_loop_runner("agent", runner):
-        cli.dispatch(["--input", str(project)])
+    cli.dispatch(["--input", str(project)])
 
     assert [call.args[0].type for call in renderer.handle.call_args_list] == [
         CoreEventType.RUN_STARTED,
         CoreEventType.RUN_FINISHED,
     ]
-    integration.close.assert_called_once_with()
 
 
-def test_dispatch_records_failure_without_closing_passed_integration(tmp_path: Path) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
+def test_dispatch_records_failure_through_the_headless_renderer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    headless_run_module = sys.modules["headless.execute"]
 
     project = _write_input_project(tmp_path)
-    integration = LocalRunIntegration()
-    integration.close = Mock()  # type: ignore[method-assign]
-    events = []
-    integration.events.subscribe(events.append)
-    runner = Mock(side_effect=RuntimeError("runner failed"))
+    renderer = Mock()
+    monkeypatch.setattr(headless_run_module, "HeadlessRenderer", lambda: renderer)
+    monkeypatch.setattr(
+        _LOOP_RUN_TARGETS["agent"], AsyncMock(side_effect=RuntimeError("runner failed"))
+    )
 
-    with _patch_loop_runner("agent", runner), pytest.raises(RuntimeError, match="runner failed"):
-        cli.dispatch(["--input", str(project)], integration=integration)
+    with pytest.raises(RuntimeError, match="runner failed"):
+        cli.dispatch(["--input", str(project)])
 
-    assert [event.type for event in events] == [
+    assert [call.args[0].type for call in renderer.handle.call_args_list] == [
         CoreEventType.RUN_STARTED,
         CoreEventType.RUN_FAILED,
     ]
-    integration.close.assert_not_called()
 
 
 def _write_microservice_project(parent: Path, *, traced: bool, name: str = "hotel") -> Path:
     """Write a microservice bundle that does or does not capture a trace graph."""
     project = parent / name
     (project / "src").mkdir(parents=True)
-    (project / "OBJECTIVE.md").write_text("Make the request path faster.\n")
     telemetry = (
         ', "--telemetry-output", "/tmp/otel/telemetry.json"'
         ', "--trace-graph-json", "/tmp/otel/trace-graph.json"'
         if traced
         else ""
     )
-    (project / "vibesys.input.toml").write_text(
+    write_task(
+        project,
         f"""\
 version = 1
 
@@ -1808,7 +2069,8 @@ command = ["servicebench", "trace", "--candidate-dir", "svc"{telemetry}]
 [benchmark.result]
 json_argument = "--output-json"
 metric = "primary_value"
-"""
+""",
+        objective="Make the request path faster.\n",
     )
     return project
 
@@ -1819,108 +2081,116 @@ def test_instrumented_microservice_task_profiles_with_otel_by_default(tmp_path: 
     Without this the default run resolves to ``none`` for microservices, the
     profiler role never executes, and no critical-path evidence is produced.
     """
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_microservice_project(tmp_path, traced=True)
-    args = cli._build_agent_parser().parse_args(["--input", str(project)])  # noqa: SLF001
-    args.input_bundle = load_input_bundle(project)
 
-    assert args.profiler is ProfilerKind.AUTO
-    cli._apply_bundle_profiler_default(args)  # noqa: SLF001
-
-    assert args.profiler is ProfilerKind.OTEL
+    invocation = parse_cli_invocation(["--input", str(project)])
+    assert invocation.args.profiler is ProfilerKind.OTEL
 
 
 def test_uninstrumented_microservice_task_keeps_auto(tmp_path: Path) -> None:
     """Without a collector there is nothing for the OTel profiler to read."""
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_microservice_project(tmp_path, traced=False)
-    args = cli._build_agent_parser().parse_args(["--input", str(project)])  # noqa: SLF001
-    args.input_bundle = load_input_bundle(project)
 
-    cli._apply_bundle_profiler_default(args)  # noqa: SLF001
-
-    assert args.profiler is ProfilerKind.AUTO
+    invocation = parse_cli_invocation(["--input", str(project)])
+    assert invocation.args.profiler is ProfilerKind.AUTO
 
 
 def test_explicit_profiler_flag_overrides_the_task_default(tmp_path: Path) -> None:
     """The bundle only supplies a default; the operator stays in control."""
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_microservice_project(tmp_path, traced=True)
-    args = cli._build_agent_parser().parse_args(  # noqa: SLF001
-        ["--input", str(project), "--profiler", "none"]
-    )
-    args.input_bundle = load_input_bundle(project)
 
-    cli._apply_bundle_profiler_default(args)  # noqa: SLF001
-
-    assert args.profiler is ProfilerKind.NONE
+    invocation = parse_cli_invocation(["--input", str(project), "--profiler", "none"])
+    assert invocation.args.profiler is ProfilerKind.NONE
 
 
 def test_non_microservice_task_is_unaffected_by_trace_arguments(tmp_path: Path) -> None:
     """OTel is microservices-only; a generic bundle must not be upgraded."""
-    import entrypoints.headless as cli  # noqa: PLC0415
 
     project = _write_microservice_project(tmp_path, traced=True, name="generic-task")
-    manifest = project / "vibesys.input.toml"
+    manifest = task_path(project) / "vibesys.input.toml"
     manifest.write_text(manifest.read_text().replace('"microservices"', '"generic"'))
-    args = cli._build_agent_parser().parse_args(["--input", str(project)])  # noqa: SLF001
-    args.input_bundle = load_input_bundle(project)
 
-    cli._apply_bundle_profiler_default(args)  # noqa: SLF001
-
-    assert args.profiler is ProfilerKind.AUTO
+    invocation = parse_cli_invocation(["--input", str(project)])
+    assert invocation.args.profiler is ProfilerKind.AUTO
 
 
-def test_expected_role_registry_covers_every_outer_loop() -> None:
-    """The advertised contract must name every loop dispatch can select."""
-    import entrypoints.headless as cli  # noqa: PLC0415
-
-    assert set(EXPECTED_AGENT_ROLES) == set(cli._OUTER_LOOPS)  # noqa: SLF001
-    assert set(EXPECTED_AGENT_ROLES) == set(cli._LOOP_COMMANDS)  # noqa: SLF001
-    assert all(EXPECTED_AGENT_ROLES.values())
-
-
-@pytest.mark.parametrize("loop", ["agent", "plain", "evolve"])
-def test_dispatch_advertises_expected_roles_on_run_started(loop: str, tmp_path: Path) -> None:
-    import entrypoints.headless as cli  # noqa: PLC0415
-
+def test_docker_flag_is_rejected_with_a_message_naming_the_replacement(tmp_path: Path) -> None:
     project = _write_input_project(tmp_path)
-    integration = LocalRunIntegration()
-    events = []
-    integration.events.subscribe(events.append)
-    runner = Mock()
 
-    with _patch_loop_runner(loop, runner):
-        cli.dispatch(["--outer-loop", loop, "--input", str(project)], integration=integration)
-
-    started = next(event for event in events if event.type is CoreEventType.RUN_STARTED)
-    assert isinstance(started.data, RunStartedData)
-    assert started.data.expected_roles == EXPECTED_AGENT_ROLES[loop]
-    assert started.data.expected_roles
+    with pytest.raises(ConfigurationError, match=r"--docker was removed.*always run"):
+        parse_cli_invocation(["--input", str(project), "--docker"])
 
 
-@pytest.mark.parametrize("loop", ["agent", "evolve"])
-def test_dispatch_omits_profiler_role_when_profiler_is_disabled(loop: str, tmp_path: Path) -> None:
-    """A disabled profiler never runs, so its placeholder must not be seeded."""
-    import entrypoints.headless as cli  # noqa: PLC0415
-
+@pytest.mark.parametrize("extra", [[], ["--docker-image", "custom:1"], ["--modal"]])
+def test_docker_flag_is_rejected_whatever_else_is_given(tmp_path: Path, extra: list[str]) -> None:
     project = _write_input_project(tmp_path)
-    integration = LocalRunIntegration()
-    events = []
-    integration.events.subscribe(events.append)
-    runner = Mock()
 
-    with _patch_loop_runner(loop, runner):
-        cli.dispatch(
-            ["--outer-loop", loop, "--input", str(project), "--profiler", "none"],
-            integration=integration,
-        )
+    with pytest.raises(ConfigurationError, match="--docker was removed"):
+        parse_cli_invocation(["--input", str(project), *extra, "--docker"])
 
-    started = next(event for event in events if event.type is CoreEventType.RUN_STARTED)
-    assert "profiler" not in started.data.expected_roles
-    assert started.data.expected_roles == tuple(
-        role for role in EXPECTED_AGENT_ROLES[loop] if role != "profiler"
+
+def test_run_environment_local_is_rejected_with_a_message_naming_the_replacement(
+    tmp_path: Path,
+) -> None:
+    project = _write_input_project(tmp_path)
+
+    with pytest.raises(ConfigurationError, match=r"--run-environment local was removed"):
+        parse_cli_invocation(["--input", str(project), "--run-environment", "local"])
+
+
+def test_a_launch_without_environment_flags_runs_the_agent_in_docker(tmp_path: Path) -> None:
+    project = _write_input_project(tmp_path)
+
+    args = parse_cli_invocation(["--input", str(project)]).args
+
+    assert run_environment_spec_from_args(args).name == "docker"
+
+
+def test_resume_of_a_run_recorded_with_the_local_environment_continues_in_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "repository"
+    project.mkdir()
+    _write_repository_task(project, "latency")
+    run_id = "20260811-120000-11111111-agent"
+    _write_project_run(
+        project,
+        run_id,
+        configuration=_agent_configuration(run_environment=_RETIRED_LOCAL_ENVIRONMENT),
+        created_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
+        options=_RunFixtureOptions(task_name="latency"),
     )
+    monkeypatch.chdir(project)
+
+    args = parse_cli_invocation(["--resume", run_id]).args
+
+    assert run_environment_spec_from_args(args).name == "docker"
+
+
+def test_resume_of_a_host_run_leaves_the_environment_to_be_derived_from_its_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "repository"
+    project.mkdir()
+    _write_repository_task(project, "latency")
+    run_id = "20260811-120000-22222222-agent"
+    _write_project_run(
+        project,
+        run_id,
+        configuration=_agent_configuration(run_environment=RunEnvironmentRecord(name="host")),
+        created_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
+        options=_RunFixtureOptions(task_name="latency"),
+    )
+    monkeypatch.chdir(project)
+
+    args = parse_cli_invocation(["--resume", run_id]).args
+
+    assert args.run_environment is None
+    # Docker here is the pre-derivation default; the runtime turns it into the
+    # host environment for a host-only backend on macOS and rejects it elsewhere.
+    assert run_environment_spec_from_args(args).name == "docker"

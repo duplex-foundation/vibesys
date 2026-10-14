@@ -27,9 +27,9 @@ matching the changed surfaces.
 - Keep example-specific evaluator, checker, benchmark, and reference behavior
   in its standard example bundle. Do not move one workload's policy into the
   framework or create shared infrastructure merely to set up an example.
-- Keep runtime prompt assets under `src/vibesys/prompts/`, organized by loop,
-  domain, and backend. Keep executable domain hooks and definitions in
-  `src/vibesys/domains/`, separate from their prompt context.
+- Keep strategy and domain prompt assets in their owning packages; keep only
+  shared rendering and templates in `src/vibesys/prompts/`. Follow the
+  [package placement rule](../../../../docs/contributing/architecture.md).
 - Keep long-form serving knowledge under `resources/skills/`. Follow
   `resources/skills/serving-systems/CLAUDE.md` for that subtree.
 - Preserve unidirectional data flow: stable interfaces and typed values feed
@@ -41,6 +41,13 @@ matching the changed surfaces.
   should normally register a new case rather than force concrete-type branches
   through implementations.
 - Keep compatibility wrappers thin and behavior in the canonical module.
+- For stateful systems, follow
+  [Functional core, interfaces and implementations](../../software-design/references/functional-core.md).
+  Keep lifecycle decisions in the pure core. Flag decisions in the shell or
+  implementations, I/O imports in the core, and implementation kind checks.
+  Each I/O interface belongs in its owning library's `.api`; implementations
+  live inside it or in smaller libraries it depends on, never in a separate
+  interface library.
 
 Ask of new abstractions:
 
@@ -62,6 +69,11 @@ Ask of new abstractions:
   subscription owns deterministic and preferably idempotent cleanup.
 - Look for partial state commits, unsafe retry behavior, check-then-act races,
   non-atomic persistence, stale caches, unbounded queues, and lost exceptions.
+- Require durable intent before executing requests, idempotent execution,
+  atomic completion records, and replay of unfinished intents after restart.
+  Flag multi-step transitions committed in pieces and results never returned
+  to the core as events. Unknown outcomes must be explicit, never success
+  defaults such as `exit_code or 0`.
 - Treat subprocesses as integration boundaries: use argument arrays, explicit
   working directories/environment/encoding/timeouts, actionable domain errors,
   injectable runners when useful, and redacted diagnostics.
@@ -90,7 +102,7 @@ Ask of new abstractions:
 
 ## Python 3.12
 
-- Expect typed Python consistent with strict Pyright. Avoid `Any` or casts that
+- Expect typed Python that passes `ty` (`./scripts/check_types.sh`). Avoid `Any` or casts that
   hide an uncertain boundary; preserve type information through registries,
   callbacks, serialization, and async code.
 - Use Pydantic models for configuration, metadata, persisted state, structured
@@ -104,7 +116,7 @@ Ask of new abstractions:
   generators for cleanup across exceptional exits.
 - Favor observable-contract tests with Pytest/Hypothesis over private call
   structure. When relevant, run focused tests, `./scripts/check_format.sh`,
-  `./scripts/check_lint.sh`, and Pyright for affected typed packages.
+  `./scripts/check_lint.sh`, and `./scripts/check_types.sh` for affected typed packages.
 
 ## TypeScript TUI
 
@@ -191,8 +203,10 @@ that prevent domain prose from leaking into neutral or unrelated prompts.
 
 For skill changes, also verify that the frontmatter description triggers on the
 intended requests without being overly broad, instructions are imperative and
-actionable, references are discoverable directly from `SKILL.md`, and
-`quick_validate.py` passes.
+actionable, and references are discoverable directly from `SKILL.md`. For
+skills under `resources/skills/`, also run
+`uv run pytest tests/entrypoints/test_skills_wiring.py`, which runs
+`validate_skill_tree`.
 
 ## Documentation And Example Drift
 
@@ -224,8 +238,14 @@ take the wrong action. Do not require prose churn for a purely internal change.
   `docs/contributing/tui-architecture.md`.
 - Test application configuration and implementation separately, then add a
   focused wiring test when their connection changes.
-- Use shared contract tests for interchangeable sandboxes, compute backends,
-  and other interface implementations.
+- Require one contract suite per I/O interface, shipped by its owning library
+  and run against every implementation, including Fake and production.
+  Flag a missing implementation or skipped contract case; a Fake must not
+  accept inputs or transitions that production rejects.
+- Test the pure core with generated event sequences and crash-and-replay at
+  every intent boundary, without async, sleeps, or Fakes. Composed-system chaos
+  tests inject implementation failures and unknown exceptions and assert a
+  typed terminal state.
 - Cover external CLI adapters with success, missing executable, timeout,
   nonzero exit, malformed output, and redaction cases as applicable.
 - Prefer the narrowest relevant check first. Broaden when the change crosses an

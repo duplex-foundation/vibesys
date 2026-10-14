@@ -1,0 +1,2000 @@
+"""Stage workspaces and execute commands on a remote Slurm cluster."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import tempfile
+import uuid
+from collections.abc import Mapping
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Literal, Protocol
+
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+
+from .config import (
+    PORT_PLACEHOLDER,
+    SlurmConfig,
+    SlurmConfigError,
+    SlurmConnectorTransport,
+    SlurmLocalTransport,
+    SlurmService,
+    SlurmSshTransport,
+    shell_join_with_port,
+)
+from .owned_process import OwnedProcessRunner
+from .remote_operations import (
+    RemoteOperationClaim,
+    RemoteOperationEvidence,
+    RemoteOperations,
+    operation_job_name,
+)
+from .scheduler_read import framed, unframed
+from .scheduler_states import (
+    INITIAL_LIFE,
+    JobLife,
+    NotInQueue,
+    QueueRow,
+    SlurmJobStatus,
+    SlurmPhase,
+    Unknown,
+    needs_accounting,
+    observe,
+    parse_accounting_row,
+    parse_queue_row,
+    phase_of,
+    status_of,
+)
+from .staging import _ContentStageError, _stage_tree, _TreeStageRequest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+    from threading import Event
+
+    from vs_sim.api import Clock
+
+# The whole line, newline included: an answer cut off mid-number ("Submitted batch
+# job 50" of job 5000) would otherwise name another job.
+_JOB_ID = re.compile(r"^Submitted batch job ([0-9]+)\r?\n", re.MULTILINE)
+# The allocation's own exit status when its server never answered the readiness probe
+# (it exited or hung while starting), so no stage ran. The job script writes it.
+SERVICE_NOT_READY_EXIT_CODE = 70
+_MAX_PROCESS_EXIT_CODE = 255
+_BATCH_RESULT_ROOT = ".vibesys-slurm-results"
+_SERVICE_LOG_TAIL = "service-log-tail.txt"
+_SERVICE_LOG_TAIL_LINES = 400
+_SERVICE_LOG_REPORTED_LINES = 40
+_SERVICE_LOG_LINE_CHARS = 400
+_SERVICE_LOG_TAIL_CHARS = 8_000
+_CONTENT_CACHE_ROOT = ".vibesys-content-cache"
+_STAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
+
+
+class SlurmProcess(Protocol):
+    """Injectable process boundary for SSH, rsync, or a custom connector."""
+
+    def __call__(
+        self, argv: Sequence[str], *, stdin: str | None, timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one transport process under a hard timeout."""
+        ...
+
+
+@dataclass(frozen=True)
+class _TransportResponse:
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class SlurmFileArtifact:
+    """A candidate-relative remote file copied to an explicit local path.
+
+    Artifacts are copied when the job succeeds. ``collect_on_failure`` also
+    copies this one when the job ran and exited nonzero, if the job wrote it:
+    a failed job may have reported why in it.
+    """
+
+    remote_path: str
+    local_path: Path
+    collect_on_failure: bool = False
+
+
+@dataclass(frozen=True)
+class SlurmTreeArtifact:
+    """A candidate-relative remote directory synchronized to a local directory."""
+
+    remote_path: str
+    local_path: Path
+
+
+@dataclass(frozen=True)
+class SlurmJobRequest:
+    """One command, its staged inputs, and requested output artifacts."""
+
+    workspace: Path
+    command: Sequence[str]
+    setup_script: str | None = None
+    service: SlurmService | None = None
+    support_trees: Mapping[str, Path] | None = None
+    file_artifacts: tuple[SlurmFileArtifact, ...] = ()
+    tree_artifacts: tuple[SlurmTreeArtifact, ...] = ()
+    cancel_event: Event | None = None
+
+
+@dataclass(frozen=True)
+class SlurmJobResult:
+    """Trusted scheduler identity, process status, and combined job output."""
+
+    job_id: str
+    exit_code: int | None
+    output: str
+    collection_failure: str | None = None
+
+
+@dataclass(frozen=True)
+class SlurmBatchStage:
+    """One ordered command in an allocation-scoped batch evaluation."""
+
+    name: str
+    command: Sequence[str]
+    timeout_seconds: int | None = None
+    file_artifacts: tuple[SlurmFileArtifact, ...] = ()
+    tree_artifacts: tuple[SlurmTreeArtifact, ...] = ()
+
+
+@dataclass(frozen=True)
+class _JobScriptRequest:
+    workspace: PurePosixPath
+    status_path: PurePosixPath
+    command: Sequence[str]
+    setup_script: str | None
+    service: SlurmService | None
+    phase_timing_root: PurePosixPath | None = None
+
+
+@dataclass(frozen=True)
+class SlurmBatchRequest:
+    """Ordered stages sharing one staged workspace, setup, service, and job."""
+
+    workspace: Path
+    stages: tuple[SlurmBatchStage, ...]
+    stop_on_failure: bool = True
+    setup_script: str | None = None
+    service: SlurmService | None = None
+    support_trees: Mapping[str, Path] | None = None
+    cancel_event: Event | None = None
+
+
+@dataclass(frozen=True)
+class SchedulerReading:
+    """One scheduler observation: a job life and the queue's evidence for it.
+
+    ``status``, ``phase`` and ``attempt`` are projections of ``life``.
+    """
+
+    life: JobLife
+    reason: str | None = None
+    estimated_start: str | None = None
+
+    @property
+    def status(self) -> SlurmJobStatus:
+        """The public status of the life."""
+        return status_of(self.life)
+
+    @property
+    def phase(self) -> SlurmPhase:
+        """The phase of the life."""
+        return phase_of(self.life)
+
+    @property
+    def attempt(self) -> int:
+        """The scheduler attempt of the life."""
+        return self.life.attempt
+
+
+class SlurmArtifactTarget(BaseModel):
+    """Artifact mapping retained in a recoverable operation handle."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    remote_path: str
+    local_path: Path
+    kind: Literal["file", "tree"]
+    collect_on_failure: bool = False
+
+
+class SlurmJobHandle(BaseModel):
+    """Credential-free durable locator for one submitted Slurm job.
+
+    Persist this model with the caller's run state. A new ``SlurmJobRunner``
+    built from the same operator configuration can poll, cancel, wait for, or
+    collect the operation without submitting it again.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    job_id: str
+    invocation_id: str
+    config_identity: str
+    remote_workspace: str
+    remote_status_path: str
+    remote_log_path: str
+    artifacts: tuple[SlurmArtifactTarget, ...] = ()
+    staging_seconds: float = 0.0
+    content_cache_hits: int = 0
+
+    @field_validator("job_id")
+    @classmethod
+    def _numeric_job_id(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9]+", value) is None:
+            raise ValueError
+        return value
+
+    @field_validator("invocation_id")
+    @classmethod
+    def _safe_invocation_id(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value) is None:
+            raise ValueError
+        return value
+
+    @field_validator("config_identity")
+    @classmethod
+    def _valid_config_identity(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError
+        return value
+
+    @model_validator(mode="after")
+    def _safe_remote_paths(self) -> SlurmJobHandle:
+        workspace = _normalized_remote_path(self.remote_workspace)
+        status = _normalized_remote_path(self.remote_status_path)
+        log = _normalized_remote_path(self.remote_log_path)
+        if (
+            workspace.name != "workspace"
+            or status.parent != workspace.parent
+            or log.parent != workspace.parent
+            or status == log
+        ):
+            raise ValueError
+        for artifact in self.artifacts:
+            _safe_relative_path(artifact.remote_path, SlurmError.invalid_artifact_path)
+        if not math.isfinite(self.staging_seconds) or self.staging_seconds < 0:
+            raise ValueError
+        if self.content_cache_hits < 0:
+            raise ValueError
+        return self
+
+
+class SlurmBatchStageHandle(BaseModel):
+    """Durable result and artifact locations for one batch stage."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    name: str
+    file_artifacts: tuple[SlurmArtifactTarget, ...] = ()
+    tree_artifacts: tuple[SlurmArtifactTarget, ...] = ()
+
+    @field_validator("name")
+    @classmethod
+    def _safe_name(cls, value: str) -> str:
+        if _STAGE_NAME.fullmatch(value) is None:
+            raise ValueError
+        return value
+
+    @model_validator(mode="after")
+    def _safe_artifacts(self) -> SlurmBatchStageHandle:
+        for artifact in (*self.file_artifacts, *self.tree_artifacts):
+            path = _safe_relative_path(artifact.remote_path, SlurmError.invalid_artifact_path)
+            if path.parts[0] == _BATCH_RESULT_ROOT:
+                raise ValueError
+        return self
+
+
+class SlurmBatchHandle(BaseModel):
+    """Recoverable handle for a batch and its stage result contract."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    job: SlurmJobHandle
+    stages: tuple[SlurmBatchStageHandle, ...]
+    stop_on_failure: bool = True
+    submission_seconds: float
+    waited_seconds: float = 0.0
+
+    @model_validator(mode="after")
+    def _unique_stages(self) -> SlurmBatchHandle:
+        names = tuple(stage.name for stage in self.stages)
+        if not names or len(set(names)) != len(names):
+            raise ValueError
+        if (
+            not math.isfinite(self.submission_seconds)
+            or self.submission_seconds < 0
+            or not math.isfinite(self.waited_seconds)
+            or self.waited_seconds < 0
+        ):
+            raise ValueError
+        return self
+
+
+@dataclass(frozen=True)
+class SlurmBatchStageResult:
+    """Stage evidence, with unknown outcomes and incomplete collection explicit."""
+
+    name: str
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    elapsed_seconds: float | None
+    skipped: bool
+    artifacts: tuple[SlurmArtifactTarget, ...] = ()
+    collection_failure: str | None = None
+
+
+@dataclass(frozen=True)
+class SlurmBatchResult:
+    """One allocation result with ordered stage outcomes and phase timings."""
+
+    job_id: str
+    job_exit_code: int | None
+    job_output: str
+    stages: tuple[SlurmBatchStageResult, ...]
+    phase_timings_seconds: Mapping[str, float]
+    content_cache_hits: int
+    service_log_tail: str = ""
+    """Last distinct lines of the shared service's log, empty without a service."""
+    collection_failure: str | None = None
+
+
+@dataclass(frozen=True)
+class SlurmBatchWaitResult:
+    """Updated durable batch handle after one bounded wait observation."""
+
+    handle: SlurmBatchHandle
+    status: SlurmJobStatus
+    timed_out: bool
+
+
+class SlurmJobWaitResult(BaseModel):
+    """Result of observing a job for a bounded interval.
+
+    ``timed_out`` means the observation interval elapsed while the job was
+    still nonterminal. It never means the scheduler job was cancelled.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    handle: SlurmJobHandle
+    status: SlurmJobStatus
+    timed_out: bool
+
+    @property
+    def terminal(self) -> bool:
+        """Whether the scheduler reported a terminal job state."""
+        return self.status.terminal
+
+
+class SlurmError(RuntimeError):
+    """Actionable failure from validation, transport, Slurm, or artifact collection."""
+
+    @classmethod
+    def invalid_operation_record(cls, operation_id: str) -> SlurmError:
+        """Describe a persisted record stored under another operation identity."""
+        return cls(f"operation record identity mismatch at {operation_id}.json")
+
+    @classmethod
+    def invalid_operation_id(cls) -> SlurmError:
+        """Describe an unsafe stable operation identifier."""
+        return cls("operation_id must contain 1 to 128 safe identifier characters")
+
+    @classmethod
+    def invalid_job_id(cls) -> SlurmError:
+        """Describe a nonnumeric scheduler identifier."""
+        return cls("job_id must be numeric")
+
+    @classmethod
+    def operation_identity_ambiguous(cls) -> SlurmError:
+        """Describe multiple scheduler jobs matching a stable operation ID."""
+        return cls("stable operation ID matched multiple scheduler jobs")
+
+    @classmethod
+    def invalid_script_states(cls) -> SlurmError:
+        """Describe an empty or incorrectly typed fake scheduler sequence."""
+        return cls("states must contain SlurmJobStatus observations")
+
+    @classmethod
+    def invalid_command(cls) -> SlurmError:
+        """Describe an empty or malformed command vector."""
+        return cls("Slurm job command must be a non-empty argv")
+
+    @classmethod
+    def invalid_batch_request(cls) -> SlurmError:
+        """Describe an empty batch or an unsafe or repeated stage name."""
+        return cls("Slurm batch must contain stages with unique safe names")
+
+    @classmethod
+    def invalid_stage_timeout(cls) -> SlurmError:
+        """Describe a stage timeout outside the supported integer range."""
+        return cls("Slurm batch stage timeout must be a positive integer number of seconds")
+
+    @classmethod
+    def content_stage_failed(cls) -> SlurmError:
+        """Describe a local tree that could not be safely content-addressed."""
+        return cls("Slurm input changed or became invalid during content-addressed staging")
+
+    @classmethod
+    def content_cache_busy(cls, detail: str) -> SlurmError:
+        """Describe a transient staging condition that can be retried."""
+        return cls(f"Slurm content staging is temporarily unavailable: {detail}")
+
+    @classmethod
+    def workspace_is_not_directory(cls) -> SlurmError:
+        """Describe a missing or non-directory workspace."""
+        return cls("Slurm job workspace must be an existing directory")
+
+    @classmethod
+    def missing_job_id(cls) -> SlurmError:
+        """Describe submission output without a job identifier."""
+        return cls("sbatch did not return a Slurm job id")
+
+    @classmethod
+    def truncated_output(cls) -> SlurmError:
+        """Describe a scheduler answer that lost its end line in transit."""
+        return cls("Slurm scheduler output did not arrive whole")
+
+    @classmethod
+    def job_timed_out(cls, job_id: str) -> SlurmError:
+        """Describe a job that exceeded its configured deadline."""
+        return cls(f"Slurm job {job_id} exceeded the configured timeout")
+
+    @classmethod
+    def transport_unavailable(cls, operation: str) -> SlurmError:
+        """Describe a missing transport executable."""
+        return cls(f"Slurm transport is unavailable during {operation}")
+
+    @classmethod
+    def transport_timed_out(cls, operation: str) -> SlurmError:
+        """Describe a transport request that exceeded its deadline."""
+        return cls(f"Slurm transport timed out during {operation}")
+
+    @classmethod
+    def transport_failed(cls, operation: str, returncode: int) -> SlurmError:
+        """Describe an unsuccessful transport operation without exposing output."""
+        return cls(f"Slurm transport {operation} failed with exit code {returncode}")
+
+    @classmethod
+    def invalid_connector_response(cls, operation: str) -> SlurmError:
+        """Describe a response that violates the connector protocol."""
+        return cls(f"Slurm connector returned an invalid response during {operation}")
+
+    @classmethod
+    def invalid_artifact_path(cls) -> SlurmError:
+        """Describe an artifact outside the staged workspace."""
+        return cls("Slurm artifact paths must be safe candidate-relative paths")
+
+    @classmethod
+    def invalid_support_path(cls) -> SlurmError:
+        """Describe an invalid local or remote support tree."""
+        return cls("Slurm support trees must map safe relative paths to directories")
+
+    @classmethod
+    def invalid_setup_script(cls) -> SlurmError:
+        """Describe an unsafe remote setup script path."""
+        return cls("Slurm setup script must be an absolute normalized POSIX path")
+
+    @classmethod
+    def malformed_result(cls) -> SlurmError:
+        """Describe missing or malformed job result files."""
+        return cls("Slurm job returned a missing or malformed status artifact")
+
+    @classmethod
+    def cancelled(cls, job_id: str) -> SlurmError:
+        """Describe a submitted job cancelled by its caller."""
+        return cls(f"Slurm job {job_id} was cancelled")
+
+    @classmethod
+    def cancelled_before_submission(cls) -> SlurmError:
+        """Describe a request cancelled before side effects began."""
+        return cls("Slurm job was cancelled before submission")
+
+    @classmethod
+    def job_not_terminal(cls, job_id: str) -> SlurmError:
+        """Describe a collection attempt before scheduler completion."""
+        return cls(f"Slurm job {job_id} is not terminal")
+
+    @classmethod
+    def invalid_wait_timeout(cls) -> SlurmError:
+        """Describe a non-positive bounded observation interval."""
+        return cls("timeout_seconds must be greater than zero")
+
+    @classmethod
+    def handle_config_mismatch(cls) -> SlurmError:
+        """Describe a handle used against a different configured cluster."""
+        return cls("Slurm job handle does not belong to this cluster configuration")
+
+    @classmethod
+    def invalid_handle(cls) -> SlurmError:
+        """Describe a handle whose remote paths do not match its identity."""
+        return cls("Slurm job handle contains paths outside its operation workspace")
+
+
+class SlurmSubmissionRejectedError(SlurmError):
+    """Submission failed before the scheduler submission call was invoked.
+
+    The original SlurmError diagnostic is preserved. Once the sbatch call
+    begins, transport loss has unknown acceptance and never uses this type.
+    """
+
+
+@dataclass
+class _SubmissionBoundary:
+    started: bool = False
+
+
+class SlurmJobRunner:
+    """Run a command in Slurm without knowing cluster credentials or transport."""
+
+    def __init__(  # noqa: PLR0913  # LW-951301; each keyword is an independent injected effect or local resource.
+        # > A settings object would group unrelated effects (process, clock,
+        # > identity, scratch) into a shallow carrier; carrying scratch on each
+        # > request cannot reach collect(), which receives only a durable handle.
+        self,
+        config: SlurmConfig,
+        *,
+        process: SlurmProcess | None = None,
+        clock: Clock,
+        invocation_id: Callable[[], str] = lambda: uuid.uuid4().hex,
+        scratch_root: Path | None = None,
+        host_environment: Callable[[], Mapping[str, str]] | None = None,
+    ) -> None:
+        """Create a runner with injectable process, clock, and identity effects.
+
+        ``clock`` times staging, submission and the job deadline. ``host_environment``
+        returns this process's environment, from which the local transport takes its
+        login-like one (``login_environment``); this process's own when omitted.
+
+        ``scratch_root`` holds the runner's own transfer files (the job script,
+        collected status, log, and batch results); the system temporary
+        directory when omitted. A caller whose transport only moves files under
+        declared roots, such as the host-owned Slurm broker, passes one of them.
+        """
+        self._config = config
+        self._scratch_root = scratch_root
+        self._process = process or _run_process
+        self._transport = _make_transport(
+            config,
+            process=self._process,
+            host_environment=host_environment or (lambda: os.environ),
+        )
+        self._operations = RemoteOperations(self._transport, config, scratch_root)
+        self._clock = clock
+        self._invocation_id = invocation_id
+
+    def run(self, request: SlurmJobRequest, *, pause: Callable[[float], None]) -> SlurmJobResult:
+        """Stage, submit, wait, and collect as a blocking compatibility API.
+
+        ``pause`` waits between polls, as in :meth:`wait`.
+        """
+        if request.cancel_event is not None and request.cancel_event.is_set():
+            raise SlurmError.cancelled_before_submission()
+        handle = self.submit(request)
+        try:
+            outcome = self._await_terminal(handle, request.cancel_event, pause)
+        except BaseException as failure:
+            # This call submitted the job, so no other owner can cancel it:
+            # whatever ends the wait (a cancel, a timeout, a failed poll, an
+            # interrupt) cancels the job, and a failed cancel travels with it.
+            self._cancel_abandoned(handle, failure)
+            raise
+        if outcome.status == SlurmJobStatus.CANCELLED:
+            raise SlurmError.cancelled(handle.job_id)
+        return self.collect(handle)
+
+    def submit(
+        self, request: SlurmJobRequest, *, operation_id: str | None = None
+    ) -> SlurmJobHandle:
+        """Stage a workspace and submit once, returning a recoverable handle."""
+        return self._stage_and_submit(request, operation_id=operation_id)
+
+    def _stage_and_submit(
+        self,
+        request: SlurmJobRequest,
+        *,
+        phase_timing_root: PurePosixPath | None = None,
+        operation_id: str | None = None,
+    ) -> SlurmJobHandle:
+        boundary = _SubmissionBoundary()
+        try:
+            return self._stage_and_submit_at_boundary(
+                request,
+                phase_timing_root=phase_timing_root,
+                boundary=boundary,
+                operation_id=operation_id,
+            )
+        except (SlurmError, OSError, UnicodeError, subprocess.SubprocessError) as error:
+            if boundary.started:
+                raise
+            raise SlurmSubmissionRejectedError(str(error)) from error
+
+    def _stage_and_submit_at_boundary(
+        self,
+        request: SlurmJobRequest,
+        *,
+        phase_timing_root: PurePosixPath | None,
+        boundary: _SubmissionBoundary,
+        operation_id: str | None,
+    ) -> SlurmJobHandle:
+        source, support, files, trees = _validate_request(request)
+        if request.cancel_event is not None and request.cancel_event.is_set():
+            raise SlurmError.cancelled_before_submission()
+        invocation = _safe_component(
+            self._invocation_id() if operation_id is None else operation_id
+        )
+        base = PurePosixPath(self._config.remote_workspace_root) / self._config.name / invocation
+        remote_workspace = base / "workspace"
+        remote_script = base / "run.sbatch"
+        remote_status = base / "exit-code.txt"
+        remote_log = base / "job.log"
+        cache_root = (
+            PurePosixPath(self._config.remote_workspace_root)
+            / self._config.name
+            / _CONTENT_CACHE_ROOT
+        )
+
+        staging_started = self._clock.now()
+        self._transport.exec(
+            f"mkdir -p {shlex.quote(base.as_posix())} {shlex.quote(cache_root.as_posix())}"
+        )
+        cache_hits = 0
+        try:
+            workspace_stage = _stage_tree(
+                self._transport,
+                _TreeStageRequest(
+                    source=source,
+                    cache_root=cache_root,
+                    destination=remote_workspace,
+                    trusted_parent=base,
+                    staging_id=f"{invocation}.workspace",
+                    excludes=(".git/",),
+                ),
+            )
+            cache_hits += int(workspace_stage.cache_hit)
+            for index, (relative, local_path) in enumerate(support):
+                support_stage = _stage_tree(
+                    self._transport,
+                    _TreeStageRequest(
+                        source=local_path,
+                        cache_root=cache_root,
+                        destination=remote_workspace / relative,
+                        trusted_parent=remote_workspace,
+                        staging_id=f"{invocation}.support{index}",
+                    ),
+                )
+                cache_hits += int(support_stage.cache_hit)
+        except _ContentStageError as exc:
+            if exc.recoverable:
+                raise SlurmError.content_cache_busy(str(exc)) from exc
+            raise SlurmError.content_stage_failed() from exc
+        staging_seconds = max(0.0, self._clock.now() - staging_started)
+
+        with tempfile.TemporaryDirectory(prefix="vs-slurm-", dir=self._scratch_root) as temporary:
+            temporary_path = Path(temporary)
+            local_script = temporary_path / "run.sbatch"
+            local_script.write_text(
+                _job_script(
+                    _JobScriptRequest(
+                        workspace=remote_workspace,
+                        status_path=remote_status,
+                        command=request.command,
+                        setup_script=request.setup_script,
+                        service=request.service,
+                        phase_timing_root=phase_timing_root,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            self._transport.put(local_script, remote_script)
+            boundary.started = True
+            job_id = self._submit(base, remote_script, remote_log)
+        artifacts = (
+            *(
+                SlurmArtifactTarget(
+                    remote_path=path.as_posix(),
+                    local_path=target,
+                    kind="file",
+                    collect_on_failure=item.collect_on_failure,
+                )
+                for (path, target), item in zip(files, request.file_artifacts, strict=True)
+            ),
+            *(
+                SlurmArtifactTarget(remote_path=path.as_posix(), local_path=target, kind="tree")
+                for path, target in trees
+            ),
+        )
+        return SlurmJobHandle(
+            job_id=job_id,
+            invocation_id=invocation,
+            config_identity=self._config_identity(),
+            remote_workspace=remote_workspace.as_posix(),
+            remote_status_path=remote_status.as_posix(),
+            remote_log_path=remote_log.as_posix(),
+            artifacts=artifacts,
+            staging_seconds=staging_seconds,
+            content_cache_hits=cache_hits,
+        )
+
+    def submit_batch(
+        self, request: SlurmBatchRequest, *, operation_id: str | None = None
+    ) -> SlurmBatchHandle:
+        """Submit ordered stages as one Slurm job and one service lifecycle."""
+        try:
+            stages = _validate_batch_request(request)
+            job_request = SlurmJobRequest(
+                workspace=request.workspace,
+                command=(
+                    "bash",
+                    "-c",
+                    _batch_script(stages, stop_on_failure=request.stop_on_failure),
+                ),
+                setup_script=request.setup_script,
+                service=request.service,
+                support_trees=request.support_trees,
+                cancel_event=request.cancel_event,
+            )
+        except (SlurmError, OSError, UnicodeError, subprocess.SubprocessError) as error:
+            raise SlurmSubmissionRejectedError(str(error)) from error
+        started = self._clock.now()
+        phase_root = PurePosixPath(_BATCH_RESULT_ROOT) / "phases"
+        job = self._stage_and_submit(
+            job_request,
+            phase_timing_root=phase_root,
+            operation_id=operation_id,
+        )
+        return SlurmBatchHandle(
+            job=job,
+            stages=tuple(
+                SlurmBatchStageHandle(
+                    name=stage.name,
+                    file_artifacts=tuple(
+                        SlurmArtifactTarget(
+                            remote_path=item.remote_path,
+                            local_path=item.local_path,
+                            kind="file",
+                        )
+                        for item in stage.file_artifacts
+                    ),
+                    tree_artifacts=tuple(
+                        SlurmArtifactTarget(
+                            remote_path=item.remote_path,
+                            local_path=item.local_path,
+                            kind="tree",
+                        )
+                        for item in stage.tree_artifacts
+                    ),
+                )
+                for stage in stages
+            ),
+            submission_seconds=max(0.0, self._clock.now() - started),
+            stop_on_failure=request.stop_on_failure,
+        )
+
+    def completed_stages(self, handle: SlurmBatchHandle) -> int:
+        """How many stages of a batch have written their result, in one remote command.
+
+        Stages run in order, so with ``n`` results written, stage ``n`` is the one
+        running. A stage that is running has not written its exit code yet.
+        """
+        root = PurePosixPath(handle.job.remote_workspace) / _BATCH_RESULT_ROOT
+        listing = f"ls -1 {shlex.quote(root.as_posix())}/*/exit-code.txt 2>/dev/null | wc -l"
+        output = self._whole_reading(listing)  # wc always counts; empty means lost, not zero
+        try:
+            return max(0, int(output))
+        except ValueError as error:
+            raise SlurmError.malformed_result() from error
+
+    def poll_batch(self, handle: SlurmBatchHandle) -> SlurmJobStatus:
+        """Read the scheduler state of a batch handle."""
+        return self.poll(handle.job)
+
+    def wait_batch(
+        self,
+        handle: SlurmBatchHandle,
+        *,
+        pause: Callable[[float], None],
+        timeout_seconds: float | None = None,
+        cancel_event: Event | None = None,
+    ) -> SlurmBatchWaitResult:
+        """Wait on a batch without changing its one-job lifecycle semantics."""
+        started = self._clock.now()
+        result = self.wait(
+            handle.job, pause=pause, timeout_seconds=timeout_seconds, cancel_event=cancel_event
+        )
+        elapsed = max(0.0, self._clock.now() - started)
+        updated = handle.model_copy(update={"waited_seconds": handle.waited_seconds + elapsed})
+        return SlurmBatchWaitResult(
+            handle=updated,
+            status=result.status,
+            timed_out=result.timed_out,
+        )
+
+    def cancel_batch(self, handle: SlurmBatchHandle) -> None:
+        """Cancel the single Slurm job that owns all batch stages."""
+        self.cancel(handle.job)
+
+    def collect_batch(
+        self, handle: SlurmBatchHandle, *, observed: SlurmJobStatus | None = None
+    ) -> SlurmBatchResult:
+        """Collect ordered stage outcomes and only artifacts from passed stages.
+
+        ``observed`` is the terminal status the caller just read; it saves a second
+        scheduler query (two remote commands).
+        """
+        self._validate_batch_handle(handle)
+        collection_started = self._clock.now()
+        job_result = self.collect_evidence(handle.job, observed=observed)
+        stage_results: list[SlurmBatchStageResult] = []
+        timings: dict[str, float] = {
+            "staging": handle.job.staging_seconds,
+            "submission": max(0.0, handle.submission_seconds - handle.job.staging_seconds),
+            "scheduler_wait_observation": handle.waited_seconds,
+        }
+        collection_failure = job_result.collection_failure
+        service_log_tail = ""
+        with tempfile.TemporaryDirectory(
+            prefix="vs-slurm-batch-", dir=self._scratch_root
+        ) as temporary:
+            temporary_path = Path(temporary)
+            results_root = temporary_path / "results"
+            results_root.mkdir()
+            try:
+                self._transport.get(
+                    PurePosixPath(handle.job.remote_workspace) / _BATCH_RESULT_ROOT,
+                    results_root,
+                    kind="tree",
+                )
+            except (SlurmError, OSError) as exc:
+                collection_failure = str(exc)
+            for index, stage in enumerate(handle.stages):
+                local_root = results_root / f"{index:04d}"
+                if not local_root.exists() and job_result.exit_code != 0:
+                    continue
+                result = self._collect_stage(handle.job, stage, local_root)
+                stage_results.append(result)
+                if result.elapsed_seconds is not None:
+                    timings[f"stage:{stage.name}"] = result.elapsed_seconds
+            phase_root = results_root / "phases"
+            for phase_name, result_name in (
+                ("setup", "setup-seconds.txt"),
+                ("service_startup", "service-startup-seconds.txt"),
+            ):
+                try:
+                    timings[phase_name] = _read_nonnegative_seconds(phase_root / result_name)
+                except SlurmError as exc:
+                    if job_result.exit_code == 0:
+                        collection_failure = collection_failure or str(exc)
+            service_log_tail = _distinct_tail(phase_root / _SERVICE_LOG_TAIL)
+        timings["collection"] = max(0.0, self._clock.now() - collection_started)
+        return SlurmBatchResult(
+            job_id=job_result.job_id,
+            job_exit_code=job_result.exit_code,
+            job_output=job_result.output,
+            stages=tuple(stage_results),
+            phase_timings_seconds=timings,
+            content_cache_hits=handle.job.content_cache_hits,
+            service_log_tail=service_log_tail,
+            collection_failure=collection_failure,
+        )
+
+    def _collect_stage(
+        self, job: SlurmJobHandle, stage: SlurmBatchStageHandle, root: Path
+    ) -> SlurmBatchStageResult:
+        """Keep each available stream even when other stage evidence is invalid."""
+        failures: list[str] = []
+        streams: dict[str, str] = {}
+        for name in ("stdout", "stderr"):
+            try:
+                streams[name] = _read_text(root / f"{name}.txt")
+            except SlurmError as exc:
+                streams[name] = ""
+                failures.append(f"{name}.txt: {exc}")
+        exit_code = None
+        skipped = False
+        elapsed = None
+        try:
+            skipped = _read_text(root / "exit-code.txt").strip() == "SKIPPED"
+            if not skipped:
+                exit_code = _read_exit_code(root / "exit-code.txt")
+        except SlurmError as exc:
+            failures.append(f"exit-code.txt: {exc}")
+        try:
+            elapsed = _read_nonnegative_seconds(root / "elapsed-seconds.txt")
+        except SlurmError as exc:
+            failures.append(f"elapsed-seconds.txt: {exc}")
+        artifacts: list[SlurmArtifactTarget] = []
+        if exit_code == 0:
+            for artifact in (*stage.file_artifacts, *stage.tree_artifacts):
+                try:
+                    self._collect_stage_artifact(job, artifact)
+                    artifacts.append(artifact)
+                except (SlurmError, OSError) as exc:
+                    failures.append(f"{artifact.remote_path}: {exc}")
+        return SlurmBatchStageResult(
+            name=stage.name,
+            exit_code=exit_code,
+            stdout=streams["stdout"],
+            stderr=streams["stderr"],
+            elapsed_seconds=None if skipped else elapsed,
+            skipped=skipped,
+            artifacts=tuple(artifacts),
+            collection_failure="; ".join(failures) or None,
+        )
+
+    def _collect_stage_artifact(self, job: SlurmJobHandle, artifact: SlurmArtifactTarget) -> None:
+        local_path = artifact.local_path
+        if artifact.kind == "file":
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            local_path.mkdir(parents=True, exist_ok=True)
+        self._transport.get(
+            PurePosixPath(job.remote_workspace) / artifact.remote_path,
+            local_path,
+            kind=artifact.kind,
+        )
+
+    def poll(self, handle: SlurmJobHandle) -> SlurmJobStatus:
+        """Read the scheduler state for a submitted or recovered handle."""
+        self._validate_handle(handle)
+        return self.inspect_job(handle.job_id).status
+
+    def wait(
+        self,
+        handle: SlurmJobHandle,
+        *,
+        pause: Callable[[float], None],
+        timeout_seconds: float | None = None,
+        cancel_event: Event | None = None,
+    ) -> SlurmJobWaitResult:
+        """Observe until terminal or bounded timeout.
+
+        The timeout never cancels the job. An explicitly set ``cancel_event``
+        requests cancellation and raises the cancellation error; this retains
+        the legacy ``run()`` behavior.
+
+        Between polls the wait pauses on ``cancel_event`` when there is one, so a
+        cancel ends the pause at once, and with ``pause`` otherwise. Either runs on
+        the runner clock's timeline: production passes a real sleep
+        (``vs_sim.api.OsThreads().sleep``), a test one that advances its clock.
+        """
+        timeout = self._config.job_timeout_seconds if timeout_seconds is None else timeout_seconds
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise SlurmError.invalid_wait_timeout()
+        try:
+            return self._observe(handle, timeout, cancel_event, pause)
+        except SlurmError as failure:
+            if cancel_event is None or not cancel_event.is_set():
+                raise
+            self._cancel_abandoned(handle, failure)
+            raise
+
+    def _observe(
+        self,
+        handle: SlurmJobHandle,
+        timeout: float,
+        cancel_event: Event | None,
+        pause: Callable[[float], None],
+    ) -> SlurmJobWaitResult:
+        """Poll until terminal or *timeout*; a set *cancel_event* raises, uncancelled."""
+        deadline = self._clock.now() + timeout
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise SlurmError.cancelled(handle.job_id)
+            status = self.poll(handle)
+            if status.terminal:
+                return SlurmJobWaitResult(handle=handle, status=status, timed_out=False)
+            remaining = deadline - self._clock.now()
+            if remaining <= 0:
+                return SlurmJobWaitResult(handle=handle, status=status, timed_out=True)
+            seconds = min(self._config.poll_interval_seconds, remaining)
+            # Bounded by *seconds*; the event's setter is the cancel path of the
+            # caller that owns the wait, so no pause here is unbounded.
+            if cancel_event is not None:
+                cancel_event.wait(seconds)
+            else:
+                pause(seconds)
+
+    def _await_terminal(
+        self, handle: SlurmJobHandle, cancel_event: Event | None, pause: Callable[[float], None]
+    ) -> SlurmJobWaitResult:
+        """Observe within the configured job timeout; running past it raises."""
+        outcome = self._observe(handle, self._config.job_timeout_seconds, cancel_event, pause)
+        if outcome.timed_out:
+            raise SlurmError.job_timed_out(handle.job_id)
+        return outcome
+
+    def _cancel_abandoned(self, handle: SlurmJobHandle, failure: BaseException) -> None:
+        """Cancel a job its waiter gave up on; note a failed cancel on *failure*."""
+        try:
+            self.cancel(handle)
+        except Exception as error:  # noqa: BLE001  # lint-waiver: LW-731105 [BLE001]; the original failure must still propagate.
+            # > Any cancel failure (transport, timeout, OS) is reported on the
+            # > failure being raised; a narrower catch would replace that failure
+            # > with the cancel's and hide why the wait ended.
+            failure.add_note(
+                f"Slurm job {handle.job_id} may still be queued or running: "
+                f"scancel failed: {type(error).__name__}: {error}"
+            )
+
+    def cancel(self, handle: SlurmJobHandle) -> None:
+        """Request scheduler cancellation for an existing operation."""
+        self._validate_handle(handle)
+        self._transport.exec(f"scancel {handle.job_id}")
+
+    def cancel_job(self, job_id: str) -> None:
+        """Request cancellation by scheduler identity without a collection locator."""
+        if re.fullmatch(r"[0-9]+", job_id) is None:
+            raise SlurmError.invalid_job_id()
+        self._transport.exec(f"scancel {job_id}")
+
+    def collect(self, handle: SlurmJobHandle) -> SlurmJobResult:
+        """Collect terminal output and declared artifacts for a handle."""
+        self._validate_handle(handle)
+        status = self.poll(handle)
+        if status == SlurmJobStatus.CANCELLED:
+            raise SlurmError.cancelled(handle.job_id)
+        if status not in {SlurmJobStatus.COMPLETED, SlurmJobStatus.FAILED}:
+            raise SlurmError.job_not_terminal(handle.job_id)
+        with tempfile.TemporaryDirectory(
+            prefix="vs-slurm-collect-", dir=self._scratch_root
+        ) as temporary:
+            temporary_path = Path(temporary)
+            local_status = temporary_path / "exit-code.txt"
+            local_log = temporary_path / "job.log"
+            self._transport.get(PurePosixPath(handle.remote_status_path), local_status, kind="file")
+            self._transport.get(PurePosixPath(handle.remote_log_path), local_log, kind="file")
+            exit_code = _read_exit_code(local_status)
+            succeeded = exit_code == 0 and status == SlurmJobStatus.COMPLETED
+            for artifact in handle.artifacts:
+                if not succeeded and not artifact.collect_on_failure:
+                    continue
+                local_path = artifact.local_path
+                remote_path = PurePosixPath(handle.remote_workspace) / artifact.remote_path
+                if artifact.kind == "file":
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    local_path.mkdir(parents=True, exist_ok=True)
+                if succeeded:
+                    self._transport.get(remote_path, local_path, kind=artifact.kind)
+                    continue
+                # A failed job need not have written it; absent stays absent.
+                with suppress(SlurmError):
+                    self._transport.get(remote_path, local_path, kind=artifact.kind)
+            return SlurmJobResult(
+                job_id=handle.job_id,
+                exit_code=exit_code,
+                output=_read_text(local_log),
+            )
+
+    def claim_operation(self, operation_id: str, intent: str) -> RemoteOperationClaim:
+        """Reserve stable identity across every local ledger on this cluster."""
+        return self._operations.claim(_safe_component(operation_id), intent)
+
+    def inspect_operation(self, operation_id: str) -> RemoteOperationEvidence:
+        """Observe durable scheduler-wide identity and cancellation evidence."""
+        return self._operations.inspect(_safe_component(operation_id))
+
+    def record_operation_acceptance(self, operation_id: str, record: str) -> None:
+        """Retain the acknowledged locator independently of local state roots."""
+        self._operations.accepted(_safe_component(operation_id), record)
+
+    def record_operation_rejection(self, operation_id: str, reason: str) -> None:
+        """Retain a rejection known to precede scheduler acceptance."""
+        self._operations.rejected(_safe_component(operation_id), reason)
+
+    def cancel_operation(self, operation_id: str) -> None:
+        """Persist scheduler-wide cancellation intent before requesting scancel."""
+        self._operations.cancel(_safe_component(operation_id))
+
+    def recover_handle(
+        self, request: SlurmJobRequest | SlurmBatchRequest, *, operation_id: str, job_id: str
+    ) -> SlurmJobHandle | SlurmBatchHandle:
+        """Rebuild a locator from persisted intent without submitting work."""
+        invocation = _safe_component(operation_id)
+        base = PurePosixPath(self._config.remote_workspace_root) / self._config.name / invocation
+        if isinstance(request, SlurmBatchRequest):
+            stages = _validate_batch_request(request)
+            job = self.recover_handle(
+                SlurmJobRequest(
+                    workspace=request.workspace,
+                    command=("true",),
+                    setup_script=request.setup_script,
+                    service=request.service,
+                    support_trees=request.support_trees,
+                ),
+                operation_id=operation_id,
+                job_id=job_id,
+            )
+            if not isinstance(job, SlurmJobHandle):
+                raise SlurmError.invalid_handle()
+            return SlurmBatchHandle(
+                job=job,
+                submission_seconds=0.0,
+                stop_on_failure=request.stop_on_failure,
+                stages=tuple(
+                    SlurmBatchStageHandle(
+                        name=stage.name,
+                        file_artifacts=tuple(
+                            SlurmArtifactTarget(
+                                remote_path=a.remote_path,
+                                local_path=a.local_path,
+                                kind="file",
+                                collect_on_failure=a.collect_on_failure,
+                            )
+                            for a in stage.file_artifacts
+                        ),
+                        tree_artifacts=tuple(
+                            SlurmArtifactTarget(
+                                remote_path=a.remote_path, local_path=a.local_path, kind="tree"
+                            )
+                            for a in stage.tree_artifacts
+                        ),
+                    )
+                    for stage in stages
+                ),
+            )
+        _validate_request(request)
+        return SlurmJobHandle(
+            job_id=job_id,
+            invocation_id=invocation,
+            config_identity=self._config_identity(),
+            remote_workspace=(base / "workspace").as_posix(),
+            remote_status_path=(base / "exit-code.txt").as_posix(),
+            remote_log_path=(base / "job.log").as_posix(),
+            artifacts=tuple(
+                SlurmArtifactTarget(
+                    remote_path=a.remote_path,
+                    local_path=a.local_path,
+                    kind="file",
+                    collect_on_failure=a.collect_on_failure,
+                )
+                for a in request.file_artifacts
+            )
+            + tuple(
+                SlurmArtifactTarget(remote_path=a.remote_path, local_path=a.local_path, kind="tree")
+                for a in request.tree_artifacts
+            ),
+        )
+
+    def find_operation(self, operation_id: str) -> str | None:
+        """Inspect active jobs then accounting by stable scheduler name."""
+        name = shlex.quote(operation_job_name(self._config, _safe_component(operation_id)))
+        active = self._read_scheduler(f"squeue -h -n {name} -o %i")
+        historical = self._read_scheduler(
+            f"sacct -n -X --name {name} --starttime=1970-01-01 --format=JobIDRaw"
+        )
+        ids = {
+            line.strip()
+            for line in (active + "\n" + historical).splitlines()
+            if re.fullmatch(r"[0-9]+", line.strip())
+        }
+        if len(ids) > 1:
+            raise SlurmError.operation_identity_ambiguous()
+        return next(iter(ids), None)
+
+    def inspect_job(self, job_id: str) -> SchedulerReading:
+        """Read scheduler state with queue reason and estimated start evidence."""
+        if re.fullmatch(r"[0-9]+", job_id) is None:
+            raise SlurmError.invalid_job_id()
+        # Accounting, not the queue, is authoritative for an ended job: slurmctld
+        # purges it after MinJobAge (300 s by default) and ``squeue -j`` then fails
+        # with "Invalid job id specified". A failed queue read is therefore not a
+        # verdict; sacct decides, and only both failing (or sacct knowing nothing
+        # of a job the queue could not be read for) leaves the state unknown. The
+        # translator decides what each reading means and whether sacct must be asked.
+        queue_failure: SlurmError | None = None
+        try:
+            queue = parse_queue_row(self._queue_state(job_id))
+        except SlurmError as exc:
+            queue_failure, queue = exc, NotInQueue()
+        life = observe(INITIAL_LIFE, queue)
+        if not needs_accounting(life):
+            return _queue_reading(life, queue)
+        try:
+            accounting = self._read_scheduler(f"sacct -n -P -X -j {job_id} --format=State,ExitCode")
+        except SlurmError:
+            # Accounting only refines what the queue said (a COMPLETING job may have
+            # ended). Without it the queue reading stands; with no queue reading
+            # either, the job's state is unknown and the failure is the answer.
+            if isinstance(life, Unknown) and life.raw is None:
+                raise
+            return _queue_reading(life, queue)
+        row = parse_accounting_row(accounting)
+        refined = observe(life, row)
+        # Slurm keeps a finished or cancelled job in COMPLETING for 20 to 40 s
+        # while the node tears down, but accounting already records its final
+        # state, and the job script has exited. Joining the accounting row ends the
+        # life; waiting for the queue to forget it would only delay the result.
+        if refined != INITIAL_LIFE or queue_failure is None:
+            return _queue_reading(refined, queue)
+        raise queue_failure
+
+    def _queue_state(self, job_id: str) -> str:
+        """The queue's line for the job."""
+        return self._read_scheduler(f"squeue -h -j {job_id} -o '%T|%r|%S'")
+
+    def _read_scheduler(self, command: str) -> str:
+        """Stdout of a read-only scheduler query; one lost read is retried, a second raises.
+
+        ``squeue`` and ``sacct`` change nothing, so repeating one is safe. Every such
+        read goes through here, so no scheduler source is the single point where one
+        dropped connection turns a known job into an unknown one.
+        """
+        try:
+            return self._whole_reading(command)
+        except SlurmError:
+            return self._whole_reading(command)
+
+    def _whole_reading(self, command: str) -> str:
+        """Stdout of ``command``, refused unless its end line arrived (`scheduler_read`).
+
+        An empty answer means "no such job" only when it provably arrived
+        whole; a lost or cut answer is unknown, never an absent job.
+        """
+        body = unframed(self._transport.exec(framed(command)).stdout)
+        if body is None:
+            raise SlurmError.truncated_output()
+        return body.strip()
+
+    def collect_evidence(
+        self, handle: SlurmJobHandle, *, observed: SlurmJobStatus | None = None
+    ) -> SlurmJobResult:
+        """Preserve available evidence even when terminal status artifacts are absent.
+
+        ``observed`` is a terminal status the caller just read; without it the scheduler
+        is queried.
+        """
+        self._validate_handle(handle)
+        status = observed if observed is not None else self.poll(handle)
+        if not status.terminal:
+            raise SlurmError.job_not_terminal(handle.job_id)
+        failures: list[str] = []
+        exit_code = None
+        output = ""
+        with tempfile.TemporaryDirectory(
+            prefix="vs-slurm-evidence-", dir=self._scratch_root
+        ) as temporary:
+            root = Path(temporary)
+            try:
+                self._transport.get(
+                    PurePosixPath(handle.remote_status_path), root / "status", kind="file"
+                )
+                exit_code = _read_exit_code(root / "status")
+            except (SlurmError, OSError) as exc:
+                failures.append(str(exc))
+            try:
+                self._transport.get(
+                    PurePosixPath(handle.remote_log_path), root / "log", kind="file"
+                )
+                output = _read_text(root / "log")
+            except (SlurmError, OSError) as exc:
+                failures.append(str(exc))
+            for artifact in handle.artifacts:
+                if (
+                    exit_code == 0 and status == SlurmJobStatus.COMPLETED
+                ) or artifact.collect_on_failure:
+                    try:
+                        self._collect_stage_artifact(handle, artifact)
+                    except (SlurmError, OSError) as exc:
+                        failures.append(str(exc))
+        return SlurmJobResult(
+            job_id=handle.job_id,
+            exit_code=exit_code,
+            output=output,
+            collection_failure="; ".join(failures) or None,
+        )
+
+    def validate_handle(self, handle: SlurmJobHandle | SlurmBatchHandle) -> None:
+        """Validate cluster configuration and operation paths without remote I/O."""
+        if isinstance(handle, SlurmBatchHandle):
+            self._validate_batch_handle(handle)
+        else:
+            self._validate_handle(handle)
+
+    def _validate_handle(self, handle: SlurmJobHandle) -> None:
+        if handle.config_identity != self._config_identity():
+            raise SlurmError.handle_config_mismatch()
+        base = PurePosixPath(self._config.remote_workspace_root) / self._config.name
+        operation_root = base / handle.invocation_id
+        if (
+            handle.remote_workspace != (operation_root / "workspace").as_posix()
+            or handle.remote_status_path != (operation_root / "exit-code.txt").as_posix()
+            or handle.remote_log_path != (operation_root / "job.log").as_posix()
+        ):
+            raise SlurmError.invalid_handle()
+
+    def _validate_batch_handle(self, handle: SlurmBatchHandle) -> None:
+        self._validate_handle(handle.job)
+        names: set[str] = set()
+        if not handle.stages:
+            raise SlurmError.invalid_batch_request()
+        for stage in handle.stages:
+            if _STAGE_NAME.fullmatch(stage.name) is None or stage.name in names:
+                raise SlurmError.invalid_batch_request()
+            names.add(stage.name)
+            for artifact in (*stage.file_artifacts, *stage.tree_artifacts):
+                path = _safe_relative_path(artifact.remote_path, SlurmError.invalid_artifact_path)
+                if path.parts[0] == _BATCH_RESULT_ROOT:
+                    raise SlurmError.invalid_artifact_path()
+
+    def _config_identity(self) -> str:
+        transport = self._config.transport.model_dump(mode="json")
+        identity = {
+            "name": self._config.name,
+            "remote_workspace_root": self._config.remote_workspace_root,
+            "transport": transport,
+        }
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _submit(self, base: PurePosixPath, script: PurePosixPath, output: PurePosixPath) -> str:
+        argv = (
+            *self._config.sbatch_command,
+            *self._config.sbatch_arguments,
+            f"--job-name={operation_job_name(self._config, base.name)}",
+            f"--output={output.as_posix()}",
+            f"--error={output.as_posix()}",
+            script.as_posix(),
+        )
+        result = self._transport.exec(f"cd {shlex.quote(base.as_posix())} && {shlex.join(argv)}")
+        match = _JOB_ID.search(result.stdout)
+        if match is None:
+            raise SlurmError.missing_job_id()
+        return match.group(1)
+
+
+class _ConnectorResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: int
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+class _Transport(Protocol):
+    def exec(self, command: str) -> _TransportResponse: ...
+
+    def sync_to(
+        self,
+        local: Path,
+        remote: PurePosixPath,
+        *,
+        delete: bool,
+        excludes: Sequence[str],
+    ) -> None: ...
+
+    def put(self, local: Path, remote: PurePosixPath) -> None: ...
+
+    def get(self, remote: PurePosixPath, local: Path, *, kind: Literal["file", "tree"]) -> None: ...
+
+
+class _ProcessTransport:
+    def __init__(self, process: SlurmProcess, timeout: float) -> None:
+        self._process = process
+        self._timeout = timeout
+
+    def _launch(self, argv: Sequence[str]) -> Sequence[str]:
+        """Return the argv to start for *argv*; a transport may wrap the program."""
+        return argv
+
+    def _run(
+        self,
+        argv: Sequence[str],
+        *,
+        operation: str,
+        stdin: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            result = self._process(self._launch(argv), stdin=stdin, timeout=self._timeout)
+        except FileNotFoundError as exc:
+            raise SlurmError.transport_unavailable(operation) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise SlurmError.transport_timed_out(operation) from exc
+        if result.returncode != 0:
+            raise SlurmError.transport_failed(operation, result.returncode)
+        return result
+
+
+class _RsyncTransport(_ProcessTransport):
+    """Transfers as rsync copies; *destination* prefixes the remote side's path."""
+
+    def __init__(
+        self,
+        rsync_command: tuple[str, ...],
+        *,
+        remote_shell: tuple[str, ...],
+        destination: str,
+        process: SlurmProcess,
+        timeout: float,
+    ) -> None:
+        super().__init__(process, timeout)
+        self._rsync_command = rsync_command
+        self._remote_shell = remote_shell
+        self._destination = destination
+
+    def sync_to(
+        self,
+        local: Path,
+        remote: PurePosixPath,
+        *,
+        delete: bool,
+        excludes: Sequence[str],
+    ) -> None:
+        options = ["-a"]
+        if delete:
+            options.append("--delete")
+        options.extend(f"--exclude={item}" for item in excludes)
+        self._rsync(
+            options, f"{local}/", self._remote(remote, trailing_slash=True), operation="sync_to"
+        )
+
+    def put(self, local: Path, remote: PurePosixPath) -> None:
+        self._rsync(["-a"], str(local), self._remote(remote), operation="put")
+
+    def get(self, remote: PurePosixPath, local: Path, *, kind: Literal["file", "tree"]) -> None:
+        tree = kind == "tree"
+        self._rsync(
+            ["-a"],
+            self._remote(remote, trailing_slash=tree),
+            f"{local}/" if tree else str(local),
+            operation="get",
+        )
+
+    def _rsync(self, options: list[str], source: str, target: str, *, operation: str) -> None:
+        self._run(
+            (*self._rsync_command, *options, *self._remote_shell, "--", source, target),
+            operation=operation,
+        )
+
+    def _remote(self, path: PurePosixPath, *, trailing_slash: bool = False) -> str:
+        suffix = "/" if trailing_slash else ""
+        return f"{self._destination}{path.as_posix()}{suffix}"
+
+
+class _SshTransport(_RsyncTransport):
+    def __init__(
+        self,
+        config: SlurmSshTransport,
+        *,
+        process: SlurmProcess,
+        timeout: float,
+    ) -> None:
+        super().__init__(
+            config.rsync_command,
+            remote_shell=("-e", shlex.join(config.ssh_command)),
+            destination=f"{config.host}:",
+            process=process,
+            timeout=timeout,
+        )
+        self._config = config
+
+    def exec(self, command: str) -> _TransportResponse:
+        result = self._run(
+            (*self._config.ssh_command, "--", self._config.host, command),
+            operation="exec",
+        )
+        return _TransportResponse(stdout=result.stdout, stderr=result.stderr)
+
+
+_LOGIN_ENVIRONMENT_NAMES = frozenset(
+    {"HOME", "USER", "LOGNAME", "SHELL", "PATH", "LANG", "TZ", "TMPDIR"}
+)
+_LOGIN_ENVIRONMENT_PREFIX = "LC_"
+
+
+def login_environment(host: Mapping[str, str]) -> dict[str, str]:
+    """Return the part of *host* that a login session would also have.
+
+    The local transport runs its programs in this environment and nothing else,
+    which is what the SSH transport gets from sshd: a fresh one. A host process
+    can hold credentials, and inside a Slurm allocation or batch job it holds
+    ``SLURM_*`` variables that would redirect the gate's own ``sbatch`` to the
+    wrong job. The names kept are the identity and locale ones a login sets
+    (``HOME USER LOGNAME SHELL PATH LANG LC_* TZ``) and ``TMPDIR``; every other
+    name, ``SLURM_*``, ``SBATCH_*``, ``SALLOC_*`` and ``SRUN_*`` included, is dropped.
+    """
+    return {
+        name: value
+        for name, value in host.items()
+        if name in _LOGIN_ENVIRONMENT_NAMES
+        or (
+            name.startswith(_LOGIN_ENVIRONMENT_PREFIX)
+            and len(name) > len(_LOGIN_ENVIRONMENT_PREFIX)
+        )
+    }
+
+
+class _LocalTransport(_RsyncTransport):
+    def __init__(
+        self,
+        config: SlurmLocalTransport,
+        *,
+        process: SlurmProcess,
+        timeout: float,
+        host_environment: Callable[[], Mapping[str, str]],
+    ) -> None:
+        super().__init__(
+            config.rsync_command,
+            remote_shell=(),
+            destination="",
+            process=process,
+            timeout=timeout,
+        )
+        self._config = config
+        self._host_environment = host_environment
+
+    def _launch(self, argv: Sequence[str]) -> Sequence[str]:
+        # ``env -i`` gives the program the login environment and nothing of this
+        # process's.
+        environment = login_environment(self._host_environment())
+        clean = ("env", "-i", *(f"{name}={value}" for name, value in sorted(environment.items())))
+        return (*clean, *argv)
+
+    def exec(self, command: str) -> _TransportResponse:
+        result = self._run((*self._config.shell_command, command), operation="exec")
+        return _TransportResponse(stdout=result.stdout, stderr=result.stderr)
+
+
+class _ConnectorTransport(_ProcessTransport):
+    def __init__(
+        self,
+        config: SlurmConnectorTransport,
+        *,
+        process: SlurmProcess,
+        timeout: float,
+    ) -> None:
+        super().__init__(process, timeout)
+        self._config = config
+
+    def exec(self, command: str) -> _TransportResponse:
+        return self._request({"version": 1, "operation": "exec", "command": command}, "exec")
+
+    def sync_to(
+        self,
+        local: Path,
+        remote: PurePosixPath,
+        *,
+        delete: bool,
+        excludes: Sequence[str],
+    ) -> None:
+        self._request(
+            {
+                "version": 1,
+                "operation": "sync_to",
+                "local_dir": str(local),
+                "remote_dir": remote.as_posix(),
+                "delete": delete,
+                "excludes": list(excludes),
+            },
+            "sync_to",
+        )
+
+    def put(self, local: Path, remote: PurePosixPath) -> None:
+        self._request(
+            {
+                "version": 1,
+                "operation": "put",
+                "local_path": str(local),
+                "remote_path": remote.as_posix(),
+            },
+            "put",
+        )
+
+    def get(self, remote: PurePosixPath, local: Path, *, kind: Literal["file", "tree"]) -> None:
+        self._request(
+            {
+                "version": 1,
+                "operation": "get",
+                "remote_path": remote.as_posix(),
+                "local_path": str(local),
+                "kind": kind,
+            },
+            "get",
+        )
+
+    def _request(self, request: dict[str, object], operation: str) -> _TransportResponse:
+        result = self._run(
+            self._config.command,
+            operation=operation,
+            stdin=json.dumps(request, separators=(",", ":")),
+        )
+        try:
+            response = _ConnectorResponse.model_validate_json(result.stdout, strict=True)
+        except ValidationError as exc:
+            raise SlurmError.invalid_connector_response(operation) from exc
+        if response.version != 1:
+            raise SlurmError.invalid_connector_response(operation)
+        if response.returncode != 0:
+            raise SlurmError.transport_failed(operation, response.returncode)
+        return _TransportResponse(stdout=response.stdout, stderr=response.stderr)
+
+
+def _make_transport(
+    config: SlurmConfig,
+    *,
+    process: SlurmProcess,
+    host_environment: Callable[[], Mapping[str, str]],
+) -> _Transport:
+    timeout = config.transport_timeout_seconds
+    match config.transport:
+        case SlurmSshTransport():
+            return _SshTransport(config.transport, process=process, timeout=timeout)
+        case SlurmLocalTransport():
+            return _LocalTransport(
+                config.transport,
+                process=process,
+                timeout=timeout,
+                host_environment=host_environment,
+            )
+        case SlurmConnectorTransport():
+            return _ConnectorTransport(config.transport, process=process, timeout=timeout)
+
+
+_OWNED_PROCESS = OwnedProcessRunner()
+
+
+def _run_process(
+    argv: Sequence[str], *, stdin: str | None, timeout: float
+) -> subprocess.CompletedProcess[str]:
+    result = _OWNED_PROCESS.run(argv, stdin=stdin, timeout=timeout)
+    return subprocess.CompletedProcess(result.argv, result.returncode, result.stdout, result.stderr)
+
+
+def _validate_request(
+    request: SlurmJobRequest,
+) -> tuple[
+    Path,
+    list[tuple[PurePosixPath, Path]],
+    list[tuple[PurePosixPath, Path]],
+    list[tuple[PurePosixPath, Path]],
+]:
+    if (
+        isinstance(request.command, str)
+        or not request.command
+        or any(not isinstance(part, str) or not part for part in request.command)
+    ):
+        raise SlurmError.invalid_command()
+    try:
+        source = request.workspace.resolve(strict=True)
+    except OSError as exc:
+        raise SlurmError.workspace_is_not_directory() from exc
+    if not source.is_dir():
+        raise SlurmError.workspace_is_not_directory()
+    if request.setup_script is not None:
+        setup = PurePosixPath(request.setup_script)
+        if not setup.is_absolute() or setup.as_posix() != request.setup_script:
+            raise SlurmError.invalid_setup_script()
+
+    support = _validate_support(request.support_trees)
+
+    if any(
+        not isinstance(item.local_path, Path)
+        for item in (*request.file_artifacts, *request.tree_artifacts)
+    ):
+        raise SlurmError.invalid_artifact_path()
+    files = [
+        (_safe_relative_path(item.remote_path, SlurmError.invalid_artifact_path), item.local_path)
+        for item in request.file_artifacts
+    ]
+    trees = [
+        (_safe_relative_path(item.remote_path, SlurmError.invalid_artifact_path), item.local_path)
+        for item in request.tree_artifacts
+    ]
+    return source, support, files, trees
+
+
+def _validate_support(support_trees: Mapping[str, Path] | None) -> list[tuple[PurePosixPath, Path]]:
+    if support_trees is not None and not isinstance(support_trees, Mapping):
+        raise SlurmError.invalid_support_path()
+    support: list[tuple[PurePosixPath, Path]] = []
+    support_items = (support_trees or {}).items()
+    if any(
+        not isinstance(relative, str) or not isinstance(local, Path)
+        for relative, local in support_items
+    ):
+        raise SlurmError.invalid_support_path()
+    for relative, local_path in sorted(support_items):
+        remote = _safe_relative_path(relative, SlurmError.invalid_support_path)
+        try:
+            local = local_path.resolve(strict=True)
+        except OSError as exc:
+            raise SlurmError.invalid_support_path() from exc
+        if not local.is_dir():
+            raise SlurmError.invalid_support_path()
+        support.append((remote, local))
+
+    return support
+
+
+def _validate_batch_request(request: SlurmBatchRequest) -> tuple[SlurmBatchStage, ...]:
+    if not request.stages:
+        raise SlurmError.invalid_batch_request()
+    names: set[str] = set()
+    for stage in request.stages:
+        if _STAGE_NAME.fullmatch(stage.name) is None or stage.name in names:
+            raise SlurmError.invalid_batch_request()
+        names.add(stage.name)
+        if (
+            isinstance(stage.command, str)
+            or not stage.command
+            or any(not isinstance(part, str) or not part for part in stage.command)
+        ):
+            raise SlurmError.invalid_command()
+        if stage.timeout_seconds is not None and (
+            not isinstance(stage.timeout_seconds, int)
+            or isinstance(stage.timeout_seconds, bool)
+            or stage.timeout_seconds <= 0
+        ):
+            raise SlurmError.invalid_stage_timeout()
+        for artifact in (*stage.file_artifacts, *stage.tree_artifacts):
+            if not isinstance(artifact.local_path, Path):
+                raise SlurmError.invalid_artifact_path()
+            path = _safe_relative_path(artifact.remote_path, SlurmError.invalid_artifact_path)
+            if path.parts[0] == _BATCH_RESULT_ROOT:
+                raise SlurmError.invalid_artifact_path()
+    _validate_request(
+        SlurmJobRequest(
+            workspace=request.workspace,
+            command=("bash", "-c", "true"),
+            setup_script=request.setup_script,
+            service=request.service,
+            support_trees=request.support_trees,
+            cancel_event=request.cancel_event,
+        )
+    )
+    return request.stages
+
+
+# ``timeout`` is GNU coreutils; stock macOS lacks it (Homebrew installs it as
+# ``gtimeout``) and the Fake cluster runs this script with the local shell.
+# Fail loudly rather than run a stage without its time limit.
+_TIMEOUT_FUNCTION = (
+    "vs_timeout() { "
+    'if command -v timeout >/dev/null 2>&1; then timeout "$@"; '
+    'elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$@"; '
+    "else echo 'vs-slurm: timeout(1) is not installed' >&2; return 127; fi; }"
+)
+
+
+def _batch_script(stages: Sequence[SlurmBatchStage], *, stop_on_failure: bool) -> str:
+    lines = ["set +e", f"mkdir -p {shlex.quote(_BATCH_RESULT_ROOT)}", "batch_failed=0"]
+    if any(stage.timeout_seconds is not None for stage in stages):
+        lines.append(_TIMEOUT_FUNCTION)
+    for index, stage in enumerate(stages):
+        result_root = PurePosixPath(_BATCH_RESULT_ROOT) / f"{index:04d}"
+        stdout_path = result_root / "stdout.txt"
+        stderr_path = result_root / "stderr.txt"
+        exit_path = result_root / "exit-code.txt"
+        elapsed_path = result_root / "elapsed-seconds.txt"
+        command = shell_join_with_port(stage.command)
+        if stage.timeout_seconds is not None:
+            command = f"vs_timeout --signal=TERM --kill-after=5s {stage.timeout_seconds}s {command}"
+        lines.extend(
+            [
+                f"mkdir -p {shlex.quote(result_root.as_posix())}",
+                "stage_started=$SECONDS",
+                'if [ "$batch_failed" -eq 0 ] || [ '
+                + ("0" if stop_on_failure else "1")
+                + " -eq 1 ]; then",
+                f"  {command} > {shlex.quote(stdout_path.as_posix())} 2> {shlex.quote(stderr_path.as_posix())}",
+                "  stage_exit=$?",
+                "  stage_elapsed=$((SECONDS - stage_started))",
+                f"  printf '%s\\n' \"$stage_exit\" > {shlex.quote(exit_path.as_posix())}",
+                f"  printf '%s\\n' \"$stage_elapsed\" > {shlex.quote(elapsed_path.as_posix())}",
+                '  if [ "$stage_exit" -ne 0 ]; then batch_failed=1; fi',
+                "else",
+                "  printf '%s\\n' SKIPPED > " + shlex.quote(exit_path.as_posix()),
+                "  printf '%s\\n' 0 > " + shlex.quote(elapsed_path.as_posix()),
+                f"  : > {shlex.quote(stdout_path.as_posix())}",
+                f"  : > {shlex.quote(stderr_path.as_posix())}",
+                "fi",
+            ]
+        )
+    # Stage failure is part of the returned evaluation result, not a scheduler
+    # failure. Returning zero lets the collector retrieve the preceding stage's
+    # status and output while preserving strict stop-on-first-failure ordering.
+    lines.extend(["exit 0", ""])
+    return "\n".join(lines)
+
+
+def _safe_relative_path(value: str, error: Callable[[], SlurmError]) -> PurePosixPath:
+    path = PurePosixPath(value)
+    if (
+        not path.parts
+        or path.is_absolute()
+        or path.as_posix() != value
+        or any(part in {".", ".."} for part in path.parts)
+    ):
+        raise error()
+    return path
+
+
+def _safe_component(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value) is None:
+        raise SlurmConfigError.invalid_invocation_id()
+    return value
+
+
+def _normalized_remote_path(value: str) -> PurePosixPath:
+    path = PurePosixPath(value)
+    if (
+        not path.is_absolute()
+        or path.as_posix() != value
+        or any(part in {".", ".."} for part in path.parts[1:])
+    ):
+        raise ValueError
+    return path
+
+
+def _job_script(request: _JobScriptRequest) -> str:
+    workspace = request.workspace
+    status_path = request.status_path
+    command = request.command
+    setup_script = request.setup_script
+    service = request.service
+    phase_timing_root = request.phase_timing_root
+    lines = ["#!/usr/bin/env bash", "set -uo pipefail", f"cd {shlex.quote(workspace.as_posix())}"]
+    if phase_timing_root is not None:
+        lines.append(f"mkdir -p {shlex.quote((workspace / phase_timing_root).as_posix())}")
+    if setup_script:
+        if phase_timing_root is not None:
+            lines.append("setup_started=$SECONDS")
+        lines.extend(
+            [
+                "set +e",
+                'export BUNDLE="$PWD"',
+                f"source {shlex.quote(setup_script)}",
+                "setup_status=$?",
+                f'if [ "$setup_status" -ne 0 ]; then printf \'%s\\n\' "$setup_status" > {shlex.quote(status_path.as_posix())}; exit "$setup_status"; fi',
+            ]
+        )
+        if phase_timing_root is not None:
+            timing_path = workspace / phase_timing_root / "setup-seconds.txt"
+            lines.append(
+                f"printf '%s\\n' $((SECONDS - setup_started)) > {shlex.quote(timing_path.as_posix())}"
+            )
+    elif phase_timing_root is not None:
+        timing_path = workspace / phase_timing_root / "setup-seconds.txt"
+        lines.append(f"printf '%s\\n' 0 > {shlex.quote(timing_path.as_posix())}")
+    lines.append("set +e")
+    if service is not None:
+        lines.extend(
+            _service_script(service, phase_timing_root=phase_timing_root, workspace=workspace)
+        )
+    elif phase_timing_root is not None:
+        timing_path = workspace / phase_timing_root / "service-startup-seconds.txt"
+        lines.append(f"printf '%s\\n' 0 > {shlex.quote(timing_path.as_posix())}")
+    lines.extend([shell_join_with_port(command), "job_status=$?"])
+    if service is not None and phase_timing_root is not None:
+        tail_path = workspace / phase_timing_root / _SERVICE_LOG_TAIL
+        lines.append(
+            f"tail -n {_SERVICE_LOG_TAIL_LINES} .vs-slurm-service.log"
+            f" > {shlex.quote(tail_path.as_posix())} 2>/dev/null"
+        )
+    if service is not None:
+        lines.append("fi")
+    lines.extend(
+        [
+            f"printf '%s\\n' \"$job_status\" > {shlex.quote(status_path.as_posix())}",
+            'exit "$job_status"',
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _service_script(
+    service: SlurmService,
+    *,
+    phase_timing_root: PurePosixPath | None = None,
+    workspace: PurePosixPath | None = None,
+) -> list[str]:
+    command = shell_join_with_port(service.command)
+    readiness_url = shlex.quote(service.readiness_url)
+    lines = [
+        "export PORT=$((20000 + SLURM_JOB_ID % 10000))",
+        'service_pid=""',
+        'stop_service() { if [ -n "$service_pid" ]; then kill "$service_pid" 2>/dev/null || true; wait "$service_pid" 2>/dev/null || true; fi; }',
+        "trap stop_service EXIT",
+        f"{command} > .vs-slurm-service.log 2>&1 &",
+        "service_pid=$!",
+        "ready=0",
+        "service_started=$SECONDS",
+        f"for attempt in $(seq 1 {service.startup_timeout_seconds}); do",
+        '  if ! kill -0 "$service_pid" 2>/dev/null; then break; fi',
+        f"  readiness_url={readiness_url}",
+        f"  readiness_url=${{readiness_url//{PORT_PLACEHOLDER}/$PORT}}",
+        '  if curl -fs --max-time 2 "$readiness_url" >/dev/null; then ready=1; break; fi',
+        "  sleep 1",
+        "done",
+    ]
+    if phase_timing_root is not None and workspace is not None:
+        timing_path = workspace / phase_timing_root / "service-startup-seconds.txt"
+        lines.append(
+            f"printf '%s\\n' $((SECONDS - service_started)) > {shlex.quote(timing_path.as_posix())}"
+        )
+    lines.append(
+        'if [ "$ready" -ne 1 ]; then tail -40 .vs-slurm-service.log;'
+        f" job_status={SERVICE_NOT_READY_EXIT_CODE}; else"
+    )
+    return lines
+
+
+def _distinct_tail(path: Path) -> str:
+    """Return the service log's last lines, keeping only the latest copy of a repeated line.
+
+    Servers often repeat one warning hundreds of times; without this the tail
+    would show only that warning and hide the server's own progress lines.
+    """
+    if not path.is_file():
+        return ""
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    seen: set[str] = set()
+    kept: list[str] = []
+    size = 0
+    for raw_line in reversed(lines):
+        line = (
+            raw_line
+            if len(raw_line) <= _SERVICE_LOG_LINE_CHARS
+            else raw_line[:_SERVICE_LOG_LINE_CHARS] + " [line truncated]"
+        )
+        if line in seen:
+            continue
+        size += len(line) + 1
+        if size > _SERVICE_LOG_TAIL_CHARS:
+            break
+        seen.add(line)
+        kept.append(line)
+        if len(kept) == _SERVICE_LOG_REPORTED_LINES:
+            break
+    return "\n".join(reversed(kept))
+
+
+def _queue_reading(life: JobLife, queue: QueueRow | NotInQueue) -> SchedulerReading:
+    """A reading of *life*, carrying the queue's reason and start estimate when it listed the job."""
+    if isinstance(queue, NotInQueue):
+        return SchedulerReading(life)
+    return SchedulerReading(life, reason=queue.reason, estimated_start=queue.estimated_start)
+
+
+def _read_exit_code(path: Path) -> int:
+    try:
+        value = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError) as exc:
+        raise SlurmError.malformed_result() from exc
+    if not 0 <= value <= _MAX_PROCESS_EXIT_CODE:
+        raise SlurmError.malformed_result()
+    return value
+
+
+def _read_nonnegative_seconds(path: Path) -> float:
+    try:
+        value = float(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError) as exc:
+        raise SlurmError.malformed_result() from exc
+    if not math.isfinite(value) or value < 0:
+        raise SlurmError.malformed_result()
+    return value
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise SlurmError.malformed_result() from exc

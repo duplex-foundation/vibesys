@@ -67,15 +67,15 @@ accuracy and performance results.
 
 ## Quickstart
 
-Install Python 3.12+, Git, and [uv](https://docs.astral.sh/uv/). Linux also
-requires `bubblewrap`, and a kernel that lets it create an unprivileged user
-namespace; macOS includes the required `sandbox-exec` command. Where user
-namespaces are blocked and installing bubblewrap needs root you do not have,
-`VIBESYS_AGENT_SANDBOX=landlock` selects a weaker but root-free backend (see
-the [CLI reference](docs/cli-flags.md) for what it stops enforcing). Tasks whose
-candidate is a container topology, such as the `microservices` examples, also
-need Docker Engine reachable without `sudo` (add your user to the `docker`
-group) and a Go toolchain on `PATH`. Then install VibeSys:
+Install Python 3.12+, Git, and [uv](https://docs.astral.sh/uv/). Agents run in
+a local Docker container, so Docker Engine must be reachable without `sudo` (add
+your user to the `docker` group). Tasks whose candidate is a container topology,
+such as the `microservices` examples, declare `docker_in_docker = true`: their
+container gets a Docker daemon of its own and needs the
+[Sysbox](https://github.com/nestybox/sysbox) runtime installed. The `slurm` environment
+with `[vibesys.agent_gpu]` also needs `bubblewrap` on Linux and on the compute nodes (see the
+[CLI reference](docs/cli-flags.md)): it confines the GPU jobs its agent starts there.
+Then install VibeSys:
 
 ```bash
 uv tool install vibesys
@@ -103,8 +103,6 @@ name = "gpt-5.4"
 
 [agent]
 backend = "cli"
-# Optional. AgentShim is the default; Omnigent is an alternate runtime.
-driver = "agentshim"
 cli_provider = "codex"
 
 [backend]
@@ -112,7 +110,9 @@ name = "cpu"
 ```
 
 See [`examples/`](examples/) for complete objectives and manifests across data
-structures, model serving, and microservices.
+structures, model serving, and microservices. New examples are registered in
+[`examples/registry.toml`](examples/registry.toml); see
+[Adding an example](docs/contributing/examples.md).
 
 Run from the project root:
 
@@ -125,7 +125,7 @@ vibesys --task my-task --max-rounds 4
 The directory must be its Git repository root, or outside Git so VibeSys can
 initialize a repository. An existing repository needs a baseline commit and a
 clean worktree. See [Running VibeSys](docs/running-vibesys.md) for copied
-projects, legacy input bundles, Docker, Modal, remote repositories, resume, and
+projects, examples, Docker, Modal, remote repositories, resume, and
 alternate search loops. The [CLI reference](docs/cli-flags.md) documents every
 flag. Contributor setup belongs in [`docs/contributing/development.md`](docs/contributing/development.md).
 

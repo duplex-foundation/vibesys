@@ -1,0 +1,123 @@
+name: Nightly
+
+# Nightly-depth runs (`--depth=nightly`) of checks that the pull-request tier
+# samples to keep CI short. A failure here is a regression the PR tier could not see.
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-depth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # `--depth=nightly` is the one depth setting (vs-sim pytest plugin): every
+      # crash point, the larger Hypothesis example counts, and the randomized
+      # `nightly` Hypothesis profile (conftest.py), so each night explores new
+      # inputs. The `slow` tests run in the `crash-sweep` job below.
+      # The chaos harness's seed set follows the depth too
+      # (tests/system/chaos/test_chaos.py).
+      - name: Run the full test suite at nightly depth
+        run: uv run python -m pytest --depth=nightly -m 'not slow and not native_build' -n auto --dist loadgroup --no-cov -q
+
+      # A failure prints its `@reproduce_failure` blob (print_blob); the
+      # artifact uploaded below holds the failing examples for replay.
+      - name: Keep the failing examples
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hypothesis-examples
+          path: .hypothesis/examples
+          if-no-files-found: ignore
+
+      # Seeds the pull-request tier never draws (see
+      # tests/system/chaos/test_chaos.py).
+      - name: Sweep the skeleton-search chaos harness over more seeds
+        run: ./scripts/chaos_loop.sh 200 1000 2
+
+  # The exhaustive crash sweeps (`-m slow`), which a pull request deselects.
+  crash-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run the slow crash sweeps at nightly depth
+        run: uv run pytest --depth=nightly -m slow -n auto --no-cov
+
+  # The real-system tiers (issue #1732) on main, a backstop for changes the
+  # pull-request change filter (`real_tiers` in .repoctl/components.toml)
+  # misses. A failed job fails the workflow. The minimal-container tier builds
+  # the CPU base only; CUDA and ROCm bases are about 25 GB each to pull.
+  real-tiers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [slurm_cluster_tests, minimal_container_tests]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The host-side job confinement the tier exercises needs bubblewrap; see
+      # the sandbox-linux job for why the AppArmor userns restriction is lifted.
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Set up Go for repoctl
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: support/repoctl/go.mod
+          cache-dependency-path: support/repoctl/go.sum
+
+      - name: Run the tier
+        env:
+          VIBESYS_SLURM_CLUSTER_DIR: ${{ runner.temp }}/slurm-cluster
+          VIBESYS_MINIMAL_CONTAINER_DIR: ${{ runner.temp }}/minimal-container
+          VIBESYS_MINIMAL_CONTAINER_BASES: cpu,ubuntu-uid-1000
+        run: ./support/repoctl/repoctl run-checks --group ${{ matrix.group }}

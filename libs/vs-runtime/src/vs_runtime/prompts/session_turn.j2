@@ -1,0 +1,10 @@
+{% for prompt in prompts %}
+{{ prompt | trim }}
+
+{% endfor %}
+{% if steers %}
+New steering from the operator since the last turn. Treat it as high-priority guidance for the work you do now:
+{% for steer in steers %}
+- ({{ steer.mode }}) {{ steer.text | trim }}
+{% endfor %}
+{% endif %}

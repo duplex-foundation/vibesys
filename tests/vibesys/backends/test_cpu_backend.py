@@ -3,22 +3,28 @@
 from __future__ import annotations
 
 import argparse
+from typing import TYPE_CHECKING
 
-from deepagents.backends import LocalShellBackend
+from tests.support.docker import capture_docker_start_argv, recording_docker_cli
 
-from entrypoints.headless import _add_common_args
-from vibesys import backends
-from vibesys.backends import SandboxKind
-from vibesys.backends.local import LocalBackend
-from vibesys.constants import ComputeBackend
-from vibesys.profilers import ProfilerKind
-from vs_sandbox import (
+from entrypoints.cli import _add_common_args
+from vs_sandbox.api import (
     BeforeReadyContext,
+    ComputeBackend,
+    DockerCli,
     DockerSandbox,
     HostResource,
     HostResourceAccess,
+    LocalBackend,
+    LocalShellRunner,
+    SandboxKind,
     SandboxLifecycleHooks,
+    create_compute_backend,
 )
+from vs_sim.api.testing import ManualClock
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class _RecordingHooks(SandboxLifecycleHooks):
@@ -29,22 +35,23 @@ class _RecordingHooks(SandboxLifecycleHooks):
         self.sandbox = context.sandbox
 
 
-def _make_backend(tmp_path) -> LocalBackend:  # noqa: ANN001  # tracked: #288
-    impl = backends.get(ComputeBackend.CPU, log_dir=tmp_path / "logs")
+def _make_backend(tmp_path: Path, *, docker: DockerCli | None = None) -> LocalBackend:
+    impl = create_compute_backend(
+        ComputeBackend.CPU, log_dir=tmp_path / "logs", docker=docker, clock=ManualClock()
+    )
     assert isinstance(impl, LocalBackend)
     return impl
 
 
 class TestCpuRegistry:
-    def test_cpu_in_registry(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-        impl = backends.get(ComputeBackend.CPU, log_dir=tmp_path)
+    def test_cpu_in_registry(self, tmp_path: Path) -> None:
+        impl = create_compute_backend(ComputeBackend.CPU, log_dir=tmp_path, clock=ManualClock())
         assert isinstance(impl, LocalBackend)
         assert impl.name is ComputeBackend.CPU
-        assert impl.profiler_kind is ProfilerKind.LINUX_CPU
 
 
 class TestCpuSandbox:
-    def test_local_returns_local_shell_backend(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_local_returns_local_shell_backend(self, tmp_path: Path) -> None:
         impl = _make_backend(tmp_path)
         workspace = tmp_path / "ws"
         workspace.mkdir()
@@ -54,9 +61,9 @@ class TestCpuSandbox:
             log_path=None,
             extra_env={"FOO": "bar"},
         )
-        assert isinstance(sb, LocalShellBackend)
+        assert isinstance(sb, LocalShellRunner)
 
-    def test_local_runs_lifecycle_hooks_before_returning(self, tmp_path):  # noqa: ANN001, ANN201
+    def test_local_runs_lifecycle_hooks_before_returning(self, tmp_path: Path) -> None:
         impl = _make_backend(tmp_path)
         workspace = tmp_path / "ws"
         workspace.mkdir()
@@ -71,8 +78,9 @@ class TestCpuSandbox:
 
         assert hooks.sandbox is sb
 
-    def test_docker_returns_docker_sandbox_without_gpus(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-        impl = _make_backend(tmp_path)
+    def test_docker_returns_docker_sandbox_without_gpus(self, tmp_path: Path) -> None:
+        docker = recording_docker_cli()
+        impl = _make_backend(tmp_path, docker=docker)
         sb = impl.make_sandbox(
             SandboxKind.DOCKER,
             host_workspace=str(tmp_path),
@@ -81,12 +89,14 @@ class TestCpuSandbox:
             container_image="sha256:" + "a" * 64,
         )
         assert isinstance(sb, DockerSandbox)
-        assert sb._gpus is None  # noqa: SLF001  # tracked: #288
-        assert sb._image == "sha256:" + "a" * 64  # noqa: SLF001  # tracked: #288
-        assert sb._env["FOO"] == "bar"  # noqa: SLF001  # tracked: #288
+        command = capture_docker_start_argv(sb, docker)
+        assert "--gpus" not in command
+        assert "sha256:" + "a" * 64 in command
+        assert "FOO=bar" in command
 
-    def test_docker_forwards_resources_to_the_sandbox(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
-        impl = _make_backend(tmp_path)
+    def test_docker_forwards_resources_to_the_sandbox(self, tmp_path: Path) -> None:
+        docker = recording_docker_cli()
+        impl = _make_backend(tmp_path, docker=docker)
         resource = HostResource(tmp_path / "history", HostResourceAccess.READ_ONLY, "history")
 
         sb = impl.make_sandbox(
@@ -98,35 +108,37 @@ class TestCpuSandbox:
         )
 
         assert isinstance(sb, DockerSandbox)
-        assert resource in sb._resources  # noqa: SLF001  # tracked: #288
+        command = capture_docker_start_argv(sb, docker)
+        assert f"{resource.path}:{resource.agent_path or resource.path}:ro" in command
 
-    def test_docker_falls_back_to_the_backend_image_without_a_resolved_container_image(  # noqa: ANN201  # tracked: #288
+    def test_docker_falls_back_to_the_backend_image_without_a_resolved_container_image(
         self,
-        tmp_path,  # noqa: ANN001  # tracked: #288
-    ):
+        tmp_path: Path,
+    ) -> None:
         """A caller that builds its own Docker sandbox without one still works.
 
-        ``DockerEnvironment.open()`` (the plain ``--docker`` path) always
+        ``DockerEnvironment.open()`` (the plain Docker path) always
         resolves an agent image and passes it as ``container_image``, so in
         practice this fallback is dead there; it still matters for Modal and
         SkyPilot's CPU-only local editor container, which builds no agent
         image and never passes ``container_image``.
         """
-        impl = _make_backend(tmp_path)
+        docker = recording_docker_cli()
+        impl = _make_backend(tmp_path, docker=docker)
         sb = impl.make_sandbox(
             SandboxKind.DOCKER,
             host_workspace=str(tmp_path),
             log_path=None,
         )
         assert isinstance(sb, DockerSandbox)
-        assert sb._image == impl.image  # noqa: SLF001  # tracked: #288
+        assert impl.image in capture_docker_start_argv(sb, docker)
 
 
 class TestCpuDevice:
-    def test_no_monitor(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_no_monitor(self, tmp_path: Path) -> None:
         assert _make_backend(tmp_path).make_monitor(tmp_path) is None
 
-    def test_reselect_is_noop(self, tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    def test_reselect_is_noop(self, tmp_path: Path) -> None:
         impl = _make_backend(tmp_path)
         # No-op: doesn't raise, doesn't change selected_device.
         impl.reselect_device()
@@ -134,7 +146,7 @@ class TestCpuDevice:
 
 
 class TestCpuCli:
-    def test_argparse_accepts_cpu(self):  # noqa: ANN201  # tracked: #288
+    def test_argparse_accepts_cpu(self) -> None:
         parser = argparse.ArgumentParser()
         _add_common_args(parser)
         ns = parser.parse_args(["--backend", "cpu"])

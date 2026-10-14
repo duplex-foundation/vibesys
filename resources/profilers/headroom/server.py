@@ -10,41 +10,48 @@ Launch:
 
     python headroom_profiler/server.py
     # or
-    uv run python headroom_profiler/server.py
+    uv run python headroom_profiler/server.py.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
+import importlib
 import sys
-import types
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from mcp.server.fastmcp import FastMCP
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from mcp.server.fastmcp import FastMCP
 
 _HERE = Path(__file__).resolve().parent
 
 sys.path.insert(0, str(_HERE))
+# lint-waiver: LW-008016 [E402]; This standalone bundle adds a sibling module directory to sys.path before importing its modules.
 import analyze_headroom  # noqa: E402
 
+# The same common runtime is staged beside each standalone profiler bundle.
+for _common_name in ("_common", "profilers_common"):
+    _common_path = Path(__file__).resolve().parent.parent / _common_name
+    if (_common_path / "capture_runtime.py").is_file():
+        sys.path.insert(0, str(_common_path))
+        break
+capture_runtime = importlib.import_module("capture_runtime")
 
-def _capture(fn, **kwargs) -> str:  # noqa: ANN001, ANN003  # tracked: #288
-    ns = types.SimpleNamespace(**kwargs)
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            fn(ns)
-    except SystemExit as exc:  # _load() reports malformed reports via sys.exit
-        return f"error: {exc}"
-    out = buf.getvalue()
-    return out or "(no output)"
+
+def _capture(fn: Callable[..., None], **kwargs: object) -> str:
+    """Run the shared textual-analysis boundary."""
+    return capture_runtime.run_analysis(fn, **kwargs)
+
+
+StrictFastMCP = importlib.import_module("strict_arguments").StrictFastMCP
 
 
 def build_server() -> FastMCP:
     """Construct the FastMCP instance with headroom-report analysis tools."""
-    mcp = FastMCP("vibesys-headroom-profiler")
+    mcp = StrictFastMCP("vibesys-headroom-profiler")
 
     @mcp.tool()
     def waterfall(report: str) -> str:
@@ -109,7 +116,8 @@ def build_server() -> FastMCP:
     return mcp
 
 
-def main(argv: list[str] | None = None) -> None:  # noqa: D103  # tracked: #288
+def main(argv: list[str] | None = None) -> None:
+    """Run the command-line entry point."""
     parser = argparse.ArgumentParser(
         prog="vibesys-headroom-mcp",
         description="Stdio MCP server exposing kernel headroom-report analyses.",

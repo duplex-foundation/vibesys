@@ -1,0 +1,345 @@
+[
+  {
+    "path": "src/vibesys/domains/base.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pathlib",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/domains/database/__init__.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pathlib",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/domains/generic/__init__.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pathlib",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/domains/kernel_writing/__init__.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pathlib",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/domains/llm_serving/__init__.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pathlib",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/domains/microservices/__init__.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pathlib",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/domains/rendering.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pathlib",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/hypothesis/plan.py",
+    "symbol": "<module>",
+    "rule": "io-import",
+    "subject": "vs_runtime.api",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/dynamic/models.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pydantic_core",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/dynamic/models.py",
+    "symbol": "<module>",
+    "rule": "effect-path",
+    "subject": "pydantic.json_schema.JsonSchemaMode",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/dynamic/models.py",
+    "symbol": "<module>",
+    "rule": "io-import",
+    "subject": "vs_runtime.api",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/dynamic/models.py",
+    "symbol": "_AnyOfTaggedUnions.tagged_union_schema",
+    "rule": "effect-path",
+    "subject": "pydantic_core.core_schema.TaggedUnionSchema",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "openevolve.config",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "openevolve.database",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "uuid",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_canonicalize_new_programs",
+    "rule": "effect-path",
+    "subject": "uuid.NAMESPACE_URL",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_canonicalize_new_programs",
+    "rule": "effect-path",
+    "subject": "uuid.uuid5",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_load_files",
+    "rule": "effect-path",
+    "subject": "openevolve.database.Program.from_dict",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random",
+    "rule": "effect-path",
+    "subject": "random.getstate",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random",
+    "rule": "effect-path",
+    "subject": "random.getstate",
+    "occurrence": 2
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random",
+    "rule": "effect-path",
+    "subject": "random.setstate",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random",
+    "rule": "effect-path",
+    "subject": "random.setstate",
+    "occurrence": 2
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random",
+    "rule": "effect-path",
+    "subject": "uuid.uuid4",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random",
+    "rule": "effect-path",
+    "subject": "uuid.uuid4",
+    "occurrence": 2
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random",
+    "rule": "effect-path",
+    "subject": "uuid.uuid4",
+    "occurrence": 3
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random._deterministic_uuid4",
+    "rule": "effect-path",
+    "subject": "random.getrandbits",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random._deterministic_uuid4",
+    "rule": "effect-path",
+    "subject": "uuid.UUID",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "_upstream_random._deterministic_uuid4",
+    "rule": "effect-path",
+    "subject": "uuid.UUID",
+    "occurrence": 2
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "admit",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/openevolve_selector.py",
+    "symbol": "select",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/search.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/search.py",
+    "symbol": "PopulationSearch.initial",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/search.py",
+    "symbol": "PopulationSearch.initial",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 2
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/search.py",
+    "symbol": "PopulationSearch.propose",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/vibesys_selector.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/vibesys_selector.py",
+    "symbol": "_scalar_softmax_parent",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/vibesys_selector.py",
+    "symbol": "_select_inspirations",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/vibesys_selector.py",
+    "symbol": "_select_parent",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/evolve/population/vibesys_selector.py",
+    "symbol": "select",
+    "rule": "effect-path",
+    "subject": "random.Random",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/multi/models.py",
+    "symbol": "<module>",
+    "rule": "io-import",
+    "subject": "vs_runtime.api",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/profilers.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "platform",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/profilers.py",
+    "symbol": "_resolve_generic_profiler",
+    "rule": "effect-path",
+    "subject": "platform.system",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/skill_selection.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pathlib",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/skill_selection.py",
+    "symbol": "<module>",
+    "rule": "effect-path",
+    "subject": "vs_agent.api.NULL_SKILL_SELECTION",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/skill_selection.py",
+    "symbol": "<module>",
+    "rule": "io-import",
+    "subject": "vs_agent.api",
+    "occurrence": 1
+  },
+  {
+    "path": "src/vibesys/orchestration/skill_selection.py",
+    "symbol": "<module>",
+    "rule": "io-import",
+    "subject": "vs_agent.api",
+    "occurrence": 2
+  },
+  {
+    "path": "src/vibesys/prompts/renderer.py",
+    "symbol": "<module>",
+    "rule": "banned-import",
+    "subject": "pathlib",
+    "occurrence": 1
+  }
+]

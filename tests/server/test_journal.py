@@ -8,12 +8,16 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
-from tests.server.support import build_server_parts
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
+from tests.server.support import HARNESS_RUN_ID, build_server_parts
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
 from server.diagnostics import (
+    Diagnostic,
     DiagnosticRetryability,
     DiagnosticScope,
     DiagnosticSeverity,
@@ -22,6 +26,8 @@ from server.events import (
     AgentExecutionActivityData,
     AgentExecutionFinishedData,
     AgentExecutionStartedData,
+    ConfigurationFailedData,
+    EventData,
     EventStatus,
     EventType,
     GateFinishedData,
@@ -32,20 +38,25 @@ from server.events import (
     RunEvent,
     make_event,
 )
+from server.host_api import FailureReason
+from server.runtime import failure_reason
+from vs_sim.api.testing import examples
 
 
-def _events(path):  # noqa: ANN001, ANN202
+def _events(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def _write_stored_events(log_dir, events):  # noqa: ANN001, ANN202
+def _write_stored_events(log_dir: Path, events: Sequence[RunEvent]) -> None:
     log_dir.mkdir()
     (log_dir / "run-events.jsonl").write_text(
         "".join(event.model_dump_json() + "\n" for event in events)
     )
 
 
-def _stored_event(sequence, event_type, status, data):  # noqa: ANN001, ANN202
+def _stored_event(
+    sequence: int, event_type: EventType, status: EventStatus, data: EventData
+) -> RunEvent:
     return RunEvent(
         sequence=sequence,
         run_id="persisted-run",
@@ -59,7 +70,7 @@ def _stored_event(sequence, event_type, status, data):  # noqa: ANN001, ANN202
     )
 
 
-def test_bootstrap_events_join_durable_history(tmp_path):  # noqa: ANN001, ANN201
+def test_bootstrap_events_join_durable_history(tmp_path: Path) -> None:
     durable = build_server_parts(tmp_path / "durable")
     durable.journal.record(EventType.RUN_FINISHED, status=EventStatus.COMPLETED)
 
@@ -86,11 +97,12 @@ def test_bootstrap_events_join_durable_history(tmp_path):  # noqa: ANN001, ANN20
     ]
 
 
-def test_attach_renumbering_bootstrap_events_starts_a_new_sequence_space(tmp_path):  # noqa: ANN001, ANN201
+def test_attach_renumbering_bootstrap_events_starts_a_new_sequence_space(tmp_path: Path) -> None:
     durable = build_server_parts(tmp_path / "durable")
     durable.journal.record(EventType.RUN_FINISHED, status=EventStatus.COMPLETED)
 
     current = build_server_parts(tmp_path / "bootstrap")
+    current.journal.record(EventType.SERVER_READY, status=EventStatus.ACTIVE)
     bootstrap_store = current.journal.store_id_locked()
     folded = current.journal.read()
     current.attach(tmp_path / "durable")
@@ -101,10 +113,10 @@ def test_attach_renumbering_bootstrap_events_starts_a_new_sequence_space(tmp_pat
     # a different sequence space and the identity has to say so.
     assert current.journal.store_id_locked() != bootstrap_store
     assert [event.sequence for event in attached] == [event.sequence for event in folded]
-    assert attached != folded
+    assert [event.type for event in attached] != [event.type for event in folded]
 
 
-def test_attach_into_an_empty_log_keeps_the_sequence_space(tmp_path):  # noqa: ANN001, ANN201
+def test_attach_into_an_empty_log_keeps_the_sequence_space(tmp_path: Path) -> None:
     current = build_server_parts(tmp_path / "bootstrap")
     bootstrap_store = current.journal.store_id_locked()
     before = [(event.sequence, event.type) for event in current.journal.read()]
@@ -117,7 +129,7 @@ def test_attach_into_an_empty_log_keeps_the_sequence_space(tmp_path):  # noqa: A
     assert [(event.sequence, event.type) for event in current.journal.read()] == before
 
 
-def test_phase_only_legacy_replay_translates_in_place(tmp_path):  # noqa: ANN001, ANN201
+def test_phase_only_legacy_replay_translates_in_place(tmp_path: Path) -> None:
     """A translated phase event replaces the original at its stored sequence."""
     log_dir = tmp_path / "legacy"
     _write_stored_events(
@@ -157,7 +169,7 @@ def test_phase_only_legacy_replay_translates_in_place(tmp_path):  # noqa: ANN001
     )
 
 
-def test_modern_phase_events_replay_unchanged(tmp_path):  # noqa: ANN001, ANN201
+def test_modern_phase_events_replay_unchanged(tmp_path: Path) -> None:
     """Phase events with a canonical lifecycle sibling pass through untouched."""
     log_dir = tmp_path / "modern"
     activity = AgentExecutionActivityData(mode="thinking", summary="Implementing")
@@ -197,10 +209,10 @@ def test_modern_phase_events_replay_unchanged(tmp_path):  # noqa: ANN001, ANN201
     ]
 
 
-def test_invocation_and_terminal_failure_share_diagnostic_identity(tmp_path):  # noqa: ANN001, ANN201
+def test_invocation_and_terminal_failure_share_diagnostic_identity(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     error = RuntimeError("token=super-secret agent process exited")
-    execution = parts.controller.start_agent_execution("implementer", "round 5", "prompt")
+    execution = parts.start_execution("implementer", "round 5", "prompt")
     parts.controller.after_agent(
         "implementer", "round 5", error=error, execution_id=execution.execution_id
     )
@@ -248,10 +260,17 @@ def test_operational_failure_events_require_diagnostics(
         with pytest.raises(ValueError, match="must include a diagnostic"):
             parts.journal.record(event_type, status=status)
     with pytest.raises(ValueError, match="must include a diagnostic"):
-        parts.journal.append(make_event(event_type, "boom", status=EventStatus.FAILED))
+        parts.journal.append(
+            make_event(
+                event_type,
+                "boom",
+                status=EventStatus.FAILED,
+                timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
 
 
-def test_append_accepts_failed_gate_outcomes_without_diagnostics(tmp_path):  # noqa: ANN001, ANN201
+def test_append_accepts_failed_gate_outcomes_without_diagnostics(tmp_path: Path) -> None:
     # A failed gate is an expected semantic outcome, not an operational fault,
     # so the append invariant must leave it diagnostic-less.
     parts = build_server_parts(tmp_path)
@@ -260,12 +279,13 @@ def test_append_accepts_failed_gate_outcomes_without_diagnostics(tmp_path):  # n
             EventType.GATE_FINISHED,
             status=EventStatus.FAILED,
             data=GateFinishedData(gate=GateKind.ACCURACY, output_tail="mismatch"),
+            timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         )
     )
     assert gate.diagnostic is None
 
 
-def test_semantic_failure_events_do_not_require_diagnostics(tmp_path):  # noqa: ANN001, ANN201
+def test_semantic_failure_events_do_not_require_diagnostics(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     judge = parts.journal.record(
         EventType.JUDGE_RESULT,
@@ -275,13 +295,17 @@ def test_semantic_failure_events_do_not_require_diagnostics(tmp_path):  # noqa: 
     round_finished = parts.journal.record(
         EventType.ROUND_FINISHED,
         status=EventStatus.FAILED,
-        data=RoundFinishedData(attempts=1, judge_verdict="fail"),
+        data=RoundFinishedData(
+            attempts=1,
+            judge_verdict="fail",
+            profile_skipped=False,
+        ),
     )
     assert judge.diagnostic is None
     assert round_finished.diagnostic is None
 
 
-def test_capture_failure_emits_nothing_on_success(tmp_path):  # noqa: ANN001, ANN201
+def test_capture_failure_emits_nothing_on_success(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     before = parts.journal.read()
     with parts.journal.capture_failure(
@@ -293,7 +317,7 @@ def test_capture_failure_emits_nothing_on_success(tmp_path):  # noqa: ANN001, AN
     assert parts.journal.read() == before
 
 
-def test_capture_failure_records_once_and_reraises(tmp_path):  # noqa: ANN001, ANN201
+def test_capture_failure_records_once_and_reraises(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     error = KeyboardInterrupt("background worker stopped")
     before = parts.journal.read()
@@ -322,7 +346,7 @@ def test_capture_failure_records_once_and_reraises(tmp_path):  # noqa: ANN001, A
     assert not any(event.type is EventType.RUN_FAILED for event in events)
 
 
-def test_nonterminal_failure_helpers_reject_wrong_event_owners(tmp_path):  # noqa: ANN001, ANN201
+def test_nonterminal_failure_helpers_reject_wrong_event_owners(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     before = parts.journal.read()
     with pytest.raises(ValueError, match="without owning run termination"):
@@ -333,6 +357,7 @@ def test_nonterminal_failure_helpers_reject_wrong_event_owners(tmp_path):  # noq
             operation="Judge",
         )
     for event_type in (EventType.CONFIGURATION_FAILED, EventType.RUN_FAILED):
+        error = RuntimeError("worker failed")
         with (
             pytest.raises(ValueError, match="without owning run termination"),
             parts.journal.capture_failure(
@@ -341,14 +366,14 @@ def test_nonterminal_failure_helpers_reject_wrong_event_owners(tmp_path):  # noq
                 operation="Background maintenance",
             ),
         ):
-            raise RuntimeError("worker failed")  # noqa: TRY003
+            raise error
     assert parts.journal.read() == before
 
 
-def test_terminal_wrapper_reuses_cause_diagnostic(tmp_path):  # noqa: ANN001, ANN201
+def test_terminal_wrapper_reuses_cause_diagnostic(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     cause = RuntimeError("token=super-secret agent process exited")
-    execution = parts.controller.start_agent_execution("implementer", "round 5", "prompt")
+    execution = parts.start_execution("implementer", "round 5", "prompt")
     parts.controller.after_agent(
         "implementer", "round 5", error=cause, execution_id=execution.execution_id
     )
@@ -367,3 +392,208 @@ def test_terminal_wrapper_reuses_cause_diagnostic(tmp_path):  # noqa: ANN001, AN
     assert terminal.diagnostic.detail == (
         "RuntimeError: run cleanup failed <- RuntimeError: token=[REDACTED] agent process exited"
     )
+
+
+def _legacy_driver_line(sequence: int, event_type: str, data: Mapping[str, object]) -> str:
+    return json.dumps(
+        {
+            "protocol_version": 1,
+            "sequence": sequence,
+            "run_id": "persisted-run",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "type": event_type,
+            "agent_kind": "implementer",
+            "round_label": "round 1",
+            "execution_id": "exec-1",
+            "data": data,
+        }
+    )
+
+
+def _write_replayed_chat_thread(log_dir: Path, thread_id: str) -> None:
+    """Write one pre-validation thread record through the durable wire shape."""
+    created = {
+        "kind": "chat_thread_created",
+        "thread_id": thread_id,
+        "provider": "codex",
+        "model": "gpt-test",
+        "created_at": "2024-01-01T00:00:00Z",
+    }
+    record = json.loads(_legacy_driver_line(1, "chat_thread_created", created))
+    record["chat_thread_id"] = thread_id
+    log_dir.mkdir()
+    (log_dir / "run-events.jsonl").write_text(json.dumps(record) + "\n")
+
+
+def test_replayed_absolute_chat_thread_identity_fails_before_attachment(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    log_dir = tmp_path / "logs"
+    thread_id = str(outside)
+    _write_replayed_chat_thread(log_dir, thread_id)
+
+    with pytest.raises(ValueError, match="invalid experiment chat thread identity") as error:
+        build_server_parts(log_dir)
+
+    assert repr(thread_id) in str(error.value)
+    assert not outside.exists()
+
+
+@pytest.mark.parametrize(
+    "thread_id",
+    [
+        pytest.param("../outside", id="parent-traversal"),
+        pytest.param("nested/thread", id="posix-separator"),
+        pytest.param(r"nested\thread", id="windows-separator"),
+        pytest.param(r"C:\outside", id="windows-drive"),
+        pytest.param(r"\\server\share", id="windows-unc"),
+        pytest.param("con", id="windows-device"),
+        pytest.param("nul.txt", id="windows-device-extension"),
+        pytest.param("thread.", id="windows-trailing-dot"),
+        pytest.param("thread ", id="windows-trailing-space"),
+    ],
+)
+def test_replayed_nonportable_chat_thread_identity_fails_before_attachment(
+    tmp_path: Path, thread_id: str
+) -> None:
+    log_dir = tmp_path / "logs"
+    _write_replayed_chat_thread(log_dir, thread_id)
+
+    with pytest.raises(ValueError, match="invalid experiment chat thread identity") as error:
+        build_server_parts(log_dir)
+
+    assert repr(thread_id) in str(error.value)
+    assert list(tmp_path.rglob("conversation.jsonl")) == []
+
+
+@settings(
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+    max_examples=examples(pr=10, nightly=25),
+)
+@given(driver=st.one_of(st.none(), st.text(max_size=12)))
+def test_journal_recorded_with_the_removed_driver_field_still_replays(
+    tmp_path_factory: pytest.TempPathFactory, driver: str | None
+) -> None:
+    """Events written while a ``driver`` attribution existed replay without it.
+
+    The field was always ``"agentshim"`` and was removed from the wire. Event
+    payloads ignore keys they no longer declare, so history recorded before the
+    removal loads and the dropped key never reappears on the wire. The event
+    envelope still rejects unknown keys.
+    """
+    log_dir = tmp_path_factory.mktemp("legacy-driver") / "logs"
+    log_dir.mkdir()
+    started = {
+        "kind": "agent_execution_started",
+        "stage": "implementer",
+        "activity": {
+            "kind": "agent_execution_activity_changed",
+            "mode": "thinking",
+            "summary": "working",
+        },
+        "driver": driver,
+        "provider": "codex",
+        "model": "gpt-test",
+    }
+    created = {
+        "kind": "chat_thread_created",
+        "thread_id": "thread-1",
+        "driver": driver or "agentshim",
+        "provider": "codex",
+        "model": "gpt-test",
+        "created_at": "2024-01-01T00:00:00Z",
+    }
+    (log_dir / "run-events.jsonl").write_text(
+        _legacy_driver_line(1, "agent_execution_started", started)
+        + "\n"
+        + _legacy_driver_line(2, "chat_thread_created", created)
+        + "\n"
+    )
+
+    parts = build_server_parts(log_dir)
+    events = parts.journal.read()
+
+    started_events = [e.data for e in events if isinstance(e.data, AgentExecutionStartedData)]
+    assert [data.provider for data in started_events] == ["codex"]
+    assert all("driver" not in (event.model_dump(mode="json")["data"] or {}) for event in events)
+    assert [thread.thread_id for thread in parts.chat.threads()] == ["thread-1"]
+
+
+_EXAMPLES = itertools.count()
+
+
+@settings(
+    max_examples=examples(pr=10, nightly=25),
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    socket_parent=st.sampled_from(["runs", "T", "tmp", "vibesys-session-x"]),
+    early_events=st.integers(min_value=0, max_value=4),
+)
+def test_every_event_names_the_run_from_the_first(
+    tmp_path: Path, socket_parent: str, early_events: int
+) -> None:
+    # Regression: a detached server journaled into its control-socket directory
+    # before its run was ready and stamped those events with that directory's
+    # parent name. A client latches the first run id it folds, so it ignored
+    # every event the run sent later. The server now knows its run from the
+    # start, so no event can name another one, whatever the socket's path.
+    case = tmp_path / str(next(_EXAMPLES))
+    current = build_server_parts(case / socket_parent / "instance")
+    for _ in range(early_events):
+        current.journal.record(EventType.SERVER_READY, status=EventStatus.ACTIVE)
+
+    current.journal.attach(case / "run-logs", run_id=HARNESS_RUN_ID)
+    current.journal.record(EventType.RUN_STARTED, status=EventStatus.ACTIVE)
+
+    assert {event.run_id for event in current.journal.read()} == {HARNESS_RUN_ID}
+
+
+@pytest.mark.parametrize(
+    ("run_id", "message"), [(None, "must name"), ("", "must name"), ("other", "cannot continue")]
+)
+def test_a_writable_journal_never_drops_or_changes_its_run(
+    tmp_path: Path, run_id: str | None, message: str
+) -> None:
+    current = build_server_parts(tmp_path / "instance")
+
+    with pytest.raises(ValueError, match=message):
+        current.journal.attach(tmp_path / "run-logs", run_id=run_id)
+
+
+def test_unknown_event_envelope_keys_stay_rejected() -> None:
+    with pytest.raises(ValueError, match="driver"):
+        RunEvent.model_validate_json(
+            _legacy_driver_line(1, "output", {"kind": "agent_output_chunk"}).replace(
+                '"sequence"', '"driver": "agentshim", "sequence"', 1
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("event_type", "data", "stage"),
+    [
+        (EventType.RUN_FAILED, None, "run"),
+        (EventType.RUN_INTERRUPTED, None, "run"),
+        (
+            EventType.CONFIGURATION_FAILED,
+            ConfigurationFailedData(code="c", stage="resume_resolution", message="m", exit_code=2),
+            "resume_resolution",
+        ),
+    ],
+)
+def test_the_event_a_run_failed_with_names_its_reason(
+    tmp_path: Path, event_type: EventType, data: ConfigurationFailedData | None, stage: str
+) -> None:
+    current = build_server_parts(tmp_path / "instance")
+    diagnostic = Diagnostic(
+        code="sandbox_start_failed", summary="no GPU", scope=DiagnosticScope.RUN
+    )
+    current.journal.record(event_type, status=EventStatus.FAILED, data=data, diagnostic=diagnostic)
+    current.journal.record(EventType.OUTPUT, data=None)
+
+    *_, failed, output = current.journal.read()
+
+    assert failure_reason(failed) == FailureReason(
+        code="sandbox_start_failed", stage=stage, message="no GPU"
+    )
+    assert failure_reason(output) is None

@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
-import json
-from typing import Literal, NoReturn
+from enum import StrEnum
+from typing import Annotated, Literal, NoReturn
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from vs_evaluator_protocol.errors import ReasonCode, reject
 
+# Parses untrusted JSON with nesting bounded, failing as a ValueError.
+_JSON: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
+
 PROTOCOL_VERSION: int = 2
+
+
+class ProfileField(StrEnum):
+    """Measurement fields a profile must provide, never inferred from aggregate cost."""
+
+    HIP_API_TIMING = "hip_api_timing"
+    PREFILL_TIMING = "prefill_timing"
+    DECODE_TIMING = "decode_timing"
 
 
 class _StrictRecord(BaseModel):
@@ -55,11 +66,53 @@ class Result(_StrictRecord):
     values: dict[str, JsonValue]
 
 
+# A finite JSON number. Integers are numbers too; booleans are not.
+_FiniteNumber = Annotated[float, Field(allow_inf_nan=False)]
+_Name = Annotated[str, Field(pattern=r"^\S+$")]
+
+
+class Progress(_StrictRecord):
+    """Work a stopped run completed, out of the work a passing run completes.
+
+    `unit` names one unit of work (for example `rounds` or `requests`).
+    """
+
+    completed: int = Field(ge=0)
+    required: int = Field(gt=0)
+    unit: _Name
+
+
+class PartialMeasurement(_StrictRecord):
+    """What a run that failed or was stopped early measured before it stopped.
+
+    It is reported only on an `error` record, so it never counts as a result:
+    it lets a reader compare failed runs by how close each came. `name` is the
+    measured quantity; it need not be a metric declared in `hello`, because a
+    run cut short usually measures a different quantity (for example the rate
+    of a warmup phase) than the one its result row would hold. `value` is what
+    was measured, `target` the value a passing run needs (absent when the
+    evaluator has no single bar), and `direction` which way is better, so two
+    partial measurements of the same quantity can be ranked.
+    """
+
+    name: _Name
+    value: _FiniteNumber
+    direction: Literal["max", "min"]
+    unit: str | None = Field(default=None, min_length=1)
+    target: _FiniteNumber | None = None
+    progress: Progress | None = None
+
+
 class ErrorRecord(_StrictRecord):
-    """Terminating record reporting that the evaluator produced no row."""
+    """Terminating record reporting that the evaluator produced no row.
+
+    `partial` is what the run measured before it failed, when it measured
+    anything; absent means nothing was measured.
+    """
 
     kind: Literal["error"] = "error"
     message: str = Field(min_length=1)
+    partial: PartialMeasurement | None = None
 
 
 Record = Hello | Result | ErrorRecord
@@ -76,6 +129,8 @@ def parse_records(text: str) -> list[Record]:
 
     Validates each line on its own: JSON shape, record kind, key set, and
     field types. Cross-record obligations belong to `read_measurement`.
+    Lines end at a line feed only: a JSON string may hold other Unicode line
+    separators (U+0085, U+2028), which `str.splitlines` would split on.
 
     Raises:
         ProtocolError: when a line is not a record of a known kind, carries an
@@ -83,16 +138,21 @@ def parse_records(text: str) -> list[Record]:
     """
     return [
         _parse_line(line, number)
-        for number, line in enumerate(text.splitlines(), start=1)
+        for number, line in enumerate(text.split("\n"), start=1)
         if line.strip()
     ]
 
 
 def _parse_line(line: str, number: int) -> Record:
-    """Parse one non-blank line into the record its `kind` names."""
+    """Parse one non-blank line into the record its `kind` names.
+
+    The line comes from the evaluator, so ``_JSON`` parses it: pydantic's parser
+    bounds nesting and reports it as a ``ValueError``, where ``json.loads``
+    recurses per level and raised ``RecursionError`` past every caller's handler.
+    """
     try:
-        payload = json.loads(line)
-    except json.JSONDecodeError:
+        payload = _JSON.validate_json(line)
+    except ValueError:
         reject(ReasonCode.MALFORMED_LINE, f"line {number} is not valid JSON")
     if not isinstance(payload, dict):
         reject(ReasonCode.MALFORMED_LINE, f"line {number} is not a JSON object")

@@ -7,7 +7,7 @@ runtime, so a renamed or removed field leaves the harness rendering through its
 raw-content fallback while nothing fails.
 
 Everything here validates against the Python models. Those are the same
-contract as ``clients/backend-client/src/generated/protocol.schema.json``, which
+contract as ``clients/libs/contracts/src/generated/protocol.schema.json``, which
 is generated from them and pinned to them by ``test_protocol_schema.py``.
 
 One test writes rather than validates. The harness reimplements the legacy
@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -32,7 +31,8 @@ from pydantic import ValidationError
 
 from server.api.protocol import PROTOCOL_VERSION, ProtocolRequest, Response
 from server.events import RunEvent
-from server.journal import EventJournal
+from server.journal import WireJournal
+from vs_sim.api.testing import ManualClock, SimThreads
 
 _HARNESS_DIR = Path(__file__).resolve().parents[2] / "clients" / "tui" / "dev"
 _FIXTURE_DIR = _HARNESS_DIR / "fixtures"
@@ -41,6 +41,12 @@ _CANONICAL_GOLDEN_PATH = _HARNESS_DIR / "canonical-events.golden.json"
 
 _UPDATE_CANONICAL_ENV = "UPDATE_CANONICAL_EVENTS"
 """Set to ``1`` to rewrite the golden from this read path. Review the diff."""
+
+
+def _journal() -> WireJournal:
+    """A journal whose locks and event store run on simulated threads."""
+    threads = SimThreads()
+    return WireJournal(threads.condition(), threads=threads, clock=ManualClock())
 
 
 class SchemaAge(StrEnum):
@@ -134,7 +140,7 @@ def _canonical_events(fixture: FixtureContract, tmp_path: Path, through: int) ->
     log_dir = tmp_path / fixture.name
     log_dir.mkdir(parents=True)
     (log_dir / "run-events.jsonl").write_bytes((_FIXTURE_DIR / fixture.name).read_bytes())
-    journal = EventJournal(threading.Condition())
+    journal = _journal()
     journal.attach(log_dir, run_id="harness-parity")
     return journal.read(before_sequence=through + 1)
 
@@ -256,7 +262,7 @@ def test_current_fixture_round_trips_exactly(fixture: FixtureContract) -> None:
 def test_canonical_events_match_the_backend_read_path(tmp_path: Path) -> None:
     """Holds the harness's hand-ported translation to the read path it copies.
 
-    `clients/tui/dev/journal.ts` reimplements what `EventJournal` does to a
+    `clients/tui/dev/journal.ts` reimplements what `WireJournal` does to a
     legacy journal on read: `execution_id` recovered from `invocation_id`, and
     `invocation_started`/`invocation_finished` rewritten to their
     `agent_execution_*` form. Without it the harness was the one place a client
@@ -308,6 +314,7 @@ def test_mock_response_body_is_a_valid_response(request_type: str) -> None:
     envelope = {
         "protocol_version": PROTOCOL_VERSION,
         "request_id": "schema-check",
+        "timestamp": "1970-01-01T00:00:00+00:00",
         "ok": True,
         **body,
     }

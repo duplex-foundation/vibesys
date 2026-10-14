@@ -1,0 +1,846 @@
+"""In-memory, configurable :class:`AgentClientProtocol` test double.
+
+``FakeAgentClient`` lets a test assert what a caller actually sent (prompts,
+tool servers, session keys), inject specific or failing responses, and observe
+streamed output and session-reuse behavior. With no configured structured
+response it raises ``AgentOutputSchemaError``; every call is recorded as a
+:class:`FakeInvocation` for direct assertions.
+
+This module stays schema-agnostic (no ``vibesys`` core imports) and provider-
+agnostic (no ``agentshim`` imports): callers enqueue already-
+constructed response objects, and this module never runs an external agent.
+"""
+
+from __future__ import annotations
+
+import functools
+import json
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Concatenate, Literal, Self, TypeVar
+from uuid import uuid4
+
+from pydantic import BaseModel, ValidationError
+
+from vs_agent.cli_common import materialize_skills
+from vs_agent.contracts import (
+    AgentCapabilities,
+    AgentEvent,
+    AgentEventKind,
+    AgentOutputSchemaError,
+    AgentQuotaError,
+    AgentSkillUse,
+    AgentTurnRequest,
+    AgentTurnResult,
+    AgentUsage,
+    SteerOutcome,
+    session_spec_fingerprint,
+)
+from vs_agent.reply_limits import ReplyGuard, reply_breach
+from vs_agent.runner import schema_error
+from vs_agent.session_errors import SessionResumeError
+from vs_agent.session_store import NullSessionStore, SessionStore
+from vs_agent.sink import NULL_AGENT_EVENT_SINK, AgentEventSink
+from vs_agent.skills import NULL_SKILL_SELECTION
+from vs_agent.usage_records import append_usage_record
+from vs_mcp.api import StdioServerDescriptor
+from vs_sim.api import OsThreads, utc_datetime
+from vs_sim.api.testing import ManualClock
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from vs_agent.contracts import AgentObserver, AgentSessionSpec, CapacityGate
+    from vs_agent.progress import AgentProgress
+    from vs_agent.session_key import AgentSessionKey
+    from vs_agent.skills import SkillSelection
+    from vs_mcp.api import ToolServerDescriptor
+    from vs_sim.api import Threads
+T = TypeVar("T", bound=BaseModel)
+
+#: Default answer :meth:`FakeAgentClient.invoke_text` returns when nothing is
+#: configured for the call's ``kind`` and no module-wide default was set.
+DEFAULT_TEXT = "Fake agent inspected the trajectory."
+_FAKE_EPOCH = ManualClock()
+"""Every fake turn happens at the epoch: the fake's usage rows carry no real time."""
+
+type ResponseValue = BaseModel | dict[str, object]
+type ResponseSource = ResponseValue | Callable[[FakeInvocation], ResponseValue]
+type TextSource = str | Callable[[FakeInvocation], str]
+
+
+class _ParseFailure:
+    """Queue marker for a turn that returns unparseable output.
+
+    When one is dequeued, ``invoke`` raises ``AgentOutputSchemaError``, as
+    the real client does for a reply that does not validate.
+    """
+
+
+#: The detail of a scripted parse failure, as the real client reports a reply with no JSON.
+_UNPARSEABLE = "the reply contained no JSON object"
+
+#: Singleton enqueued by :meth:`FakeAgentClient.enqueue_parse_failure`.
+_PARSE_FAILURE = _ParseFailure()
+
+type QueuedResponse = ResponseSource | _ParseFailure
+
+
+@dataclass(frozen=True, slots=True)
+class FakeInvocation:
+    """One recorded call to :meth:`FakeAgentClient.invoke` or ``invoke_text``."""
+
+    method: Literal["invoke", "invoke_text"]
+    kind: str
+    workspace: Path
+    system_prompt: str
+    user_prompt: str
+    round_label: str | None
+    response_cls: type[BaseModel] | None
+    env: dict[str, str] | None
+    invocation_id: str | None
+    progress: AgentProgress | None
+    tool_servers: list[ToolServerDescriptor] | None
+    reuse_session: bool | None
+    session_key: AgentSessionKey | None
+
+
+@dataclass(slots=True)
+class _FailureState:
+    """Mutable countdown for a configured :meth:`FakeAgentClient.fail`."""
+
+    exc: BaseException
+    #: ``None`` means "raise forever"; otherwise the number of remaining calls
+    #: that still raise before the client resumes normal responses.
+    remaining: int | None
+
+
+def _materialize_response(source: ResponseSource, invocation: FakeInvocation) -> ResponseValue:
+    """Resolve a configured structured-response source, calling it if callable."""
+    if isinstance(source, BaseModel | dict):
+        return source
+    return source(invocation)
+
+
+def _materialize_text(source: TextSource, invocation: FakeInvocation) -> str:
+    """Resolve a configured text source, calling it if callable."""
+    if isinstance(source, str):
+        return source
+    return source(invocation)
+
+
+_PopT = TypeVar("_PopT")
+
+
+def _refuse_flood(text: str) -> None:
+    """End the turn as production does when its reply passes the declared reply limits."""
+    refusal = reply_breach(text)
+    if refusal is not None:
+        raise AgentOutputSchemaError(refusal)
+
+
+def _pop(queues: dict[str, list[_PopT]], kind: str) -> _PopT | None:
+    """Pop and return ``kind``'s next queued item, or ``None`` if empty/absent."""
+    queue = queues.get(kind)
+    if not queue:
+        return None
+    return queue.pop(0)
+
+
+def _turn_in_flight[**P, R](
+    method: Callable[Concatenate[FakeAgentClient, P], R],
+) -> Callable[Concatenate[FakeAgentClient, P], R]:
+    """Mark the wrapped call as a turn in flight, for :meth:`FakeAgentClient.steer`.
+
+    When the turn ends, every steer the fake accepted and was scripted to
+    refuse is handed back through its ``on_rejected``, as a provider refusing
+    an accepted message would.
+    """
+
+    @functools.wraps(method)
+    def run(self: FakeAgentClient, *args: P.args, **kwargs: P.kwargs) -> R:
+        self._begin_turn()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._end_turn()
+
+    return run
+
+
+class FakeAgentClient:
+    """Configurable in-memory double for :class:`~vs_agent.contracts.AgentClientProtocol`.
+
+    With no configured response, ``invoke`` raises ``AgentOutputSchemaError`` and
+    ``invoke_text`` returns a fixed default sentence. Configured through the
+    chained ``enqueue``/``set_*``/
+    ``fail``/``on_invoke`` methods, it can return specific responses per agent
+    ``kind``, fail on demand, stream output through the injected event sink,
+    and track provider-session reuse.
+    """
+
+    backend_name = "fake"
+
+    def __init__(  # noqa: PLR0913  # lint-waiver: LW-010177 [PLR0913]; Preserve FakeAgentClient.__init__'s named-argument contract because callers pass these independent settings directly.
+        self,
+        *,
+        backend_name: str = "fake",
+        provider: str | None = "fake",
+        model: str | None = None,
+        session_reuse: bool = False,
+        capabilities: AgentCapabilities | None = None,
+        event_sink: AgentEventSink = NULL_AGENT_EVENT_SINK,
+        session_store: SessionStore | None = None,
+        skill_selection: SkillSelection = NULL_SKILL_SELECTION,
+        log_dir: Path | None = None,
+        threads: Threads | None = None,
+    ) -> None:
+        """Create a fake client; see the class docstring for defaults.
+
+        With ``log_dir`` every dispatched turn, failed or not, appends one row to its
+        ``usage.jsonl``, as the production client does; ``set_usage`` fills the row's
+        token counts.
+
+        ``capabilities`` overrides the reported feature set (e.g. to report
+        ``tool_servers=True`` for a backend that hosts issue-tracker tools); when
+        omitted it is ``AgentCapabilities(session_reuse=session_reuse)``.
+        """
+        # Instance attribute shadows the class default so a test can report a
+        # different backend (e.g. "cli") without subclassing.
+        self.backend_name = backend_name
+        self._provider = provider
+        self._model = model
+        self._capabilities = (
+            capabilities
+            if capabilities is not None
+            else AgentCapabilities(session_reuse=session_reuse)
+        )
+        self._session_reuse = self._capabilities.session_reuse
+        self._sink = event_sink
+        self._session_store = session_store or NullSessionStore()
+        self._skill_selection = skill_selection
+        self._log_dir = log_dir
+        self._usage = AgentUsage()
+        self._default_text: TextSource = DEFAULT_TEXT
+
+        self.calls: list[FakeInvocation] = []
+        #: Streams passed to :meth:`set_log_file`, in call order, so a test can
+        #: assert the run logger was wired to the client.
+        self.log_files: list[object] = []
+
+        self._queues: dict[str, list[QueuedResponse]] = {}
+        self._constants: dict[str, ResponseSource] = {}
+        self._text_queues: dict[str, list[TextSource]] = {}
+        self._text_constants: dict[str, TextSource] = {}
+        self._failures: dict[str, _FailureState] = {}
+        self._model_for_kind: dict[str, str] = {}
+        self._stream_chunks: dict[str, list[str]] = {}
+        self._on_invoke_callbacks: list[Callable[[FakeInvocation], None]] = []
+
+        self._sessions: dict[AgentSessionKey, str] = {}
+        self._last_turn_sessions: dict[AgentSessionKey, str] = {}
+        self._raw_fingerprints: dict[AgentSessionKey, str] = {}
+
+        #: Messages accepted mid-turn by :meth:`steer`, in order.
+        self.steers: list[str] = []
+        self._steer_outcome = SteerOutcome.UNSUPPORTED
+        self._refuses_accepted_steers = False
+        self._refusals: list[Callable[[], None]] = []
+        self._turns_in_flight = 0
+        threads = threads or OsThreads()
+        self._steer_lock = threads.lock()
+
+        self._capacity_gate: CapacityGate | None = None
+        self._closed = False
+        self.cancel_count = 0
+        self.cancelled_sessions: list[AgentSessionKey] = []
+        self.released_sessions: list[AgentSessionKey] = []
+        self._cancelled = threads.event()
+
+    # -- AgentClientProtocol: attribution ---------------------------------
+
+    @property
+    def capabilities(self) -> AgentCapabilities:
+        """Report the configured capability set (see ``capabilities`` ctor arg)."""
+        return self._capabilities
+
+    @property
+    def provider(self) -> str | None:
+        """Return the configured provider name (default ``"fake"``)."""
+        return self._provider
+
+    def model_for_kind(self, kind: str) -> str | None:
+        """Return the per-kind model override, falling back to the ctor model."""
+        return self._model_for_kind.get(kind, self._model)
+
+    def provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Return the id minted or seeded for ``session_key``, else ``None``."""
+        cached = self._sessions.get(session_key)
+        checkpoint = self._session_store.get(session_key)
+        return (
+            cached if cached is not None else None if checkpoint is None else checkpoint.session_id
+        )
+
+    def last_turn_provider_session_id(self, session_key: AgentSessionKey) -> str | None:
+        """Return the id used on ``session_key``'s last turn, else ``None``."""
+        return self._last_turn_sessions.get(session_key)
+
+    def set_log_file(self, stream: object) -> None:
+        """Record the retarget stream (in ``log_files``); emit no file logs."""
+        self.log_files.append(stream)
+
+    @property
+    def closed(self) -> bool:
+        """Whether :meth:`close` has been called (observable teardown)."""
+        return self._closed
+
+    def close(self) -> None:
+        """Mark this client closed. Idempotent, like every ``close()``."""
+        self._closed = True
+
+    def cancel(self) -> None:
+        """Record a cancellation request and release turns waiting for one."""
+        self.cancel_count += 1
+        self._cancelled.set()
+
+    # -- optional capability: steering a running turn ---------------------------
+
+    def set_steering(self, outcome: SteerOutcome, *, refuses_after_accepting: bool = False) -> Self:
+        """Script how :meth:`steer` answers while a turn is in flight.
+
+        The default is ``UNSUPPORTED``, like a provider on a one-shot transport.
+        With ``refuses_after_accepting`` a ``DELIVERED`` message is handed back
+        through its ``on_rejected`` when the turn ends.
+        """
+        self._steer_outcome = outcome
+        self._refuses_accepted_steers = refuses_after_accepting
+        return self
+
+    def steer(self, text: str, *, on_rejected: Callable[[], None]) -> SteerOutcome:
+        """Offer *text* to the turn in flight, answering as scripted."""
+        with self._steer_lock:
+            if self._turns_in_flight == 0:
+                return SteerOutcome.NO_RUNNING_TURN
+            outcome = self._steer_outcome
+            if outcome is SteerOutcome.DELIVERED:
+                self.steers.append(text)
+                if self._refuses_accepted_steers:
+                    self._refusals.append(on_rejected)
+            return outcome
+
+    def _begin_turn(self) -> None:
+        with self._steer_lock:
+            self._turns_in_flight += 1
+
+    def _end_turn(self) -> None:
+        with self._steer_lock:
+            self._turns_in_flight -= 1
+            refusals, self._refusals = self._refusals, []
+        for refusal in refusals:
+            refusal()
+
+    def cancel_session(self, key: AgentSessionKey) -> None:
+        """Record a cancellation of one key and release turns waiting for a cancellation."""
+        self.cancelled_sessions.append(key)
+        self._cancelled.set()
+
+    def release_session(self, key: AgentSessionKey) -> None:
+        """Drop the live conversation of *key*; its stored checkpoint survives."""
+        self.released_sessions.append(key)
+        self._sessions.pop(key, None)
+
+    def wait_cancelled(self, timeout: float) -> bool:
+        """Block until :meth:`cancel` is called; return whether it was.
+
+        A scripted response calls this to model a long provider turn that
+        only a cancellation ends, as the production client's process kill
+        does. *timeout* is a deadlock guard, not a verdict.
+        """
+        return self._cancelled.wait(timeout)
+
+    # -- configuration (each returns self for chaining) --------------------
+
+    def enqueue(self, kind: str, *responses: ResponseSource) -> Self:
+        """Queue structured responses ``invoke(kind=kind, ...)`` pops in order."""
+        self._queues.setdefault(kind, []).extend(responses)
+        return self
+
+    def set_response(self, kind: str, response: ResponseSource) -> Self:
+        """Set the constant structured response used once ``kind``'s queue empties."""
+        self._constants[kind] = response
+        return self
+
+    def enqueue_text(self, kind: str, *texts: TextSource) -> Self:
+        """Queue plain-text responses ``invoke_text(kind=kind, ...)`` pops in order."""
+        self._text_queues.setdefault(kind, []).extend(texts)
+        return self
+
+    def set_text(self, kind: str | None, text: TextSource) -> Self:
+        """Set the constant text for ``kind``, or the module-wide default if ``None``."""
+        if kind is None:
+            self._default_text = text
+        else:
+            self._text_constants[kind] = text
+        return self
+
+    def fail(self, kind: str, exc: BaseException, *, times: int | None = None) -> Self:
+        """Raise ``exc`` from ``invoke``/``invoke_text`` calls of ``kind``.
+
+        ``exc`` may be any ``BaseException`` so a test can simulate cancellation
+        (``KeyboardInterrupt``) as faithfully as an ordinary error. ``times=None``
+        fails forever; otherwise the next ``times`` calls fail and the client
+        then resumes normal responses.
+        """
+        self._failures[kind] = _FailureState(exc=exc, remaining=times)
+        return self
+
+    def enqueue_parse_failure(self, kind: str, *, count: int = 1) -> Self:
+        """Queue ``count`` parse failures for ``invoke(kind=...)``, in call order.
+
+        Models the real client emitting output the loop cannot parse into
+        ``response_cls``: that turn raises ``AgentOutputSchemaError``, as the
+        real client does, and keeps the session. A scripted dict that does
+        not validate raises the same error, naming its fields. Queued positionally
+        alongside :meth:`enqueue`, so ``enqueue(kind, ok).enqueue_parse_failure(kind)``
+        makes the first turn succeed and the second parse-fail. The call is
+        still recorded. Only affects :meth:`invoke`, not :meth:`invoke_text`.
+        """
+        self._queues.setdefault(kind, []).extend([_PARSE_FAILURE] * count)
+        return self
+
+    def set_attribution(
+        self,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> Self:
+        """Override attribution props; only the given (non-``None``) fields change."""
+        if provider is not None:
+            self._provider = provider
+        if model is not None:
+            self._model = model
+        return self
+
+    def set_usage(self, usage: AgentUsage) -> Self:
+        """Report ``usage`` for every turn from now on (the default reports none)."""
+        self._usage = usage
+        return self
+
+    def set_model_for_kind(self, mapping: dict[str, str]) -> Self:
+        """Set per-kind model overrides, merged into any already configured."""
+        self._model_for_kind.update(mapping)
+        return self
+
+    def set_capabilities(self, capabilities: AgentCapabilities) -> Self:
+        """Replace the reported capability set (e.g. to enable ``tool_servers``)."""
+        self._capabilities = capabilities
+        self._session_reuse = capabilities.session_reuse
+        return self
+
+    def set_session(
+        self,
+        session_key: AgentSessionKey,
+        *,
+        provider_session_id: str | None = None,
+        last_turn: str | None = None,
+    ) -> Self:
+        """Seed session ids for ``session_key`` without an invoke minting them."""
+        if provider_session_id is not None:
+            self._sessions[session_key] = provider_session_id
+        if last_turn is not None:
+            self._last_turn_sessions[session_key] = last_turn
+        return self
+
+    def evict_session(self, session_key: AgentSessionKey) -> Self:
+        """Forget ``session_key``'s ids, so ``provider_session_id`` reports ``None``.
+
+        Models a provider conversation retiring: after this the next
+        ``reuse_session`` turn mints a fresh id instead of continuing.
+        """
+        self._sessions.pop(session_key, None)
+        self._last_turn_sessions.pop(session_key, None)
+        self._session_store.clear(session_key)
+        return self
+
+    def stream_output(self, kind: str, chunks: Sequence[str]) -> Self:
+        """Emit ``chunks`` through the event sink on every future call of ``kind``."""
+        self._stream_chunks[kind] = list(chunks)
+        return self
+
+    def on_invoke(self, callback: Callable[[FakeInvocation], None]) -> Self:
+        """Register ``callback`` to run, in registration order, on every call."""
+        self._on_invoke_callbacks.append(callback)
+        return self
+
+    # -- FakeInvocation lookup ----------------------------------------------
+
+    def calls_for(self, kind: str) -> list[FakeInvocation]:
+        """Return recorded calls whose ``kind`` matches, in call order."""
+        return [call for call in self.calls if call.kind == kind]
+
+    # -- AgentClientProtocol: turns ------------------------------------------
+
+    @_turn_in_flight
+    def run(
+        self,
+        *,
+        session_spec: AgentSessionSpec,
+        turn: AgentTurnRequest,
+        session_key: AgentSessionKey | None = None,
+        observer: AgentObserver | None = None,
+    ) -> AgentTurnResult:
+        """Execute a raw turn with the same scripts and strict identity fences."""
+        fingerprint = session_spec_fingerprint(session_spec)
+        if turn.require_provider_checkpoint and (session_key is None or not session_key.durable):
+            raise SessionResumeError(
+                str(session_key), "strict continuation requires a durable session key"
+            )
+        if turn.require_provider_checkpoint and not self.capabilities.provider_session_resume:
+            raise SessionResumeError(str(session_key), "provider cannot resume durable sessions")
+        self._prepare_raw_turn(session_spec, turn, session_key, fingerprint)
+        tools: list[ToolServerDescriptor] = [
+            StdioServerDescriptor(
+                server.name, server.command, server.args, server.env, server.runtime_env
+            )
+            for server in session_spec.mcp_servers
+        ]
+        invocation = self._record(
+            method="invoke_text" if turn.output_schema is None else "invoke",
+            kind=session_spec.role,
+            workspace=session_spec.workspace,
+            system_prompt=turn.instructions,
+            user_prompt=turn.message,
+            round_label=turn.label,
+            response_cls=turn.output_schema,
+            env=dict(session_spec.environment),
+            invocation_id=turn.invocation_id,
+            progress=None,
+            tool_servers=tools,
+            reuse_session=True,
+            session_key=session_key,
+        )
+        self._write_usage(
+            session_spec.role, turn.label, session_spec.model, session_spec.reasoning_effort
+        )
+        self._maybe_raise(session_spec.role, turn.message, turn.label, turn.invocation_id)
+        self._update_session(reuse_session=True, session_key=session_key)
+        if session_key is not None:
+            self._raw_fingerprints[session_key] = fingerprint
+            # The provider hands out the conversation id with the turn, so it is on record
+            # even when the reply that follows is rejected: a restarted host continues it.
+            self._record_raw_checkpoint(
+                session_spec, session_key, fingerprint, self.provider_session_id(session_key)
+            )
+        self._emit_stream(session_spec.role, invocation)
+        text = (
+            self._resolve_text(session_spec.role, invocation)
+            if turn.output_schema is None
+            else self._resolve_response(
+                session_spec.role, invocation, turn.output_schema
+            ).model_dump_json()
+        )
+        _refuse_flood(text)
+        result = AgentTurnResult(
+            text=text,
+            provider_session_id=(
+                None if session_key is None else self.provider_session_id(session_key)
+            ),
+        )
+        if observer is not None:
+            for chunk in self._stream_chunks.get(session_spec.role) or [text]:
+                observer.on_event(AgentEvent(kind=AgentEventKind.TEXT, text=chunk))
+        return result
+
+    def _prepare_raw_turn(
+        self,
+        session_spec: AgentSessionSpec,
+        turn: AgentTurnRequest,
+        session_key: AgentSessionKey | None,
+        fingerprint: str,
+    ) -> None:
+        """Fence continuation identity, then materialize skills for a new spec."""
+        expected = turn.expected_provider_session_id
+        if expected is None and turn.require_provider_checkpoint and session_key is not None:
+            expected = self.provider_session_id(session_key)
+        if expected is not None:
+            self._validate_raw_continuation(session_key, expected, fingerprint)
+        elif session_key is not None:
+            checkpoint = self._session_store.get(session_key)
+            known_fingerprint = self._raw_fingerprints.get(
+                session_key, None if checkpoint is None else checkpoint.spec_fingerprint
+            )
+            if known_fingerprint is not None and known_fingerprint != fingerprint:
+                self._sessions.pop(session_key, None)
+                self._session_store.clear(session_key)
+        if session_key is None or self._raw_fingerprints.get(session_key) != fingerprint:
+            materialize_skills(
+                session_spec.workspace,
+                list(session_spec.skills),
+                selection=self._skill_selection,
+                event_sink=self._sink,
+            )
+
+    def _record_raw_checkpoint(
+        self,
+        session_spec: AgentSessionSpec,
+        session_key: AgentSessionKey | None,
+        fingerprint: str,
+        provider_session_id: str | None,
+    ) -> None:
+        """Persist the provider session id a raw turn produced."""
+        if session_key is None or provider_session_id is None:
+            return
+        self._session_store.record(
+            session_key,
+            spec_fingerprint=fingerprint,
+            provider=session_spec.provider,
+            model=session_spec.model,
+            session_id=provider_session_id,
+            role=session_spec.role,
+        )
+
+    def _validate_raw_continuation(
+        self, key: AgentSessionKey | None, expected: str, fingerprint: str
+    ) -> None:
+        if key is None or not key.durable or not self.capabilities.provider_session_resume:
+            raise SessionResumeError(
+                str(key), "strict continuation requires durable session capability"
+            )
+        if self.provider_session_id(key) != expected:
+            raise SessionResumeError(str(key), "provider checkpoint identity changed")
+        checkpoint = self._session_store.get(key)
+        known_fingerprint = self._raw_fingerprints.get(
+            key, None if checkpoint is None else checkpoint.spec_fingerprint
+        )
+        if known_fingerprint != fingerprint:
+            raise SessionResumeError(str(key), "session specification changed")
+
+    @_turn_in_flight
+    def invoke(  # noqa: PLR0913  # lint-waiver: LW-010178 [PLR0913]; Preserve FakeAgentClient.invoke's named-argument contract because callers pass these independent settings directly.
+        self,
+        *,
+        kind: str,
+        workspace: Path,
+        system_prompt: str,
+        user_prompt: str,
+        response_cls: type[T],
+        round_label: str,
+        env: dict[str, str] | None = None,
+        invocation_id: str | None = None,
+        progress: AgentProgress | None = None,
+        tool_servers: list[ToolServerDescriptor] | None = None,
+        reuse_session: bool | None = None,
+        session_key: AgentSessionKey | None = None,
+    ) -> T:
+        """Run one structured turn against the configured/scripted response."""
+        invocation = self._record(
+            method="invoke",
+            kind=kind,
+            workspace=workspace,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            round_label=round_label,
+            response_cls=response_cls,
+            env=env,
+            invocation_id=invocation_id,
+            progress=progress,
+            tool_servers=tool_servers,
+            reuse_session=reuse_session,
+            session_key=session_key,
+        )
+        self._write_usage(kind, round_label, self.model_for_kind(kind), None)
+        self._maybe_raise(kind, user_prompt, round_label, invocation_id)
+        self._update_session(reuse_session=reuse_session, session_key=session_key)
+        self._emit_stream(kind, invocation)
+        return self._resolve_response(kind, invocation, response_cls)
+
+    @_turn_in_flight
+    def invoke_text(  # noqa: PLR0913  # lint-waiver: LW-010179 [PLR0913]; Preserve FakeAgentClient.invoke_text's named-argument contract because callers pass these independent settings directly.
+        self,
+        *,
+        kind: str,
+        workspace: Path,
+        system_prompt: str,
+        user_prompt: str,
+        round_label: str,
+        env: dict[str, str] | None = None,
+        invocation_id: str | None = None,
+        progress: AgentProgress | None = None,
+        tool_servers: list[ToolServerDescriptor] | None = None,
+        reuse_session: bool | None = None,
+        session_key: AgentSessionKey | None = None,
+    ) -> str:
+        """Run one conversational turn against the configured/default text."""
+        invocation = self._record(
+            method="invoke_text",
+            kind=kind,
+            workspace=workspace,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            round_label=round_label,
+            response_cls=None,
+            env=env,
+            invocation_id=invocation_id,
+            progress=progress,
+            tool_servers=tool_servers,
+            reuse_session=reuse_session,
+            session_key=session_key,
+        )
+        self._write_usage(kind, round_label, self.model_for_kind(kind), None)
+        self._maybe_raise(kind, user_prompt, round_label, invocation_id)
+        self._update_session(reuse_session=reuse_session, session_key=session_key)
+        self._emit_stream(kind, invocation)
+        text = self._resolve_text(kind, invocation)
+        _refuse_flood(text)
+        return text
+
+    # -- internals ------------------------------------------------------------
+
+    def _record(  # noqa: PLR0913  # lint-waiver: LW-010180 [PLR0913]; Preserve FakeAgentClient._record's named-argument contract because callers pass these independent settings directly.
+        self,
+        *,
+        method: Literal["invoke", "invoke_text"],
+        kind: str,
+        workspace: Path,
+        system_prompt: str,
+        user_prompt: str,
+        round_label: str | None,
+        response_cls: type[BaseModel] | None,
+        env: dict[str, str] | None,
+        invocation_id: str | None,
+        progress: AgentProgress | None,
+        tool_servers: list[ToolServerDescriptor] | None,
+        reuse_session: bool | None,
+        session_key: AgentSessionKey | None,
+    ) -> FakeInvocation:
+        invocation = FakeInvocation(
+            method=method,
+            kind=kind,
+            workspace=workspace,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            round_label=round_label,
+            response_cls=response_cls,
+            env=env,
+            invocation_id=invocation_id,
+            progress=progress,
+            tool_servers=list(tool_servers) if tool_servers is not None else None,
+            reuse_session=reuse_session,
+            session_key=session_key,
+        )
+        self.calls.append(invocation)
+        for callback in self._on_invoke_callbacks:
+            callback(invocation)
+        return invocation
+
+    def _write_usage(
+        self, kind: str, round_label: str | None, model: str | None, reasoning_effort: str | None
+    ) -> None:
+        """Append the turn's usage row, before its outcome is known, like the real client."""
+        if self._log_dir is None:
+            return
+        append_usage_record(
+            self._log_dir,
+            kind=kind,
+            round_label=round_label,
+            provider=self._provider,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            usage=self._usage,
+            skills=AgentSkillUse(),
+            recorded_at=utc_datetime(_FAKE_EPOCH),
+        )
+
+    def set_capacity_gate(self, gate: CapacityGate) -> None:
+        """Route a scripted ``AgentQuotaError`` through ``gate``, as the real client does."""
+        self._capacity_gate = gate
+
+    def _maybe_raise(
+        self, kind: str, message: str, label: str | None, invocation_id: str | None
+    ) -> None:
+        """Raise the scripted failure; a quota limit waits at the gate and sends the turn again."""
+        stops = 0
+        while True:
+            try:
+                self._raise_scripted(kind)
+            except AgentQuotaError as error:
+                gate = self._capacity_gate
+                if gate is None:
+                    raise
+                stops += 1
+                request = AgentTurnRequest(
+                    message=message, label=label, invocation_id=invocation_id
+                )
+                gate.wait_for_capacity(error, request, role=kind, attempt=stops)
+            else:
+                return
+
+    def _raise_scripted(self, kind: str) -> None:
+        state = self._failures.get(kind)
+        if state is None:
+            return
+        if state.remaining is None:
+            raise state.exc
+        if state.remaining > 0:
+            state.remaining -= 1
+            raise state.exc
+
+    def _update_session(
+        self, *, reuse_session: bool | None, session_key: AgentSessionKey | None
+    ) -> None:
+        if not (self._session_reuse and reuse_session and session_key is not None):
+            return
+        session_id = self.provider_session_id(session_key)
+        if session_id is None:
+            session_id = f"fake-session-{uuid4()}"
+        self._sessions[session_key] = session_id
+        self._last_turn_sessions[session_key] = session_id
+
+    def _emit_stream(self, kind: str, invocation: FakeInvocation) -> None:
+        chunks = self._stream_chunks.get(kind)
+        if not chunks:
+            return
+        guard = ReplyGuard()
+        for chunk in chunks:
+            refusal = guard.feed(chunk)
+            if refusal is not None:
+                raise AgentOutputSchemaError(refusal)
+            self._sink.agent_output(
+                chunk,
+                channel="assistant",
+                agent_kind=kind,
+                round_label=invocation.round_label,
+                invocation_id=invocation.invocation_id,
+            )
+
+    def _resolve_response(
+        self,
+        kind: str,
+        invocation: FakeInvocation,
+        response_cls: type[T],
+    ) -> T:
+        source = _pop(self._queues, kind)
+        if isinstance(source, _ParseFailure):
+            raise AgentOutputSchemaError(_UNPARSEABLE)
+        if source is None:
+            source = self._constants.get(kind)
+        if source is None:
+            message = f"no scripted response for agent kind {kind!r}"
+            raise AgentOutputSchemaError(message)
+        value = _materialize_response(source, invocation)
+        if isinstance(value, BaseModel):
+            # Production only ever validates decoded JSON, so a scripted model
+            # takes the same path: an instance of the wrong type fails here
+            # exactly as the equivalent agent reply would.
+            value = value.model_dump(mode="json")
+        _refuse_flood(json.dumps(value))
+        try:
+            return response_cls.model_validate_json(json.dumps(value))
+        except ValidationError as error:
+            raise schema_error(error) from error
+
+    def _resolve_text(self, kind: str, invocation: FakeInvocation) -> str:
+        source = _pop(self._text_queues, kind)
+        if source is None:
+            source = self._text_constants.get(kind, self._default_text)
+        return _materialize_text(source, invocation)

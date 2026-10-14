@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from tests.server.support import build_server_parts
+from tests.server.support import REQUEST_TIME, auxiliary_agent_providers, build_server_parts
 
 from server.api.protocol import (
     ChatOptionsQuery,
@@ -18,21 +18,18 @@ from server.chat.manager import ChatAnswer, ChatThreadFactory, ChatThreadHandle
 from server.chat.options import ChatRunSettings
 from server.events import ChatData, ChatThreadCreatedData, EventType, RunEvent, make_event
 
+_TIMESTAMP = datetime(2026, 1, 1, tzinfo=UTC)
 
-def _factory(
-    calls: list[tuple[str, str | None, str | None, str | None]], answer: str
-) -> ChatThreadFactory:
-    def factory(
-        thread_id: str, driver: str | None, provider: str | None, model: str | None
-    ) -> ChatThreadHandle:
-        calls.append((thread_id, driver, provider, model))
+
+def _factory(calls: list[tuple[str, str | None, str | None]], answer: str) -> ChatThreadFactory:
+    def factory(thread_id: str, provider: str | None, model: str | None) -> ChatThreadHandle:
+        calls.append((thread_id, provider, model))
         return ChatThreadHandle(
             spec=ChatThreadCreatedData(
                 thread_id=thread_id,
-                driver=driver or "agentshim",
                 provider=provider or "codex",
                 model=model or "gpt-default",
-                created_at=datetime.now(UTC),
+                created_at=_TIMESTAMP,
             ),
             handler=lambda question: ChatAnswer(
                 text=f"{answer}: {question}", invocation_id=f"exec-{thread_id}"
@@ -48,25 +45,24 @@ def _events(path: Path) -> list[dict]:
     ]
 
 
-def test_created_thread_routes_chat_and_stamps_events(tmp_path):  # noqa: ANN001, ANN201
+def test_created_thread_routes_chat_and_stamps_events(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     parts.chat.install_default_handler(
         lambda question: ChatAnswer(text=f"default: {question}", invocation_id="exec-default")
     )
-    calls: list[tuple[str, str | None, str | None, str | None]] = []
-    parts.chat.set_thread_factory(_factory(calls, "omnigent-claude"))
+    calls: list[tuple[str, str | None, str | None]] = []
+    parts.chat.set_thread_factory(_factory(calls, "agentshim-claude"))
 
-    spec = parts.chat.create_thread(driver="omnigent", provider="claude", model="opus")
-    assert calls == [(spec.thread_id, "omnigent", "claude", "opus")]
+    spec = parts.chat.create_thread(provider="claude", model="opus")
+    assert calls == [(spec.thread_id, "claude", "opus")]
     assert parts.chat.chat("what changed?", thread_id=spec.thread_id) == (
-        "omnigent-claude: what changed?"
+        "agentshim-claude: what changed?"
     )
     assert parts.chat.chat("what changed?") == "default: what changed?"
 
     created = [event for event in _events(tmp_path) if event["type"] == "chat_thread_created"]
     assert len(created) == 1
     assert created[0]["chat_thread_id"] == spec.thread_id
-    assert created[0]["data"]["driver"] == "omnigent"
     assert created[0]["data"]["provider"] == "claude"
     assert created[0]["data"]["model"] == "opus"
     chats = [event for event in _events(tmp_path) if event["type"] == "chat"]
@@ -74,7 +70,7 @@ def test_created_thread_routes_chat_and_stamps_events(tmp_path):  # noqa: ANN001
     assert chats[0]["agent_kind"] == "chat"
 
 
-def test_chat_records_carry_the_answering_invocation_id(tmp_path):  # noqa: ANN001, ANN201
+def test_chat_records_carry_the_answering_invocation_id(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     parts.chat.install_default_handler(
         lambda question: ChatAnswer(text=f"default: {question}", invocation_id="exec-default")
@@ -94,7 +90,7 @@ def test_chat_records_carry_the_answering_invocation_id(tmp_path):  # noqa: ANN0
     ]
 
 
-def test_fallback_answers_take_fresh_invocation_identities(tmp_path):  # noqa: ANN001, ANN201
+def test_fallback_answers_take_fresh_invocation_identities(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
 
     parts.chat.chat("what happened?")
@@ -109,35 +105,36 @@ def test_fallback_answers_take_fresh_invocation_identities(tmp_path):  # noqa: A
     assert len(set(ids)) == len(ids) == 2
 
 
-def test_unknown_thread_returns_clear_answer_without_event(tmp_path):  # noqa: ANN001, ANN201
+def test_unknown_thread_returns_clear_answer_without_event(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     answer = parts.chat.chat("hello?", thread_id="missing-thread")
     assert "Unknown experiment chat thread 'missing-thread'" in answer
     assert all(event["type"] != "chat" for event in _events(tmp_path))
 
 
-def test_thread_creation_without_factory_is_rejected(tmp_path):  # noqa: ANN001, ANN201
+def test_thread_creation_without_factory_is_rejected(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     with pytest.raises(RuntimeError, match="chat threads are not available"):
         parts.chat.create_thread()
 
 
-def test_factory_validation_error_propagates_without_event(tmp_path):  # noqa: ANN001, ANN201
+def test_factory_validation_error_propagates_without_event(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
 
     def rejecting_factory(*_args: object) -> ChatThreadHandle:
-        raise ValueError("agent driver 'omnigent' does not support provider 'gemini'")  # noqa: TRY003
+        _failure_message = "agent provider 'unknown' is not supported"
+        raise ValueError(_failure_message)
 
     parts.chat.set_thread_factory(rejecting_factory)
-    with pytest.raises(ValueError, match="does not support provider 'gemini'"):
-        parts.chat.create_thread(driver="omnigent", provider="gemini")
+    with pytest.raises(ValueError, match="provider 'unknown' is not supported"):
+        parts.chat.create_thread(provider="unknown")
     assert all(event["type"] != "chat_thread_created" for event in _events(tmp_path))
 
 
-def test_threads_replay_and_rebuild_on_demand(tmp_path):  # noqa: ANN001, ANN201
+def test_threads_replay_and_rebuild_on_demand(tmp_path: Path) -> None:
     first = build_server_parts(tmp_path)
     first.chat.set_thread_factory(_factory([], "first"))
-    spec = first.chat.create_thread(driver="agentshim", provider="claude")
+    spec = first.chat.create_thread(provider="claude")
     assert first.chat.chat("why did round two regress so much?", thread_id=spec.thread_id)
 
     resumed = build_server_parts(tmp_path)
@@ -146,13 +143,13 @@ def test_threads_replay_and_rebuild_on_demand(tmp_path):  # noqa: ANN001, ANN201
     assert replayed[0].title == "why did round two regress so much?"
     assert "cannot answer right now" in resumed.chat.chat("still there?", thread_id=spec.thread_id)
 
-    calls: list[tuple[str, str | None, str | None, str | None]] = []
+    calls: list[tuple[str, str | None, str | None]] = []
     resumed.chat.set_thread_factory(_factory(calls, "rebuilt"))
     assert resumed.chat.chat("still there?", thread_id=spec.thread_id) == ("rebuilt: still there?")
-    assert calls == [(spec.thread_id, "agentshim", "claude", "gpt-default")]
+    assert calls == [(spec.thread_id, "claude", "gpt-default")]
 
 
-def test_first_message_titles_an_untitled_thread_once(tmp_path):  # noqa: ANN001, ANN201
+def test_first_message_titles_an_untitled_thread_once(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     parts.chat.set_thread_factory(_factory([], "answer"))
     spec = parts.chat.create_thread()
@@ -166,7 +163,7 @@ def test_first_message_titles_an_untitled_thread_once(tmp_path):  # noqa: ANN001
     assert parts.chat.threads()[0].title == "explain why the benchmark throughput…"
 
 
-def test_explicit_title_is_authoritative(tmp_path):  # noqa: ANN001, ANN201
+def test_explicit_title_is_authoritative(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     parts.chat.set_thread_factory(_factory([], "answer"))
     spec = parts.chat.create_thread(title="  perf deep dive  ")
@@ -178,7 +175,7 @@ def test_explicit_title_is_authoritative(tmp_path):  # noqa: ANN001, ANN201
     assert parts.chat.threads()[0].title == "perf deep dive"
 
 
-def test_cleared_threads_stop_routing_but_keep_replayable_specs(tmp_path):  # noqa: ANN001, ANN201
+def test_cleared_threads_stop_routing_but_keep_replayable_specs(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     parts.chat.set_thread_factory(_factory([], "answer"))
     spec = parts.chat.create_thread()
@@ -188,18 +185,19 @@ def test_cleared_threads_stop_routing_but_keep_replayable_specs(tmp_path):  # no
     assert [thread.thread_id for thread in parts.chat.threads()] == [spec.thread_id]
 
 
-def test_api_creates_threads_and_routes_threaded_chat(tmp_path):  # noqa: ANN001, ANN201
+def test_api_creates_threads_and_routes_threaded_chat(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     parts.chat.set_thread_factory(_factory([], "thread-agent"))
 
-    created = parts.api.execute(ChatThreadCreateQuery(provider="claude"))
+    created = parts.api.execute(ChatThreadCreateQuery(timestamp=REQUEST_TIME, provider="claude"))
     assert created.chat_thread is not None
     assert created.chat_thread.provider == "claude"
-    assert created.chat_thread.driver == "agentshim"
     assert any(event.type is EventType.CHAT_THREAD_CREATED for event in created.events)
 
     response = parts.api.execute(
-        ChatQuery(text="what changed?", thread_id=created.chat_thread.thread_id)
+        ChatQuery(
+            timestamp=REQUEST_TIME, text="what changed?", thread_id=created.chat_thread.thread_id
+        )
     )
     assert response.chat is not None
     assert response.chat.answer == "thread-agent: what changed?"
@@ -209,19 +207,24 @@ def test_api_creates_threads_and_routes_threaded_chat(tmp_path):  # noqa: ANN001
     ]
 
 
-def test_chat_options_group_by_provider_and_mark_run_model(tmp_path):  # noqa: ANN001, ANN201
+def test_chat_options_group_by_provider_and_mark_run_model(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
     parts.chat.set_run_settings(
         ChatRunSettings(
-            driver="omnigent",
             provider="codex",
             model="gpt-5.5-run",
+            agent_providers=auxiliary_agent_providers(),
             role_models=("gpt-5.6-outer", "gpt-5.5-run"),
         )
     )
-    options = parts.api.execute(ChatOptionsQuery()).chat_options
+    options = parts.api.execute(ChatOptionsQuery(timestamp=REQUEST_TIME)).chat_options
     assert options is not None
-    assert [group.provider for group in options.providers] == ["claude", "codex"]
+    assert [group.provider for group in options.providers] == [
+        "claude",
+        "codex",
+        "gemini",
+        "opencode",
+    ]
     assert "driver" not in options.model_dump()
 
     codex = next(group for group in options.providers if group.provider == "codex")
@@ -236,29 +239,35 @@ def test_chat_options_group_by_provider_and_mark_run_model(tmp_path):  # noqa: A
     assert not any(option.default for option in claude.models)
 
 
-def test_chat_options_are_absent_before_run_settings_attach(tmp_path):  # noqa: ANN001, ANN201
-    response = build_server_parts(tmp_path).api.execute(ChatOptionsQuery())
+def test_chat_options_are_absent_before_run_settings_attach(tmp_path: Path) -> None:
+    response = build_server_parts(tmp_path).api.execute(ChatOptionsQuery(timestamp=REQUEST_TIME))
     assert response.ok is True
     assert response.chat_options is None
 
 
-def test_api_passes_optional_thread_choices_to_factory(tmp_path):  # noqa: ANN001, ANN201
+def test_api_passes_optional_thread_choices_to_factory(tmp_path: Path) -> None:
     parts = build_server_parts(tmp_path)
-    calls: list[tuple[str, str | None, str | None, str | None]] = []
+    calls: list[tuple[str, str | None, str | None]] = []
     parts.chat.set_thread_factory(_factory(calls, "thread-agent"))
 
-    created = parts.api.execute(ChatThreadCreateQuery(provider="claude", model="opus"))
+    created = parts.api.execute(
+        ChatThreadCreateQuery(timestamp=REQUEST_TIME, provider="claude", model="opus")
+    )
     assert created.chat_thread is not None
-    assert calls == [(created.chat_thread.thread_id, None, "claude", "opus")]
-    assert created.chat_thread.driver == "agentshim"
+    assert calls == [(created.chat_thread.thread_id, "claude", "opus")]
 
 
 def test_chat_thread_wire_shapes_round_trip() -> None:
-    request = ChatThreadCreateQuery(driver="omnigent", provider="codex", model="o4", title="t")
+    request = ChatThreadCreateQuery(timestamp=REQUEST_TIME, provider="codex", model="o4", title="t")
     assert ChatThreadCreateQuery.model_validate_json(request.model_dump_json()) == request
-    query = ChatQuery(text="why?", thread_id="thread-1")
+    query = ChatQuery(timestamp=REQUEST_TIME, text="why?", thread_id="thread-1")
     assert ChatQuery.model_validate_json(query.model_dump_json()) == query
-    assert ChatQuery.model_validate({"type": "query.chat", "text": "why?"}).thread_id is None
+    assert (
+        ChatQuery.model_validate(
+            {"type": "query.chat", "timestamp": REQUEST_TIME.isoformat(), "text": "why?"}
+        ).thread_id
+        is None
+    )
 
     event = make_event(
         EventType.CHAT_THREAD_CREATED,
@@ -266,11 +275,11 @@ def test_chat_thread_wire_shapes_round_trip() -> None:
         agent_kind="chat",
         data=ChatThreadCreatedData(
             thread_id="thread-1",
-            driver="agentshim",
             provider="claude",
             model="opus",
-            created_at=datetime.now(UTC),
+            created_at=_TIMESTAMP,
         ),
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
     )
     restored = RunEvent.model_validate_json(event.model_dump_json())
     assert restored.chat_thread_id == "thread-1"
@@ -282,6 +291,7 @@ def test_chat_thread_wire_shapes_round_trip() -> None:
         "why?",
         chat_thread_id="thread-1",
         data=ChatData(answer="because", thread_title="why?"),
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
     )
     restored_chat = RunEvent.model_validate_json(chat_event.model_dump_json())
     assert isinstance(restored_chat.data, ChatData)
@@ -289,10 +299,10 @@ def test_chat_thread_wire_shapes_round_trip() -> None:
 
     response = Response.model_validate_json(
         Response(
+            timestamp=REQUEST_TIME,
             request_id="r1",
             chat_thread=ChatThreadInfo(
                 thread_id="thread-1",
-                driver="agentshim",
                 provider="claude",
                 model="opus",
             ),
@@ -300,3 +310,11 @@ def test_chat_thread_wire_shapes_round_trip() -> None:
     )
     assert response.chat_thread is not None
     assert response.chat_thread.thread_id == "thread-1"
+
+
+@pytest.mark.parametrize("thread_id", ["../outside", "con"])
+def test_chat_query_rejects_a_nonportable_thread_identity(thread_id: str) -> None:
+    with pytest.raises(ValueError, match="invalid experiment chat thread identity") as error:
+        ChatQuery(timestamp=REQUEST_TIME, text="why?", thread_id=thread_id)
+
+    assert repr(thread_id) in str(error.value)

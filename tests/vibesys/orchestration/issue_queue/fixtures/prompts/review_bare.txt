@@ -1,0 +1,47 @@
+Review issue #7: [feature] Implement streaming
+
+## Acceptance criteria
+- stream non-empty token deltas
+
+Implementer summary: Done.
+Implementer self-check: <none>
+
+Reference: .
+Objective: Build the candidate.
+Accuracy command: <not configured>
+Benchmark command: <not configured>
+Runtime notes: <none>
+
+Performance improvement is out of scope for this verdict. Inspect the candidate without
+editing it, run its focused automated tests, and use the accuracy checker when one is configured. A
+failing required correctness check requires a fail verdict.
+
+Exercise the changed behavior through the public interface declared by the objective and issue.
+When the benchmark is configured, run a short sanity workload and require a successful,
+well-formed result without judging the issue on performance improvement.
+
+For an unrelated bug, check the board below first and report at most one bug in `new_issues`
+(type `bug`), with `## Background`, `## Acceptance criteria` and `## Notes` in its
+description. Never report performance suggestions.
+
+Board:
+none yet
+
+
+Return exactly one JSON object matching:
+{"reply":{"analysis": "...", "feedback": "...", "verdict": "pass" | "fail",
+ "new_issues": [{"type": "bug", "title": "...", "description": "..."}]}}
+Feedback must be empty on pass.
+
+You may measure your own workspace before you reply: call `submit_evaluation` on the
+`evaluation` tool. The framework decides whether the submission is admitted and counts
+a new candidate against the run's budget; a refusal names the reason, so change the
+workspace or stop submitting. A candidate with the same content is evaluated once for
+this workstream, whoever asks: if the implementer or the reviewer already submitted it,
+the call returns that evaluation's handle (`"repeat": true`) and charges nothing. A
+reply with an `outcome` is an evaluation that has already ended, and lists its `evidence`
+ids as a resume would: do not wait for it. A successful call returns a handle. To wait for the
+result, call `validate_evaluation_wait` with every handle you need, then finish the
+turn with only `{"reply":{"kind":"waiting_for_evaluation","handles":["<handle>"]}}`. Do not
+poll: the host resumes this same session once every listed measurement is terminal.
+A waiting turn uses no new attempt.

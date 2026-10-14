@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 
-import {type ChildProcess, spawn} from 'node:child_process';
+import {type ChildProcess, type SpawnOptions, spawn} from 'node:child_process';
 import {accessSync, closeSync, constants, openSync, realpathSync} from 'node:fs';
 import {access, mkdtemp, readFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {dirname, join} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {isThemeName, THEME_NAMES} from './ui/theme.js';
+import {isThemeName, THEME_NAMES} from './theme.js';
 
 const READY_TIMEOUT_MS = 30_000;
 const READY_POLL_INTERVAL_MS = 25;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 const BACKEND_EXIT_GRACE_MS = 2_000;
 const FRONTEND_EXIT_GRACE_MS = 2_000;
+const BACKEND_LOG_EXCERPT_LINES = 20;
+const BACKEND_DIAGNOSTIC_PREFIX = 'vibesys: ';
 
 export async function launch(argv: string[]): Promise<number> {
   const python = resolvePythonCommand();
@@ -49,25 +51,14 @@ export async function launch(argv: string[]): Promise<number> {
   const sessionDir = await mkdtemp(join(tmpdir(), 'vibesys-session-'));
   const socketPath = join(sessionDir, 'control.sock');
   const backendLogPath = join(sessionDir, 'backend.log');
-  const backendLogFd = openSync(backendLogPath, 'w');
+  let backendLogFd: number | undefined;
   let backendLogClosed = false;
-  const backendProcess = spawn(
-    python.command,
-    [...python.args, '-m', 'entrypoints.server', ...argv, '--control-socket', socketPath],
-    {
-      detached: true,
-      stdio: ['ignore', backendLogFd, backendLogFd],
-    },
-  );
-
+  let backendProcess: ChildProcess | undefined;
   let frontend: ChildProcess | undefined;
   const cleanup = async () => {
-    if (frontend && frontend.exitCode === null && frontend.signalCode === null) {
-      frontend.kill('SIGTERM');
-      await waitOrKill(frontend);
-    }
-    await terminateBackend(backendProcess);
-    if (!backendLogClosed) {
+    if (frontend) await terminateFrontend(frontend);
+    if (backendProcess) await terminateBackend(backendProcess);
+    if (backendLogFd !== undefined && !backendLogClosed) {
       backendLogClosed = true;
       closeSync(backendLogFd);
     }
@@ -80,26 +71,45 @@ export async function launch(argv: string[]): Promise<number> {
   };
   const disposeSignalCleanup = installSignalCleanup(runCleanup);
   try {
+    backendLogFd = openSync(backendLogPath, 'w');
+    const backendStart = beginChildStart(
+      python.command,
+      [...python.args, '-m', 'entrypoints.server', ...argv, '--control-socket', socketPath],
+      {
+        detached: true,
+        stdio: ['ignore', backendLogFd, backendLogFd],
+      },
+    );
+    backendProcess = backendStart.process;
+    const backendStartError = await backendStart.failure;
+    if (backendStartError) return reportChildStartFailure('backend', backendStartError);
+    const startedBackend = childProcessAfterSuccessfulStart(backendStart);
+
     // The frontend does its own connect retries, so it starts now and pays
     // its interpreter and renderer startup while the backend is still coming
     // up. Startup readiness is still watched here: only the launcher can see
     // a backend that dies before it ever listens, and report its log.
-    const startupFailed = watchBackendStartup(socketPath, backendProcess).then(ready => {
-      if (!ready && frontend) frontend.kill('SIGTERM');
-      return !ready;
-    });
-    frontend = spawn(runtime, [entrypoint], {
+    const frontendStart = beginChildStart(runtime, [entrypoint], {
       env: frontendEnvironment(socketPath, requestedTheme),
       stdio: 'inherit',
     });
+    frontend = frontendStart.process;
+    const frontendStartError = await frontendStart.failure;
+    if (frontendStartError) return reportChildStartFailure('frontend', frontendStartError);
+    const startedFrontend = childProcessAfterSuccessfulStart(frontendStart);
+    const startupFailed = watchBackendStartup(socketPath, startedBackend).then(ready => {
+      if (!ready) startedFrontend.kill('SIGTERM');
+      return !ready;
+    });
+
     const exitCode = await monitor(
-      frontend,
-      backendProcess,
+      startedFrontend,
+      startedBackend,
       Boolean(process.env['VIBESYS_RELEASE_SMOKE_MARKER']),
     );
     if (await startupFailed) {
-      await reportBackendFailure(backendProcess, backendLogPath);
-      return exitStatus(backendProcess) ?? 1;
+      await reportBackendFailure(startedBackend, backendLogPath);
+      return exitStatus(startedBackend) ?? 1;
     }
     return exitCode;
   } finally {
@@ -111,6 +121,50 @@ export async function launch(argv: string[]): Promise<number> {
 interface PythonCommand {
   command: string;
   args: string[];
+}
+
+interface ChildStart {
+  process: ChildProcess | undefined;
+  failure: Promise<Error | undefined>;
+}
+
+/** Start one interactive child and make its asynchronous spawn failure observable. */
+function beginChildStart(command: string, args: string[], options: SpawnOptions): ChildStart {
+  try {
+    const process = spawn(command, args, options);
+    return {process, failure: childStartError(process)};
+  } catch (error) {
+    return {process: undefined, failure: Promise.resolve(asError(error))};
+  }
+}
+
+function childStartError(process: ChildProcess): Promise<Error | undefined> {
+  return new Promise(resolve => {
+    const onSpawn = () => {
+      process.off('error', onError);
+      resolve(undefined);
+    };
+    const onError = (error: Error) => {
+      process.off('spawn', onSpawn);
+      resolve(error);
+    };
+    process.once('spawn', onSpawn);
+    process.once('error', onError);
+  });
+}
+
+function childProcessAfterSuccessfulStart(start: ChildStart): ChildProcess {
+  if (start.process) return start.process;
+  throw new Error('child start completed without a process');
+}
+
+function reportChildStartFailure(role: 'backend' | 'frontend', error: Error): number {
+  console.error(`vs: failed to start ${role}: ${error.message}`);
+  return 1;
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 /**
@@ -191,7 +245,12 @@ async function watchBackendStartup(socketPath: string, backend: ChildProcess): P
   return false;
 }
 
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: pre-existing; tracked: #288
+type MonitorAction =
+  | {kind: 'return'; code: number}
+  | {kind: 'wait-backend'; frontendCode: number}
+  | {kind: 'wait-frontend'; backendCode: number}
+  | {kind: 'continue'};
+
 async function monitor(
   frontend: ChildProcess,
   backend: ChildProcess,
@@ -200,41 +259,58 @@ async function monitor(
   while (true) {
     const frontendCode = exitStatus(frontend);
     const backendCode = exitStatus(backend);
-    if (frontendCode !== undefined) {
-      if (releaseSmokeMode && frontendCode === 0) return 0;
-      if (backendCode === undefined) {
-        const gracefulBackendCode = await waitForExit(backend, BACKEND_EXIT_GRACE_MS);
-        if (gracefulBackendCode === undefined) {
-          await terminateBackend(backend);
-          return frontendCode === 0 ? 0 : normalizeFrontendExit(frontendCode);
-        }
-        return frontendCode === 0 ? gracefulBackendCode : normalizeFrontendExit(frontendCode);
-      }
-      return frontendCode === 0 ? backendCode : normalizeFrontendExit(frontendCode);
+    const action = monitorAction(frontendCode, backendCode, releaseSmokeMode);
+    if (action.kind === 'return') return action.code;
+    if (action.kind === 'wait-backend') {
+      const gracefulBackendCode = await waitForExit(backend, BACKEND_EXIT_GRACE_MS);
+      return resolveFrontendExit(backend, action.frontendCode, gracefulBackendCode);
     }
-    if (backendCode !== undefined) {
-      // The backend never legitimately exits while the frontend is attached
-      // (it stays alive for post-run chat until the frontend ends the
-      // session), so this is always an unexpected backend death. Give the
-      // frontend a moment to exit on its own, then terminate it so the
-      // launcher's cleanup can run.
-      //
-      // This branch's safety depends on the backend never tearing down
-      // while a subscription is active or about to redial. Today
-      // `_client_disconnected` in `unix_jsonl.py` latches on the first
-      // mid-run drop and never unsticks on reconnect, so the backend can
-      // exit under a live client, violating that contract. Fixed by the
-      // reconnect-aware SubscriptionTracker in #588 (PR #602).
+    if (action.kind === 'wait-frontend') {
       const gracefulFrontendCode = await waitForExit(frontend, FRONTEND_EXIT_GRACE_MS);
-      if (gracefulFrontendCode === undefined) {
-        frontend.kill('SIGTERM');
-        await waitOrKill(frontend);
-        return backendCode;
-      }
-      return gracefulFrontendCode === 0 ? backendCode : normalizeFrontendExit(gracefulFrontendCode);
+      return resolveBackendExit(frontend, action.backendCode, gracefulFrontendCode);
     }
     await sleep(50);
   }
+}
+
+function monitorAction(
+  frontendCode: number | undefined,
+  backendCode: number | undefined,
+  releaseSmokeMode: boolean,
+): MonitorAction {
+  if (frontendCode !== undefined) {
+    if (releaseSmokeMode && frontendCode === 0) return {kind: 'return', code: 0};
+    if (backendCode === undefined) return {kind: 'wait-backend', frontendCode};
+    return {kind: 'return', code: combineExitCodes(frontendCode, backendCode)};
+  }
+  if (backendCode !== undefined) return {kind: 'wait-frontend', backendCode};
+  return {kind: 'continue'};
+}
+
+async function resolveFrontendExit(
+  backend: ChildProcess,
+  frontendCode: number,
+  gracefulBackendCode: number | undefined,
+): Promise<number> {
+  if (gracefulBackendCode !== undefined) return combineExitCodes(frontendCode, gracefulBackendCode);
+  await terminateBackend(backend);
+  return normalizeFrontendExit(frontendCode);
+}
+
+async function resolveBackendExit(
+  frontend: ChildProcess,
+  backendCode: number,
+  gracefulFrontendCode: number | undefined,
+): Promise<number> {
+  if (gracefulFrontendCode !== undefined)
+    return gracefulFrontendCode === 0 ? backendCode : normalizeFrontendExit(gracefulFrontendCode);
+  frontend.kill('SIGTERM');
+  await waitOrKill(frontend);
+  return backendCode;
+}
+
+function combineExitCodes(frontendCode: number, backendCode: number): number {
+  return frontendCode === 0 ? backendCode : normalizeFrontendExit(frontendCode);
 }
 
 async function terminateBackend(backend: ChildProcess): Promise<void> {
@@ -254,6 +330,13 @@ async function terminateBackend(backend: ChildProcess): Promise<void> {
   await waitForExit(backend);
 }
 
+async function terminateFrontend(frontend: ChildProcess): Promise<void> {
+  if (exitStatus(frontend) !== undefined) return;
+  if (frontend.pid === undefined) return;
+  frontend.kill('SIGTERM');
+  await waitOrKill(frontend);
+}
+
 async function waitOrKill(process: ChildProcess): Promise<void> {
   if ((await waitForExit(process, SHUTDOWN_TIMEOUT_MS)) !== undefined) return;
   process.kill('SIGKILL');
@@ -263,13 +346,21 @@ async function waitOrKill(process: ChildProcess): Promise<void> {
 async function reportBackendFailure(backend: ChildProcess, logPath: string): Promise<void> {
   const code = exitStatus(backend) ?? 1;
   console.error(`vs: backend exited with status ${code}`);
-  const tail = await readLogTail(logPath);
-  if (tail.length > 0) console.error(tail.join('\n'));
+  const excerpt = await readBackendLogExcerpt(logPath);
+  if (excerpt.length > 0) console.error(excerpt.join('\n'));
 }
 
-async function readLogTail(path: string): Promise<string[]> {
+/** Return a bounded startup excerpt with the backend's actionable diagnostics first. */
+async function readBackendLogExcerpt(path: string): Promise<string[]> {
   try {
-    return (await readFile(path, 'utf8')).split(/\r?\n/).slice(-20);
+    const lines = (await readFile(path, 'utf8')).split(/\r?\n/);
+    while (lines.at(-1) === '') lines.pop();
+    const diagnostics = lines.filter(line => line.startsWith(BACKEND_DIAGNOSTIC_PREFIX));
+    const prioritized = diagnostics.slice(-BACKEND_LOG_EXCERPT_LINES);
+    const remaining = BACKEND_LOG_EXCERPT_LINES - prioritized.length;
+    if (remaining === 0) return prioritized;
+    const context = lines.filter(line => !line.startsWith(BACKEND_DIAGNOSTIC_PREFIX));
+    return [...prioritized, ...context.slice(-remaining)];
   } catch {
     return [];
   }
