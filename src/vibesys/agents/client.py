@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, TypeVar
 from pydantic import BaseModel
 
 from vibesys.agent_runner import (
+    explain_parse_failure,
     log_and_print,
     log_json_and_print,
     log_prompt_markdown_and_print,
@@ -152,6 +153,21 @@ def _normalize_mcp_servers(
     return tuple(servers)
 
 
+# How many times a turn whose reply held no usable JSON object is asked for the
+# object again, in the same session, before the caller's fallback stands in.
+_REPLY_RETRIES = 2
+
+
+def _reply_again_prompt(response_cls: type[BaseModel], reason: str) -> str:
+    return (
+        f"Your previous reply did not contain a valid {response_cls.__name__} JSON "
+        f"object: {reason}. Reply now with exactly one JSON object that conforms to "
+        "the schema below, and nothing else: no prose before or after it, no markdown "
+        'fences. Inside string values escape every double quote as \\" and write '
+        "newlines as \\n."
+    )
+
+
 class AgentClient:
     """Run agent turns and own the resulting configured sessions.
 
@@ -276,6 +292,38 @@ class AgentClient:
         )
         label = agent_label(kind)
         parsed = parse_typed_response_text(result.text, response_cls)
+        # A reply without a usable object is nearly always a slip in the JSON
+        # itself (a quote left unescaped inside a string, a stray comma, a
+        # required field dropped): the work of the turn is done and sits in the
+        # conversation, so the same session is told what was wrong and asked
+        # for the object again. That costs seconds; the fallback below costs
+        # the round. An unkeyed turn closed its session and cannot be asked.
+        asked = 0
+        while (
+            parsed is None and (reuse_session is None or reuse_session) and asked < _REPLY_RETRIES
+        ):
+            asked += 1
+            reason = explain_parse_failure(result.text, response_cls)
+            log_and_print(
+                f"\n=== {label} ROUND OUTPUT (no {response_cls.__name__}: {reason}); "
+                f"asking again, {asked}/{_REPLY_RETRIES} ===",
+                self._run_log_file,
+            )
+            result, logger = self._invoke_turn(
+                kind=kind,
+                workspace=workspace,
+                system_prompt=system_prompt,
+                user_prompt=_reply_again_prompt(response_cls, reason),
+                output_schema=response_cls,
+                round_label=f"{round_label}-reply-{asked}",
+                env=env,
+                invocation_id=invocation_id,
+                progress=progress,
+                mcp_servers=mcp_servers,
+                reuse_session=True,
+                session_key=session_key,
+            )
+            parsed = parse_typed_response_text(result.text, response_cls)
         if parsed is None:
             log_and_print(f"\n=== {label} ROUND OUTPUT (missing response) ===", self._run_log_file)
             log_and_print(

@@ -677,7 +677,7 @@ def test_runtime_accessors_default_to_none_or_codex_when_unconfigured() -> None:
 
 
 def test_invoke_uses_fallback_only_for_unparseable_output(tmp_path: Path) -> None:
-    session = _FakeSession(results=[AgentTurnResult("not json")])
+    session = _FakeSession(results=[AgentTurnResult("not json")] * 3)  # the turn, two re-asks
     client = AgentClient(_FakeDriver([session]))
     fallback_calls = 0
 
@@ -698,3 +698,67 @@ def test_invoke_uses_fallback_only_for_unparseable_output(tmp_path: Path) -> Non
 
     assert response == _Response(answer="fallback")
     assert fallback_calls == 1
+
+
+def test_invoke_asks_the_same_session_again_when_the_reply_holds_no_object(tmp_path: Path) -> None:
+    session = _FakeSession(
+        results=[
+            AgentTurnResult('{"answer": "set {"x": 1} here"}'),  # a quote left unescaped
+            AgentTurnResult('{"answer": "fixed"}'),
+        ]
+    )
+    client = AgentClient(_FakeDriver([session]))
+
+    response = client.invoke(
+        kind="orchestrator",
+        workspace=tmp_path,
+        system_prompt="system",
+        user_prompt="user",
+        response_cls=_Response,
+        fallback_factory=lambda: _Response(answer="fallback"),
+        round_label="plan #1",
+    )
+
+    assert response == _Response(answer="fixed")
+    assert len(session.turns) == 2
+    assert "invalid JSON" in session.turns[1].message
+    assert session.turns[1].output_schema is _Response
+    assert session.turns[1].label == "plan #1-reply-1"
+    assert session.close_calls == 0
+
+
+def test_invoke_falls_back_after_the_reply_retries_are_spent(tmp_path: Path) -> None:
+    session = _FakeSession(results=[AgentTurnResult("no object")] * 3)
+    client = AgentClient(_FakeDriver([session]))
+
+    response = client.invoke(
+        kind="judge",
+        workspace=tmp_path,
+        system_prompt="system",
+        user_prompt="user",
+        response_cls=_Response,
+        fallback_factory=lambda: _Response(answer="fallback"),
+        round_label="judge #1",
+    )
+
+    assert response == _Response(answer="fallback")
+    assert len(session.turns) == 3
+
+
+def test_an_unkeyed_turn_is_not_asked_again(tmp_path: Path) -> None:
+    session = _FakeSession(results=[AgentTurnResult("no object")])
+    client = AgentClient(_FakeDriver([session]))
+
+    response = client.invoke(
+        kind="judge",
+        workspace=tmp_path,
+        system_prompt="system",
+        user_prompt="user",
+        response_cls=_Response,
+        fallback_factory=lambda: _Response(answer="fallback"),
+        round_label="judge #1",
+        reuse_session=False,
+    )
+
+    assert response == _Response(answer="fallback")
+    assert len(session.turns) == 1

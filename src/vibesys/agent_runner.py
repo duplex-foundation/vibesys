@@ -203,11 +203,57 @@ def publish_todos(todos: list[dict[str, Any]]) -> None:
 # ---------------------------------------------------------------------------
 
 
+_PARSE_EXCERPT_CHARS = 60  # context shown on either side of where the JSON broke
+_PARSE_ERRORS_SHOWN = 3  # schema problems named before the list is cut
+
+
 def parse_typed_response_text(text: str, response_cls: type[T]) -> T | None:
     """Best-effort recovery of a typed Pydantic payload from raw model text."""
-    if not text:
-        return None
+    for candidate in _reply_candidates(text):
+        for attempt in (candidate, _escape_control_chars_in_strings(candidate)):
+            try:
+                payload = json.loads(attempt)
+                return response_cls.model_validate(payload)
+            except (json.JSONDecodeError, ValidationError, TypeError):
+                continue
+    return None
 
+
+def explain_parse_failure(text: str, response_cls: type[BaseModel]) -> str:
+    """Say, in one line, why ``text`` yielded no ``response_cls``.
+
+    The line goes back to the model when the turn is asked again, so it names
+    the defect the way the model can act on it: where the JSON broke, or which
+    fields the schema rejected. The longest candidate object is the one judged;
+    narrative text carries small inline braces that are never the reply.
+    """
+    objects = [candidate for candidate in _reply_candidates(text) if candidate.startswith("{")]
+    if not objects:
+        return "the reply holds no JSON object"
+    candidate = max(objects, key=len)
+    try:
+        payload = json.loads(_escape_control_chars_in_strings(candidate))
+    except json.JSONDecodeError as exc:
+        start = max(0, exc.pos - _PARSE_EXCERPT_CHARS)
+        excerpt = candidate[start : exc.pos + _PARSE_EXCERPT_CHARS].replace("\n", " ")
+        return f"invalid JSON ({exc.msg}, character {exc.pos}, near: {excerpt!r})"
+    try:
+        response_cls.model_validate(payload)
+    except ValidationError as exc:
+        problems = [
+            f"{'.'.join(str(part) for part in error['loc']) or '<root>'}: {error['msg']}"
+            for error in exc.errors()[:_PARSE_ERRORS_SHOWN]
+        ]
+        return f"the JSON does not fit {response_cls.__name__} ({'; '.join(problems)})"
+    except TypeError as exc:
+        return f"the JSON does not fit {response_cls.__name__} ({exc})"
+    return "the JSON parses and fits the schema"
+
+
+def _reply_candidates(text: str) -> list[str]:
+    """Every span of ``text`` that may be the reply object, most likely first."""
+    if not text:
+        return []
     candidates: list[str] = []
     stripped = text.strip()
     if stripped:
@@ -221,18 +267,13 @@ def parse_typed_response_text(text: str, response_cls: type[T]) -> T | None:
     # reply, so a single first-``{``-to-last-``}`` slice would fail to parse.
     candidates.extend(_balanced_objects(text))
 
+    unique: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        for attempt in (candidate, _escape_control_chars_in_strings(candidate)):
-            try:
-                payload = json.loads(attempt)
-                return response_cls.model_validate(payload)
-            except (json.JSONDecodeError, ValidationError, TypeError):
-                continue
-    return None
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+    return unique
 
 
 def _balanced_objects(text: str) -> list[str]:

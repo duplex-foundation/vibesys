@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from vibesys.agent_runner import parse_typed_response_text
+from vibesys.agent_runner import explain_parse_failure, parse_typed_response_text
 
 
 class Reply(BaseModel):
@@ -48,3 +48,18 @@ def test_escaped_quotes_and_backslashes_survive_the_repair() -> None:
 def test_nothing_parseable_returns_none() -> None:
     assert parse_typed_response_text("no json here {unbalanced", Reply) is None
     assert parse_typed_response_text("", Reply) is None
+
+
+def test_explain_names_the_defect_the_model_can_fix() -> None:
+    assert (
+        explain_parse_failure("thinking only, no object", Reply) == "the reply holds no JSON object"
+    )
+    # An unescaped quote inside a string value: the shape GLM-5.3 produced in
+    # three of five lost turns of one run.
+    broken = '{"analysis": "set {"indexer_kv_dtype": "mxfp4"} on both engines", "verdict": "pass"}'
+    reason = explain_parse_failure(broken, Reply)
+    assert reason.startswith("invalid JSON (")
+    assert "indexer_kv_dtype" in reason
+    # A required field dropped: the JSON is fine, the schema rejects it.
+    reason = explain_parse_failure('{"analysis": "knob flipped"}', Reply)
+    assert reason == "the JSON does not fit Reply (verdict: Field required)"
