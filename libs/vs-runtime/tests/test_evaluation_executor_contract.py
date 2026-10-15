@@ -296,3 +296,27 @@ async def test_close_ends_every_submitted_evaluation_in_a_terminal_state(
     observed = await world.executor.inspect_only(_HANDLE)
     assert observed is not None
     assert observed.state in _TERMINAL, observed
+
+
+async def test_the_polling_executor_evaluates_in_the_root_where_no_candidate_can_open(
+    tmp_path: Path,
+) -> None:
+    """A host that cannot open isolated candidates (the host run environment) still
+    measures: the gates run in the root workspace, which holds the submitted
+    revision once the agent's turn is over, as trusted commands do there."""
+    del tmp_path
+    evaluation = FakeEvaluation()
+    evaluation.default_accuracy = AccuracyEvaluation(executed=True)
+    workspaces = FakeWorkspaces(
+        FakeWorkspace(path=Path("/workspace")), supports_parallel_candidates=False
+    )
+    snapshot = await workspaces.root.snapshot("candidate")
+    executor = PollingEvaluationExecutor(evaluation, workspaces, clock=ManualClock())
+
+    await executor.submit(_request(snapshot), handle_id=_HANDLE)
+    observed = await _terminal(executor)
+
+    assert observed.state is EvaluationState.SUCCEEDED, observed.failure
+    assert [step.state for step in observed.stage_results] == [StageState.SUCCEEDED] * 2
+    assert workspaces.candidates == ()
+    await executor.close()

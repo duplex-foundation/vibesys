@@ -55,7 +55,10 @@ class PollingEvaluationExecutor:
     """Run semantic evaluation requests in-process, publishing observations a caller polls.
 
     Each submitted request evaluates its candidate snapshot in a fresh candidate
-    workspace through the trusted ``Evaluation`` effects, one stage at a time.
+    workspace through the trusted ``Evaluation`` effects, one stage at a time;
+    where the run environment cannot open isolated candidates (the host), the
+    stages run in the root workspace, which holds the submitted revision once the
+    agent's turn is over, as trusted commands do there.
     Observations are process-local: nothing survives a restart.
     """
 
@@ -137,7 +140,11 @@ class PollingEvaluationExecutor:
         results: list[EvaluationStepResult] = []
         failure: str | None = None
         try:
-            workspace = await self._workspaces.create_candidate(first.snapshot)
+            if self._workspaces.supports_parallel_candidates:
+                workspace = await self._workspaces.create_candidate(first.snapshot)
+                evaluated: Workspace = workspace
+            else:
+                evaluated = self._workspaces.root
             self._publish(
                 handle_id,
                 ExecutorObservation(
@@ -146,7 +153,7 @@ class PollingEvaluationExecutor:
             )
             for step in request.stages:
                 stage = SemanticEvaluationStage.model_validate(step.payload)
-                observed = await self._evaluate(workspace, stage, handle_id)
+                observed = await self._evaluate(evaluated, stage, handle_id)
                 evidence = observed.evidence
                 results.append(
                     EvaluationStepResult(
