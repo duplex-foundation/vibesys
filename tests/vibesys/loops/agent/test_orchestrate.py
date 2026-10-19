@@ -504,6 +504,7 @@ def test_project_configuration_captures_effective_agent_behavior(tmp_path: Path)
             "gpu": "A100-80GB",
             "model_volume": "weights",
             "app": "vibesys",
+            "parallel_candidates": None,
             "resources": None,
         },
     }
