@@ -368,6 +368,14 @@ def test_cli_compatibility_flags_keep_options_scoped_to_selected_environment(): 
     assert skypilot.options["profiles_file"] == Path("/operator/clusters.toml")
     assert skypilot.options["executable"] == "sky-custom"
 
+    parallel = make_run_environment_spec(local_parallel_candidates=True)
+    assert parallel.name == "local"
+    assert parallel.options == {"parallel_candidates": True}
+    assert run_environment_record(parallel).parallel_candidates is True
+    assert run_environment_record(make_run_environment_spec()).parallel_candidates is None
+    with pytest.raises(ValueError, match="local run environment only"):
+        make_run_environment_spec(use_docker=True, local_parallel_candidates=True)
+
 
 def test_skypilot_selection_requires_profile_and_resources() -> None:
     resources = RunResourceRequest(accelerators_per_node=1, accelerator_backend="rocm")
@@ -444,6 +452,21 @@ def test_local_environment_opens_local_sandbox_with_host_paths(tmp_path):  # noq
     assert session.view.paths.benchmark_command == "uv run python benchmark/benchmark.py"
     assert session.view.isolated is False
     backend.sandbox.start.assert_not_called()
+
+
+def test_local_environment_evaluates_candidates_in_parallel_only_when_told(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288
+    request = _request(tmp_path, FakeBackend(), accuracy_command="a", benchmark_command="b")
+
+    serial = build_run_environment(RunEnvironmentSpec("local")).open(request)
+    assert serial.view.supports_parallel_candidate_evaluation is False
+
+    parallel = build_run_environment(
+        RunEnvironmentSpec("local", options={"parallel_candidates": True})
+    ).open(request)
+    assert parallel.view.supports_parallel_candidate_evaluation is True
+
+    with pytest.raises(TypeError, match="parallel_candidates"):
+        build_run_environment(RunEnvironmentSpec("local", options={"parallel_candidates": "yes"}))
 
 
 def test_local_environment_materializes_effective_objective_outside_workspace(tmp_path):  # noqa: ANN001, ANN201  # tracked: #288

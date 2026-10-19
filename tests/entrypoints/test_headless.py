@@ -453,6 +453,47 @@ def test_each_outer_loop_builds_the_task_image_once(
     assert loop_runner.call_args.kwargs["run_environment"].options["image"] == image_id
 
 
+def test_local_parallel_candidates_reach_the_evolve_loop_with_the_capture_command(
+    tmp_path: Path,
+) -> None:
+    import entrypoints.headless as cli  # noqa: PLC0415
+
+    project = _write_input_project(tmp_path)
+    invocation = parse_cli_invocation(
+        [
+            "--outer-loop",
+            "evolve",
+            "--input",
+            str(project),
+            "--local-parallel-candidates",
+            "--max-parallelism",
+            "3",
+        ]
+    )
+
+    with (
+        patch(
+            "entrypoints.headless.load_config_and_skills",
+            return_value=(Mock(), (), ComputeBackend.CPU),
+        ),
+        patch("entrypoints.headless._prepare_experiment_repository"),
+        patch("vibesys.loops.evolve.loop.run_evolve_loop", return_value=True) as loop_runner,
+    ):
+        getattr(cli, "_run_evolve")(invocation.args, Mock())  # noqa: B009  # private by convention, like the loop dispatch test above
+
+    kwargs = loop_runner.call_args.kwargs
+    assert kwargs["run_environment"].name == "local"
+    assert kwargs["run_environment"].options == {"parallel_candidates": True}
+    assert kwargs["max_parallelism"] == 3
+    assert kwargs["capture_command"] == invocation.args.input_bundle.capture_command_display
+
+
+def test_local_parallel_candidates_belong_to_the_local_environment(tmp_path: Path) -> None:
+    project = _write_input_project(tmp_path)
+    with pytest.raises(ValueError, match="local run environment only"):
+        parse_cli_invocation(["--input", str(project), "--docker", "--local-parallel-candidates"])
+
+
 @pytest.mark.parametrize(
     "flags",
     [

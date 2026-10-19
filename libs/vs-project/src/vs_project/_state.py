@@ -766,6 +766,9 @@ class RunEnvironmentRecord(BaseModel):
     gpu: PortableText | None = None
     model_volume: PortableText | None = None
     app: PortableText | None = None
+    # The local environment's one option: its trusted commands measure off the
+    # host, so a generation's candidates may be evaluated concurrently.
+    parallel_candidates: bool | None = None
     resources: RunResourceRequest | None = None
 
 

@@ -130,6 +130,7 @@ _RUN_ENVIRONMENT_OPTION_CLI_FIELDS: dict[str, str] = {
     "modal_gpu": "gpu",
     "modal_model_volume": "model_volume",
     "modal_app": "app",
+    "local_parallel_candidates": "parallel_candidates",
 }
 
 _AGENT_RESUME_CLI_FIELDS: dict[str, str] = {
@@ -496,6 +497,15 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Select where trusted work runs. SkyPilot and Modal keep the agent "
             "in a local CPU-only Docker editor."
+        ),
+    )
+    parser.add_argument(
+        "--local-parallel-candidates",
+        action="store_true",
+        help=(
+            "With the local run environment: evaluate a generation's candidates "
+            "concurrently (see --max-parallelism), for a task whose trusted commands "
+            "measure off this host, such as a remote benchmark queue."
         ),
     )
     parser.add_argument(
@@ -941,6 +951,7 @@ def run_environment_spec_from_args(  # tracked: #288
         cluster_profiles_file=getattr(args, "cluster_profiles_file", None),
         skypilot_executable=getattr(args, "skypilot_executable", "sky"),
         resources=bundle.manifest.resources if bundle is not None else None,
+        local_parallel_candidates=getattr(args, "local_parallel_candidates", False),
     )
 
 
@@ -2401,6 +2412,7 @@ def _run_evolve(args: argparse.Namespace, integration: RunIntegration) -> None:
         task_root=bundle.task_root,
         accuracy_command=bundle.accuracy_command_display,
         benchmark_command=bundle.benchmark_command_display,
+        capture_command=bundle.capture_command_display,
         workspace_sources=bundle.workspace_sources,
         evaluator_path=bundle.evaluator_path,
         evaluator_package_root=bundle.evaluator_package_root,

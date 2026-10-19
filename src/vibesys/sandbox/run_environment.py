@@ -330,12 +330,31 @@ class _DefaultRunEnvironmentSession:
             _stop_sandbox(self.sandbox)
 
 
-class LocalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
+class LocalEnvironment(_NoopWorkspaceRecovery):
+    """The host itself: the agents, the gates and the profiler run on this machine.
+
+    ``parallel_candidates`` says the trusted commands may run concurrently,
+    which holds when they measure somewhere else (a remote benchmark queue)
+    rather than on this host's devices; the evolve loop then evaluates a
+    generation's candidates at once instead of one after the other.
+    """
+
     isolated: bool = False
     materialize_local_model_weights: bool = True
     default_profiler_kind: ProfilerKind = ProfilerKind.NSYS
     supported_profiler_kinds: frozenset[ProfilerKind] | None = None
     backend_image: str | None = None
+
+    def __init__(self, *, parallel_candidates: bool = False) -> None:
+        """Remember whether candidates may be evaluated concurrently (see the class)."""
+        self.parallel_candidates = parallel_candidates
+
+    @classmethod
+    def from_options(cls, options: Mapping[str, object]) -> LocalEnvironment:  # noqa: D102  # tracked: #288
+        parallel = options.get("parallel_candidates", False)
+        if not isinstance(parallel, bool):
+            raise TypeError(f"parallel_candidates must be a bool, got {parallel!r}")  # noqa: TRY003  # tracked: #288
+        return cls(parallel_candidates=parallel)
 
     def open(self, request: RunEnvironmentRequest) -> RunEnvironmentSession:  # noqa: D102  # tracked: #288
         objective_document = _materialize_effective_objective(request)
@@ -372,6 +391,7 @@ class LocalEnvironment(_NoopWorkspaceRecovery):  # noqa: D101  # tracked: #288
                     capture_command=_environment_command(request, request.capture_command),
                     profiler_support=request.profiler_support_path,
                 ),
+                supports_parallel_candidate_evaluation=self.parallel_candidates,
             ),
             stop_on_close=False,
         )
@@ -1115,6 +1135,7 @@ def run_environment_record(spec: RunEnvironmentSpec) -> RunEnvironmentRecord:
         gpu=_recorded_option(spec, "gpu"),
         model_volume=_recorded_option(spec, "model_volume"),
         app=_recorded_option(spec, "app"),
+        parallel_candidates=True if spec.options.get("parallel_candidates") else None,
         resources=spec.resources,
     )
 
@@ -1135,7 +1156,7 @@ def _recorded_option(spec: RunEnvironmentSpec, key: str) -> str | None:
 
 def build_run_environment(spec: RunEnvironmentSpec) -> RunEnvironment:  # noqa: D103  # tracked: #288
     if spec.name == "local":
-        return LocalEnvironment()
+        return LocalEnvironment.from_options(spec.options)
     if spec.name == "docker":
         return DockerEnvironment.from_options(spec.options)
     if spec.name == "modal":
@@ -1159,8 +1180,13 @@ def make_run_environment_spec(  # noqa: PLR0913  # tracked: #288
     cluster_profiles_file: Path | None = None,
     skypilot_executable: str = "sky",
     resources: RunResourceRequest | None = None,
+    local_parallel_candidates: bool = False,
 ) -> RunEnvironmentSpec:
     """Build a spec from the current CLI compatibility flags.
+
+    ``local_parallel_candidates`` is the local environment's one option: its
+    trusted commands measure off this host, so candidates may be evaluated
+    concurrently. It belongs to no other environment.
 
     Modal mode (April 2026 refactor) runs the agent in a *local Docker
     container* and dispatches GPU work via the candidate's ``modal run`` entrypoint,
@@ -1172,6 +1198,10 @@ def make_run_environment_spec(  # noqa: PLR0913  # tracked: #288
     if sum((use_docker, use_modal, use_skypilot)) > 1:
         raise ValueError(  # noqa: TRY003
             "--docker, --modal, and --skypilot are mutually exclusive"
+        )
+    if local_parallel_candidates and (use_docker or use_modal or use_skypilot):
+        raise ValueError(  # noqa: TRY003
+            "--local-parallel-candidates applies to the local run environment only"
         )
     if use_skypilot:
         if not cluster_profile:
@@ -1206,6 +1236,8 @@ def make_run_environment_spec(  # noqa: PLR0913  # tracked: #288
         return RunEnvironmentSpec(
             name="docker", options={"image": docker_image}, resources=resources
         )
+    if local_parallel_candidates:
+        return RunEnvironmentSpec(options={"parallel_candidates": True}, resources=resources)
     return RunEnvironmentSpec(resources=resources)
 
 
