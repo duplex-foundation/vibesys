@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -40,6 +41,12 @@ class FrameworkSnapshotStatus(StrEnum):
     MISSING = "missing"
     EXACT = "exact"
     DIFFERENT = "different"
+
+
+# ``git worktree add`` is retried this many times, this far apart, before a
+# candidate's setup is given up (see GitTracker.add_worktree).
+WORKTREE_ADD_ATTEMPTS = 5
+WORKTREE_ADD_RETRY_DELAY_S = 2.0
 
 
 class GitTracker:
@@ -185,10 +192,36 @@ class GitTracker:
         ``.git/worktrees`` admin area, so callers must serialize concurrent
         adds; committing *inside* a worktree afterwards is independent per
         worktree and safe to run concurrently.
+
+        The add is retried: on a FUSE-backed home (gocryptfs on a dev box) the
+        second worktree of a generation has failed with ``EPERM`` writing files
+        under the new ``.git/worktrees/<name>`` entry while a sibling candidate's
+        agent was starting up, and the identical command succeeds moments
+        later. Each failure is reported; the last one raises.
         """
         destination = self._validate_local_worktree_path(worktree_dir)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        self.run(["git", "worktree", "add", "--detach", str(destination), commit])
+        command = ["git", "worktree", "add", "--detach", str(destination), commit]
+        for attempt in range(1, WORKTREE_ADD_ATTEMPTS + 1):
+            result = self.run(command, check=False)
+            if result.returncode == 0:
+                return
+            stderr = result.stderr.decode(errors="replace").strip()
+            if attempt == WORKTREE_ADD_ATTEMPTS:
+                self._events.warning(
+                    f"git worktree add failed {attempt} times: {' '.join(command)}",
+                    detail=f"exit code {result.returncode}: {stderr}",
+                )
+                result.check_returncode()
+            self._events.warning(
+                f"git worktree add failed (attempt {attempt}/{WORKTREE_ADD_ATTEMPTS}), "
+                f"pruning and retrying in {WORKTREE_ADD_RETRY_DELAY_S:g} s",
+                detail=f"exit code {result.returncode}: {stderr}",
+            )
+            # A failed add leaves nothing registered; prune whatever admin entry
+            # it may have abandoned before trying again.
+            self.run(["git", "worktree", "prune"], check=False)
+            time.sleep(WORKTREE_ADD_RETRY_DELAY_S)
 
     def remove_worktree(self, worktree_dir: Path) -> None:
         """Unregister a linked worktree and delete its directory (best-effort).

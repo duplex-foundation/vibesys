@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from vibesys.run import git_tracker as git_tracker_module
 from vibesys.run.git_events import NullGitTrackerEvents
 from vibesys.run.git_tracker import GitTracker
 from vibesys.run.project_policy import trusted_project_input_paths
@@ -597,3 +598,81 @@ def test_events_report_failed_tree_restore_as_warning(tmp_path: Path) -> None:
 
     assert tracker.checkout_tree("f" * 40) is False
     assert any(warning.startswith("git tree restore") for warning in events.warnings)
+
+
+def test_add_worktree_retries_a_transient_git_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second candidate's add has failed with EPERM on a FUSE home and
+    succeeded moments later: one failed attempt is reported and retried."""
+    events = _RecordingEvents()
+    tracker = GitTracker(
+        tmp_path,
+        run_id="retry",
+        events=events,
+        trusted_input_paths=trusted_project_input_paths(tmp_path, evaluator_source=None),
+    )
+    tracker.init(existing=False)
+    store = _project(tmp_path, tracker, "retry")
+    baseline = tracker.current_sha()
+    assert baseline is not None
+    worktree = store.state.candidate_worktree_directory("retry", "candidate-2")
+
+    real_run = tracker.run
+    failures = {"left": 1}
+    slept: list[float] = []
+
+    def flaky_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if cmd[:3] == ["git", "worktree", "add"] and failures["left"]:
+            failures["left"] -= 1
+            return subprocess.CompletedProcess(
+                cmd,
+                128,
+                stdout=b"",
+                stderr=b"fatal: could not open 'commondir' for writing: Operation not permitted",
+            )
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(tracker, "run", flaky_run)
+    monkeypatch.setattr(git_tracker_module.time, "sleep", slept.append)
+
+    tracker.add_worktree(worktree, baseline)
+
+    assert (worktree / ".git").exists()
+    assert slept == [git_tracker_module.WORKTREE_ADD_RETRY_DELAY_S]
+    assert len(events.warnings) == 1
+    assert "attempt 1/5" in events.warnings[0]
+    assert "Operation not permitted" in events.warnings[0]
+
+
+def test_add_worktree_gives_up_after_the_last_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = _RecordingEvents()
+    tracker = GitTracker(
+        tmp_path,
+        run_id="exhausted",
+        events=events,
+        trusted_input_paths=trusted_project_input_paths(tmp_path, evaluator_source=None),
+    )
+    tracker.init(existing=False)
+    store = _project(tmp_path, tracker, "exhausted")
+    worktree = store.state.candidate_worktree_directory("exhausted", "candidate-2")
+    adds: list[list[str]] = []
+    real_run = tracker.run
+
+    def failing_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if cmd[:3] == ["git", "worktree", "add"]:
+            adds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 128, stdout=b"", stderr=b"fatal: boom")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(tracker, "run", failing_run)
+    monkeypatch.setattr(git_tracker_module.time, "sleep", lambda _s: None)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        tracker.add_worktree(worktree, "HEAD")
+
+    assert len(adds) == git_tracker_module.WORKTREE_ADD_ATTEMPTS
+    assert events.warnings[-1].startswith("git worktree add failed 5 times")
+    assert not worktree.exists()
